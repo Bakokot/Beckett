@@ -40,6 +40,24 @@ impl Explorer {
         }
     }
 
+    /// Re-reads `dir` if it is loaded, keeping which subfolders are expanded.
+    pub fn refresh(&mut self, dir: &Path) {
+        let Some(node) = find_mut(&mut self.root, dir) else {
+            return;
+        };
+        let Some(mut old) = node.children.take() else {
+            return;
+        };
+        node.load_children();
+        for child in node.children.iter_mut().flatten() {
+            if let Some(i) = old.iter().position(|o| o.path == child.path && o.is_dir == child.is_dir) {
+                let previous = old.swap_remove(i);
+                child.expanded = previous.expanded;
+                child.children = previous.children;
+            }
+        }
+    }
+
     pub fn view(&self, active: Option<&Path>) -> Element<'_, Message> {
         let mut rows = Vec::new();
         for child in self.root.children.iter().flatten() {

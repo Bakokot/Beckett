@@ -136,15 +136,22 @@ pub struct Buffer {
     version: u64,
     reveal: u64,
     crlf: bool,
+    /// The file started with a UTF-8 byte order mark (kept out of the text).
+    bom: bool,
     language: Language,
     /// Lexer state at the start of each line, valid for a prefix of lines.
     line_states: RefCell<Vec<LineState>>,
 }
 
 const PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')];
+const BOM: char = '\u{feff}';
 
 impl Buffer {
+    /// Builds a buffer from file contents; a leading byte order mark is
+    /// stripped and restored by [`Buffer::file_contents`].
     pub fn new(text: &str, language: Language) -> Self {
+        let bom = text.starts_with(BOM);
+        let text = text.strip_prefix(BOM).unwrap_or(text);
         let crlf = text.contains("\r\n");
         let rope = if crlf {
             Rope::from_str(&text.replace("\r\n", "\n"))
@@ -161,6 +168,7 @@ impl Buffer {
             version: 0,
             reveal: 0,
             crlf,
+            bom,
             language,
             line_states: RefCell::new(vec![LineState::Normal]),
         }
@@ -168,13 +176,23 @@ impl Buffer {
 
     // ---- Queries ----
 
-    /// Full text, with the file's original line endings.
+    /// Full text, with the file's original line endings (no byte order mark).
     pub fn text(&self) -> String {
         let text = self.rope.to_string();
         if self.crlf {
             text.replace('\n', "\r\n")
         } else {
             text
+        }
+    }
+
+    /// What to write back to disk: the text, plus the byte order mark if
+    /// the file had one.
+    pub fn file_contents(&self) -> String {
+        if self.bom {
+            format!("{BOM}{}", self.text())
+        } else {
+            self.text()
         }
     }
 
@@ -1270,6 +1288,15 @@ mod tests {
         assert_eq!(b.char_to_pos(b.primary().head), Pos { line: 1, column: 9 });
         b.apply(Command::Undo);
         assert_eq!(b.text(), "v.len\nw.len");
+    }
+
+    #[test]
+    fn byte_order_mark_is_kept_out_of_the_text() {
+        let b = buf("\u{feff}extends Node");
+        assert_eq!(b.text(), "extends Node");
+        assert_eq!(b.line_text(0), "extends Node");
+        assert_eq!(b.file_contents(), "\u{feff}extends Node");
+        assert_eq!(buf("plain").file_contents(), "plain");
     }
 
     #[test]

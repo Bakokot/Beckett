@@ -10,6 +10,7 @@ mod runner;
 mod style;
 mod terminal_panel;
 mod terminal_view;
+mod watcher;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -77,6 +78,10 @@ pub enum Message {
     ClearOutput,
     /// A `res://` link in the output: path and 1-based line.
     OpenOutputLink(String, u32),
+    /// Paths changed on disk by something other than the IDE.
+    FilesChanged(Vec<PathBuf>),
+    /// Discard the active tab's edits and reload it from disk.
+    ReloadActive,
 }
 
 /// Which panel receives keyboard input.
@@ -173,6 +178,8 @@ struct Tab {
     version: i32,
     /// Diagnostic underlines, rebuilt when diagnostics or the theme change.
     marks: Vec<Mark>,
+    /// The file changed on disk while this tab had unsaved edits.
+    disk_changed: bool,
 }
 
 impl Tab {
@@ -277,7 +284,13 @@ impl App {
             .map(|request| runner::run(request).map(Message::Run))
             .unwrap_or_else(Subscription::none);
 
-        Subscription::batch([keys, lsp, terminal, run])
+        let files = self
+            .project
+            .as_ref()
+            .map(|project| watcher::watch(project.root.clone()).map(Message::FilesChanged))
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([keys, lsp, terminal, run, files])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -355,6 +368,12 @@ impl App {
             }
             Message::Run(event) => self.on_run(event),
             Message::ClearOutput => self.run.output.clear(),
+            Message::FilesChanged(paths) => self.on_files_changed(&paths),
+            Message::ReloadActive => {
+                if let Some(index) = self.active {
+                    self.reload_tab(index);
+                }
+            }
             Message::OpenOutputLink(res_path, line) => {
                 let path = self
                     .project
@@ -469,6 +488,73 @@ impl App {
                 self.run.request = None;
             }
         }
+    }
+
+    fn on_files_changed(&mut self, paths: &[PathBuf]) {
+        // Files appeared or vanished: refresh their folders in the explorer.
+        if let Some(project) = &mut self.project {
+            let dirs: std::collections::BTreeSet<&Path> = paths.iter().filter_map(|p| p.parent()).collect();
+            for dir in dirs {
+                project.explorer.refresh(dir);
+            }
+        }
+
+        for index in 0..self.tabs.len() {
+            let tab = &self.tabs[index];
+            if !paths.iter().any(|p| uri::same_path(p, &tab.path)) {
+                continue;
+            }
+            let Ok(disk) = std::fs::read_to_string(&tab.path) else {
+                if !tab.path.exists() {
+                    self.status = Some(format!("{} was deleted on disk", tab.title()));
+                    self.tabs[index].disk_changed = true;
+                }
+                continue;
+            };
+            // Our own saves come back as events too.
+            if disk == tab.buffer.file_contents() {
+                self.tabs[index].disk_changed = false;
+                continue;
+            }
+            if tab.dirty {
+                self.status = Some(format!(
+                    "{} changed on disk (save keeps yours)",
+                    tab.title()
+                ));
+                self.tabs[index].disk_changed = true;
+            } else {
+                self.reload_tab(index);
+            }
+        }
+    }
+
+    /// Replaces a tab's contents with the file on disk, keeping the cursor
+    /// line and column where possible.
+    fn reload_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&tab.path) {
+            Ok(text) => text,
+            Err(error) => {
+                self.status = Some(format!("Cannot reload {}: {error}", tab.title()));
+                return;
+            }
+        };
+        let cursor = tab.buffer.char_to_pos(tab.buffer.primary().head);
+        tab.buffer = Buffer::new(&text, tab.language);
+        tab.buffer.set_cursor(cursor);
+        tab.dirty = false;
+        tab.disk_changed = false;
+        tab.version += 1;
+        if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
+            let _ = client.did_change(&tab.path, tab.version, &tab.buffer.text());
+        }
+        self.status = Some(format!("Reloaded {} from disk", tab.title()));
+        if Some(index) == self.active {
+            self.dismiss_popups();
+        }
+        self.refresh_marks();
     }
 
     fn push_output(&mut self, line: OutputLine) {
@@ -894,9 +980,10 @@ impl App {
                     dirty: false,
                     version: 1,
                     marks: Vec::new(),
+                    disk_changed: false,
                 };
                 if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
-                    let _ = client.did_open(&tab.path, tab.version, &text);
+                    let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
                 }
                 self.tabs.push(tab);
                 self.active = Some(self.tabs.len() - 1);
@@ -956,12 +1043,12 @@ impl App {
         let Some(tab) = self.tabs.get_mut(index) else {
             return false;
         };
-        let text = tab.buffer.text();
-        match std::fs::write(&tab.path, &text) {
+        match std::fs::write(&tab.path, tab.buffer.file_contents()) {
             Ok(()) => {
                 tab.dirty = false;
+                tab.disk_changed = false;
                 if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
-                    let _ = client.did_save(&tab.path, &text);
+                    let _ = client.did_save(&tab.path, &tab.buffer.text());
                 }
                 true
             }
@@ -1163,7 +1250,12 @@ impl App {
 
     fn tab_bar(&self) -> Element<'_, Message> {
         let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
-            let label = format!("{}{}", tab.title(), if tab.dirty { " *" } else { "" });
+            let marker = match (tab.dirty, tab.disk_changed) {
+                (_, true) => " (changed on disk)",
+                (true, false) => " *",
+                (false, false) => "",
+            };
+            let label = format!("{}{marker}", tab.title());
             let style: fn(&iced::Theme, button::Status) -> button::Style =
                 if self.active == Some(index) {
                     button::secondary
@@ -1237,6 +1329,15 @@ impl App {
             left.push(
                 button(text(label).size(12).color(style::to_color(color)))
                     .on_press(message)
+                    .style(button::text)
+                    .padding([0, 4])
+                    .into(),
+            );
+        }
+        if self.active_tab().is_some_and(|t| t.disk_changed) {
+            left.push(
+                button(text("Reload from disk").size(12).color(style::to_color(ui.warning)))
+                    .on_press(Message::ReloadActive)
                     .style(button::text)
                     .padding([0, 4])
                     .into(),

@@ -87,7 +87,9 @@ crates/
 - [ ] IME composition (CJK input)
 - [ ] Find/replace in file and across project (regex, case, whole word)
 - [ ] GDScript snippets (`_ready`, `_process`, `@export`, `@onready`, signals…)
-- [ ] External file change detection and reload
+- [x] External file change detection (`notify`): unchanged tabs reload silently; tabs with unsaved
+      edits are flagged "(changed on disk)" with a Reload button; explorer folders refresh
+- [x] UTF-8 byte order mark kept out of the editor and the language server, restored on save
 
 **LSP** — `lsp-client` crate; verified against Godot 4.7.1 (`cargo run -p lsp-client --example probe`)
 - [x] Detect Godot installs (env, PATH, Desktop/Downloads/Program Files/Steam/scoop/winget), pick
