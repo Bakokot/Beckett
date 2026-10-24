@@ -1,6 +1,9 @@
 //! Code editor widget: draws an `editor_core::Buffer` on a monospace grid
-//! and turns input into `Command`s. The buffer lives in app state; this
-//! widget only keeps view state (focus, scroll, drag).
+//! and turns input into [`EditorEvent`]s. The buffer and popup contents live
+//! in app state; this widget only keeps view state (focus, scroll, drag,
+//! hover timing).
+
+use std::ops::Range;
 
 use editor_core::buffer::TAB_WIDTH;
 use editor_core::gdscript::{Token, TokenKind};
@@ -17,10 +20,38 @@ use iced::{
     Size, Theme, Vector,
 };
 
+use crate::docs::Doc;
 use crate::style::to_color;
 
 const BLINK_MILLIS: u128 = 500;
+const HOVER_DELAY: Duration = Duration::from_millis(500);
 const LINE_HEIGHT_FACTOR: f32 = 1.4;
+const COMPLETION_ROWS: usize = 10;
+const DOC_FONT_SIZE: f32 = 13.0;
+const POPUP_PADDING: f32 = 8.0;
+/// Width of the kind-tag column in the completion list (`const` + a space).
+const TAG_COLUMNS: usize = 6;
+
+#[derive(Debug, Clone)]
+pub enum EditorEvent {
+    Command(Command),
+    Completion(CompletionAction),
+    /// Ctrl+Space.
+    TriggerCompletion,
+    /// The mouse rested on the word at this position.
+    Hover(Pos),
+    /// The mouse left the hovered word.
+    HoverEnd,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CompletionAction {
+    Move(isize),
+    Accept,
+    /// Clicked row (index into the visible list).
+    AcceptIndex(usize),
+    Dismiss,
+}
 
 /// An underline over a char-column range (e.g. a diagnostic).
 #[derive(Debug, Clone, Copy)]
@@ -31,16 +62,48 @@ pub struct Mark {
     pub color: Color,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompletionRow {
+    pub label: String,
+    /// Short kind tag, e.g. `fn`, `var`.
+    pub tag: &'static str,
+    pub color: Color,
+}
+
+pub struct CompletionPopup<'a> {
+    pub rows: &'a [CompletionRow],
+    pub selected: usize,
+    /// Where the completed word starts.
+    pub anchor: Pos,
+    pub doc: Option<&'a Doc>,
+}
+
+pub struct HoverPopup<'a> {
+    pub pos: Pos,
+    pub doc: &'a Doc,
+}
+
+pub struct SignaturePopup<'a> {
+    pub label: &'a str,
+    /// Byte range of the active parameter in `label`.
+    pub active: Option<Range<usize>>,
+    pub anchor: Pos,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Colors {
     pub background: Color,
     pub text: Color,
+    pub muted: Color,
+    pub accent: Color,
     pub gutter: Color,
     pub gutter_active: Color,
     pub current_line: Color,
     pub selection: Color,
     pub cursor: Color,
     pub bracket: Color,
+    pub popup: Color,
+    pub popup_border: Color,
     pub syntax: theme::SyntaxColors,
 }
 
@@ -52,17 +115,21 @@ impl Colors {
         Self {
             background: to_color(ui.background),
             text: to_color(theme.syntax.text),
+            muted: to_color(ui.text_muted),
+            accent,
             gutter: to_color(ui.text_muted).scale_alpha(0.7),
             gutter_active: text,
             current_line: text.scale_alpha(0.05),
             selection: accent.scale_alpha(0.35),
             cursor: text,
             bracket: text.scale_alpha(0.5),
+            popup: to_color(ui.surface),
+            popup_border: to_color(ui.border),
             syntax: theme.syntax,
         }
     }
 
-    fn token(&self, kind: Option<TokenKind>) -> Color {
+    pub fn token(&self, kind: Option<TokenKind>) -> Color {
         let s = &self.syntax;
         to_color(match kind {
             None => s.text,
@@ -84,30 +151,55 @@ impl Colors {
 
 pub struct CodeEditor<'a, Message> {
     buffer: &'a Buffer,
-    on_command: Box<dyn Fn(Command) -> Message + 'a>,
+    on_event: Box<dyn Fn(EditorEvent) -> Message + 'a>,
     marks: &'a [Mark],
     colors: Colors,
     font_size: f32,
+    completion: Option<CompletionPopup<'a>>,
+    hover: Option<HoverPopup<'a>>,
+    signature: Option<SignaturePopup<'a>>,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
     pub fn new(
         buffer: &'a Buffer,
         colors: Colors,
-        on_command: impl Fn(Command) -> Message + 'a,
+        on_event: impl Fn(EditorEvent) -> Message + 'a,
     ) -> Self {
         Self {
             buffer,
-            on_command: Box::new(on_command),
+            on_event: Box::new(on_event),
             marks: &[],
             colors,
             font_size: 14.0,
+            completion: None,
+            hover: None,
+            signature: None,
         }
     }
 
     pub fn marks(mut self, marks: &'a [Mark]) -> Self {
         self.marks = marks;
         self
+    }
+
+    pub fn completion(mut self, popup: Option<CompletionPopup<'a>>) -> Self {
+        self.completion = popup.filter(|p| !p.rows.is_empty());
+        self
+    }
+
+    pub fn hover(mut self, popup: Option<HoverPopup<'a>>) -> Self {
+        self.hover = popup.filter(|p| !p.doc.is_empty());
+        self
+    }
+
+    pub fn signature(mut self, popup: Option<SignaturePopup<'a>>) -> Self {
+        self.signature = popup;
+        self
+    }
+
+    fn emit(&self, shell: &mut Shell<'_, Message>, event: EditorEvent) {
+        shell.publish((self.on_event)(event));
     }
 }
 
@@ -116,6 +208,15 @@ struct Metrics {
     font_size: f32,
     char_width: f32,
     line_height: f32,
+}
+
+/// Tracks the mouse resting over text, for hover requests.
+#[derive(Debug, Clone, Copy)]
+struct HoverTrack {
+    point: Point,
+    since: Instant,
+    /// Word range (char indices) a hover was requested for.
+    sent: Option<(usize, usize)>,
 }
 
 struct State {
@@ -129,6 +230,7 @@ struct State {
     modifiers: Modifiers,
     seen_reveal: u64,
     metrics: Option<Metrics>,
+    hover: Option<HoverTrack>,
 }
 
 impl State {
@@ -145,6 +247,7 @@ impl State {
             modifiers: Modifiers::default(),
             seen_reveal: u64::MAX,
             metrics: None,
+            hover: None,
         }
     }
 
@@ -194,10 +297,33 @@ impl Geometry {
     fn page_lines(&self) -> usize {
         ((self.bounds.height / self.line_height) as usize).saturating_sub(1).max(1)
     }
+
+    /// Places a popup of `size` below the line at `anchor` (or above it when
+    /// there is no room), kept inside the editor horizontally.
+    fn popup_at(&self, anchor: Point, size: Size, above_first: bool) -> Rectangle {
+        let below = anchor.y + self.line_height + 2.0;
+        let above = anchor.y - size.height - 2.0;
+        let fits_below = below + size.height <= self.bounds.y + self.bounds.height;
+        let fits_above = above >= self.bounds.y;
+        let y = match (above_first, fits_above, fits_below) {
+            (true, true, _) | (false, true, false) => above,
+            _ => below,
+        };
+        let max_x = self.bounds.x + self.bounds.width - size.width;
+        Rectangle::new(Point::new(anchor.x.min(max_x).max(self.bounds.x), y), size)
+    }
+}
+
+/// Completion list layout: the list box, the first visible row and the
+/// optional docs box beside it.
+struct CompletionLayout {
+    list: Rectangle,
+    first: usize,
+    docs: Option<Rectangle>,
 }
 
 enum KeyAction {
-    Command(Command),
+    Event(EditorEvent),
     Copy,
     Cut,
     Paste,
@@ -209,6 +335,20 @@ impl<'a, Message> CodeEditor<'a, Message> {
         let line = line.min(self.buffer.len_lines() - 1);
         let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).round().max(0.0);
         Pos { line, column: self.buffer.column_for_visual(line, visual as usize) }
+    }
+
+    /// Char index of the character under `point` (not rounded to the nearest gap).
+    fn char_under(&self, geometry: &Geometry, scroll: Vector, point: Point) -> usize {
+        let line = ((point.y - geometry.bounds.y + scroll.y) / geometry.line_height).max(0.0) as usize;
+        let line = line.min(self.buffer.len_lines() - 1);
+        let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).floor().max(0.0);
+        let column = self.buffer.column_for_visual(line, visual as usize);
+        self.buffer.pos_to_char(Pos { line, column })
+    }
+
+    fn screen_point(&self, geometry: &Geometry, scroll: Vector, pos: Pos) -> Point {
+        let visual = self.buffer.visual_col(pos.line, pos.column);
+        Point::new(geometry.col_x(visual, scroll), geometry.line_y(pos.line, scroll))
     }
 
     /// Scrolls so the primary cursor is visible.
@@ -238,6 +378,33 @@ impl<'a, Message> CodeEditor<'a, Message> {
         state.scroll.x = state.scroll.x.max(0.0);
     }
 
+    fn completion_layout(
+        &self,
+        popup: &CompletionPopup<'_>,
+        geometry: &Geometry,
+        scroll: Vector,
+        metrics: Metrics,
+    ) -> CompletionLayout {
+        let cw = geometry.char_width;
+        let visible = popup.rows.len().min(COMPLETION_ROWS);
+        let widest = popup.rows.iter().map(|r| r.label.chars().count()).max().unwrap_or(0);
+        let width = ((widest + TAG_COLUMNS + 2).clamp(24, 64)) as f32 * cw;
+        let size = Size::new(width, visible as f32 * geometry.line_height + 4.0);
+        let anchor = self.screen_point(geometry, scroll, popup.anchor);
+        let list = geometry.popup_at(Point::new(anchor.x - cw * (TAG_COLUMNS as f32 + 0.5), anchor.y), size, false);
+        let first = popup.selected.saturating_sub(visible - 1);
+
+        let docs = popup.doc.filter(|d| !d.is_empty()).and_then(|doc| {
+            let right = geometry.bounds.x + geometry.bounds.width;
+            let width = (right - list.x - list.width - 4.0).min(440.0);
+            (width >= 220.0).then(|| {
+                let height = doc_height(doc, width, metrics);
+                Rectangle::new(Point::new(list.x + list.width + 4.0, list.y), Size::new(width, height))
+            })
+        });
+        CompletionLayout { list, first, docs }
+    }
+
     fn key_action(
         &self,
         key: &Key,
@@ -246,9 +413,33 @@ impl<'a, Message> CodeEditor<'a, Message> {
         page: usize,
     ) -> Option<KeyAction> {
         let (ctrl, shift, alt) = (modifiers.command(), modifiers.shift(), modifiers.alt());
-        let movement = |motion| Some(KeyAction::Command(Command::Move { motion, extend: shift }));
-        let command = |command| Some(KeyAction::Command(command));
+        let event = |event| Some(KeyAction::Event(event));
+        let command = |command| Some(KeyAction::Event(EditorEvent::Command(command)));
+        let movement = |motion| command(Command::Move { motion, extend: shift });
+
+        // Popup navigation takes precedence while one is open.
+        if let Key::Named(named) = key.as_ref() {
+            if self.completion.is_some() {
+                let action = match named {
+                    Named::ArrowUp => Some(CompletionAction::Move(-1)),
+                    Named::ArrowDown => Some(CompletionAction::Move(1)),
+                    Named::PageUp => Some(CompletionAction::Move(-(COMPLETION_ROWS as isize))),
+                    Named::PageDown => Some(CompletionAction::Move(COMPLETION_ROWS as isize)),
+                    Named::Enter | Named::Tab => Some(CompletionAction::Accept),
+                    Named::Escape => Some(CompletionAction::Dismiss),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    return event(EditorEvent::Completion(action));
+                }
+            }
+            if named == Named::Escape && (self.signature.is_some() || self.hover.is_some()) {
+                return event(EditorEvent::Completion(CompletionAction::Dismiss));
+            }
+        }
+
         match key.as_ref() {
+            Key::Named(Named::Space) if ctrl => event(EditorEvent::TriggerCompletion),
             Key::Named(named) => match named {
                 Named::ArrowLeft => movement(if ctrl { Motion::WordLeft } else { Motion::Left }),
                 Named::ArrowRight => movement(if ctrl { Motion::WordRight } else { Motion::Right }),
@@ -271,6 +462,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
                 Named::Escape if self.buffer.selections().len() > 1 => {
                     command(Command::CollapseSelections)
                 }
+                Named::Space => command(Command::Insert(" ".to_string())),
                 _ => None,
             },
             // Ctrl+Alt is AltGr on many layouts: treat it as typing.
@@ -290,7 +482,37 @@ impl<'a, Message> CodeEditor<'a, Message> {
             },
             _ => {
                 let text = text?.chars().filter(|c| !c.is_control()).collect::<String>();
-                (!text.is_empty()).then_some(KeyAction::Command(Command::Insert(text)))
+                (!text.is_empty()).then_some(KeyAction::Event(EditorEvent::Command(Command::Insert(text))))
+            }
+        }
+    }
+
+    fn update_hover(
+        &self,
+        state: &mut State,
+        geometry: &Geometry,
+        shell: &mut Shell<'_, Message>,
+        point: Option<Point>,
+    ) {
+        let now = Instant::now();
+        let sent = state.hover.and_then(|h| h.sent);
+        let Some(point) = point.filter(|p| geometry.text_area.contains(*p)) else {
+            if sent.is_some() {
+                self.emit(shell, EditorEvent::HoverEnd);
+            }
+            state.hover = None;
+            return;
+        };
+        let index = self.char_under(geometry, state.scroll, point);
+        let word = self.buffer.word_range(index);
+        match sent {
+            Some(range) if range == word && word.0 != word.1 => {}
+            _ => {
+                if sent.is_some() {
+                    self.emit(shell, EditorEvent::HoverEnd);
+                }
+                state.hover = Some(HoverTrack { point, since: now, sent: None });
+                shell.request_redraw_at(now + HOVER_DELAY);
             }
         }
     }
@@ -359,6 +581,17 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     let wait = BLINK_MILLIS - elapsed % BLINK_MILLIS;
                     shell.request_redraw_at(*now + Duration::from_millis(wait as u64));
                 }
+                if let Some(track) = &mut state.hover {
+                    if track.sent.is_none() && now.saturating_duration_since(track.since) >= HOVER_DELAY {
+                        let index = self.char_under(&geometry, state.scroll, track.point);
+                        let word = self.buffer.word_range(index);
+                        track.sent = Some(word);
+                        if word.0 != word.1 && !state.dragging {
+                            let pos = self.buffer.char_to_pos(index);
+                            shell.publish((self.on_event)(EditorEvent::Hover(pos)));
+                        }
+                    }
+                }
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
@@ -368,11 +601,23 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     state.focused = false;
                     return;
                 };
-                let click = mouse::Click::new(point, mouse::Button::Left, state.last_click);
-                state.last_click = Some(click);
                 state.focused = true;
                 state.focused_at = Instant::now();
 
+                // A click on the completion list accepts that row.
+                if let Some(popup) = &self.completion {
+                    let layout = self.completion_layout(popup, &geometry, state.scroll, metrics);
+                    if layout.list.contains(point) {
+                        let row = ((point.y - layout.list.y - 2.0) / geometry.line_height) as usize;
+                        let index = (layout.first + row).min(popup.rows.len() - 1);
+                        self.emit(shell, EditorEvent::Completion(CompletionAction::AcceptIndex(index)));
+                        shell.capture_event();
+                        return;
+                    }
+                }
+
+                let click = mouse::Click::new(point, mouse::Button::Left, state.last_click);
+                state.last_click = Some(click);
                 let pos = self.pos_at(&geometry, state.scroll, point);
                 let alt = state.modifiers.alt();
                 let command = match click.kind() {
@@ -384,18 +629,38 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     mouse::click::Kind::Double => Command::SelectWordAt(pos),
                     mouse::click::Kind::Triple => Command::SelectLineAt(pos),
                 };
-                shell.publish((self.on_command)(command));
+                self.emit(shell, EditorEvent::Command(command));
                 shell.capture_event();
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
-                let pos = self.pos_at(&geometry, state.scroll, *position);
-                shell.publish((self.on_command)(Command::Drag(pos)));
-                shell.capture_event();
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                if state.dragging {
+                    let pos = self.pos_at(&geometry, state.scroll, *position);
+                    self.emit(shell, EditorEvent::Command(Command::Drag(pos)));
+                    shell.capture_event();
+                } else {
+                    self.update_hover(state, &geometry, shell, cursor.position_over(geometry.bounds));
+                }
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                self.update_hover(state, &geometry, shell, None);
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(geometry.bounds) => {
+                if let Some(popup) = &self.completion {
+                    let layout = self.completion_layout(popup, &geometry, state.scroll, metrics);
+                    if cursor.is_over(layout.list) {
+                        let lines = match *delta {
+                            mouse::ScrollDelta::Lines { y, .. } => y,
+                            mouse::ScrollDelta::Pixels { y, .. } => y / geometry.line_height,
+                        };
+                        let step = if lines > 0.0 { -1 } else { 1 };
+                        self.emit(shell, EditorEvent::Completion(CompletionAction::Move(step)));
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 let (mut dx, mut dy) = match *delta {
                     mouse::ScrollDelta::Lines { x, y } => {
                         (x * 3.0 * geometry.char_width, y * 3.0 * geometry.line_height)
@@ -407,6 +672,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 }
                 state.scroll = state.scroll - Vector::new(dx, dy);
                 self.clamp_scroll(state, &geometry);
+                self.update_hover(state, &geometry, shell, None);
                 shell.request_redraw();
                 shell.capture_event();
             }
@@ -417,22 +683,27 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 let Some(action) = self.key_action(key, *modifiers, text.as_deref(), page) else {
                     return;
                 };
-                let command = match action {
-                    KeyAction::Command(command) => Some(command),
+                let event = match action {
+                    KeyAction::Event(event) => Some(event),
                     KeyAction::Copy | KeyAction::Cut => {
                         let selected = self.buffer.selected_text();
                         if !selected.is_empty() {
                             clipboard.write(clipboard::Kind::Standard, selected);
                         }
-                        matches!(action, KeyAction::Cut).then_some(Command::DeleteSelection)
+                        matches!(action, KeyAction::Cut)
+                            .then_some(EditorEvent::Command(Command::DeleteSelection))
                     }
                     KeyAction::Paste => clipboard
                         .read(clipboard::Kind::Standard)
-                        .map(Command::Paste),
+                        .map(|text| EditorEvent::Command(Command::Paste(text))),
                 };
-                if let Some(command) = command {
-                    shell.publish((self.on_command)(command));
+                if let Some(event) = event {
+                    self.emit(shell, event);
                 }
+                if state.hover.is_some_and(|h| h.sent.is_some()) {
+                    self.emit(shell, EditorEvent::HoverEnd);
+                }
+                state.hover = None;
                 state.focused_at = Instant::now();
                 shell.capture_event();
             }
@@ -524,19 +795,8 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 if let Some((open, close)) = buffer.matching_bracket(primary.head) {
                     for index in [open, close] {
                         let pos = buffer.char_to_pos(index);
-                        let visual = buffer.visual_col(pos.line, pos.column);
-                        let rect = Rectangle::new(
-                            Point::new(g.col_x(visual, scroll), g.line_y(pos.line, scroll)),
-                            Size::new(cw, lh),
-                        );
-                        r.fill_quad(
-                            Quad {
-                                bounds: rect,
-                                border: Border { color: colors.bracket, width: 1.0, radius: 2.0.into() },
-                                ..Quad::default()
-                            },
-                            Color::TRANSPARENT,
-                        );
+                        let rect = Rectangle::new(self.screen_point(&g, scroll, pos), Size::new(cw, lh));
+                        outline(r, rect, colors.bracket);
                     }
                 }
             }
@@ -562,12 +822,64 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     if !(first..last).contains(&pos.line) {
                         continue;
                     }
-                    let visual = buffer.visual_col(pos.line, pos.column);
-                    let rect = Rectangle::new(
-                        Point::new(g.col_x(visual, scroll) - 1.0, g.line_y(pos.line, scroll)),
-                        Size::new(2.0, lh),
-                    );
+                    let point = self.screen_point(&g, scroll, pos);
+                    let rect = Rectangle::new(Point::new(point.x - 1.0, point.y), Size::new(2.0, lh));
                     fill(r, rect, colors.cursor);
+                }
+            }
+        });
+
+        // Popups, on top of everything.
+        renderer.with_layer(g.bounds, |r| {
+            if let Some(popup) = &self.hover {
+                let width = 520.0_f32.min(g.bounds.width - 16.0);
+                let size = Size::new(width, doc_height(popup.doc, width, metrics));
+                let anchor = self.screen_point(&g, scroll, popup.pos);
+                let rect = g.popup_at(anchor, size, false);
+                draw_doc(r, popup.doc, rect, colors, metrics);
+            }
+
+            if let Some(popup) = &self.signature {
+                let chars = popup.label.chars().count() as f32;
+                let size = Size::new(chars * cw + POPUP_PADDING * 2.0, lh + 8.0);
+                let anchor = self.screen_point(&g, scroll, popup.anchor);
+                let rect = g.popup_at(Point::new(anchor.x - cw, anchor.y), size, true);
+                panel(r, rect, colors);
+                let origin = Point::new(rect.x + POPUP_PADDING, rect.y + 4.0);
+                let label = popup.label;
+                let active = popup.active.clone().unwrap_or(0..0);
+                let parts = [
+                    (&label[..active.start], colors.text),
+                    (&label[active.clone()], colors.accent),
+                    (&label[active.end..], colors.text),
+                ];
+                let mut x = origin.x;
+                for (part, color) in parts {
+                    if !part.is_empty() {
+                        draw_text(r, part.to_string(), Point::new(x, origin.y), color, metrics, rect);
+                    }
+                    x += part.chars().count() as f32 * cw;
+                }
+            }
+
+            if let Some(popup) = &self.completion {
+                let layout = self.completion_layout(popup, &g, scroll, metrics);
+                panel(r, layout.list, colors);
+                let visible = popup.rows.len().min(COMPLETION_ROWS);
+                for (offset, row) in popup.rows[layout.first..layout.first + visible].iter().enumerate() {
+                    let index = layout.first + offset;
+                    let y = layout.list.y + 2.0 + offset as f32 * lh;
+                    if index == popup.selected {
+                        let bounds = Rectangle::new(Point::new(layout.list.x + 2.0, y), Size::new(layout.list.width - 4.0, lh));
+                        fill(r, bounds, colors.selection);
+                    }
+                    let tag = Point::new(layout.list.x + cw * 0.5, y);
+                    draw_text(r, row.tag.to_string(), tag, row.color, metrics, layout.list);
+                    let label = Point::new(layout.list.x + cw * (TAG_COLUMNS as f32 + 0.5), y);
+                    draw_text(r, row.label.clone(), label, colors.text, metrics, layout.list);
+                }
+                if let (Some(rect), Some(doc)) = (layout.docs, popup.doc) {
+                    draw_doc(r, doc, rect, colors, metrics);
                 }
             }
         });
@@ -586,6 +898,12 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             return mouse::Interaction::None;
         };
         let geometry = Geometry::new(self.buffer, layout.bounds(), metrics);
+        if let Some(popup) = &self.completion {
+            let layout = self.completion_layout(popup, &geometry, state.scroll, metrics);
+            if cursor.is_over(layout.list) {
+                return mouse::Interaction::Pointer;
+            }
+        }
         if cursor.is_over(geometry.text_area) {
             mouse::Interaction::Text
         } else {
@@ -603,22 +921,108 @@ impl<'a, Message: 'a> From<CodeEditor<'a, Message>> for Element<'a, Message> {
 fn measure(font_size: f32) -> Metrics {
     const SAMPLE: &str = "MMMMMMMMMMMMMMMMMMMM";
     let line_height = (font_size * LINE_HEIGHT_FACTOR).round();
-    let paragraph = <iced::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
-        content: SAMPLE,
-        bounds: Size::INFINITE,
-        size: Pixels(font_size),
-        line_height: text::LineHeight::Absolute(Pixels(line_height)),
-        font: Font::MONOSPACE,
-        align_x: text::Alignment::Left,
-        align_y: alignment::Vertical::Top,
-        shaping: text::Shaping::Basic,
-        wrapping: text::Wrapping::None,
-    });
+    let paragraph = paragraph(SAMPLE, Font::MONOSPACE, font_size, line_height, f32::INFINITY);
     Metrics {
         font_size,
         char_width: paragraph.min_width() / SAMPLE.len() as f32,
         line_height,
     }
+}
+
+type Paragraph = <iced::Renderer as text::Renderer>::Paragraph;
+
+fn paragraph(content: &str, font: Font, size: f32, line_height: f32, width: f32) -> Paragraph {
+    Paragraph::with_text(text::Text {
+        content,
+        bounds: Size::new(width, f32::INFINITY),
+        size: Pixels(size),
+        line_height: text::LineHeight::Absolute(Pixels(line_height)),
+        font,
+        align_x: text::Alignment::Left,
+        align_y: alignment::Vertical::Top,
+        shaping: text::Shaping::Advanced,
+        wrapping: text::Wrapping::WordOrGlyph,
+    })
+}
+
+fn doc_line_height() -> f32 {
+    (DOC_FONT_SIZE * 1.35).round()
+}
+
+/// Height of a docs panel of `width`: signature (monospace) plus prose.
+fn doc_height(doc: &Doc, width: f32, metrics: Metrics) -> f32 {
+    let inner = width - POPUP_PADDING * 2.0;
+    let mut height = POPUP_PADDING * 2.0;
+    if let Some(signature) = &doc.signature {
+        height += paragraph(signature, Font::MONOSPACE, metrics.font_size, metrics.line_height, inner).min_height();
+    }
+    if !doc.body.is_empty() {
+        if doc.signature.is_some() {
+            height += 6.0;
+        }
+        height += paragraph(&doc.body, Font::DEFAULT, DOC_FONT_SIZE, doc_line_height(), inner).min_height();
+    }
+    height.min(360.0)
+}
+
+/// Draws a docs panel. Uses `fill_text` (owned, cached by the renderer):
+/// `fill_paragraph` only keeps a weak reference, so a paragraph built
+/// during `draw` would be gone before the frame renders. The bounds must be
+/// finite: with an infinite height the cached text wraps after every glyph.
+fn draw_doc(renderer: &mut iced::Renderer, doc: &Doc, rect: Rectangle, colors: &Colors, metrics: Metrics) {
+    panel(renderer, rect, colors);
+    let inner = rect.width - POPUP_PADDING * 2.0;
+    let x = rect.x + POPUP_PADDING;
+    let mut y = rect.y + POPUP_PADDING;
+    let clip = Rectangle { height: rect.height - POPUP_PADDING, ..rect };
+    let wrapped = |renderer: &mut iced::Renderer, content: &str, font, size, line_height, color, y| {
+        renderer.fill_text(
+            text::Text {
+                content: content.to_string(),
+                bounds: Size::new(inner, rect.height),
+                size: Pixels(size),
+                line_height: text::LineHeight::Absolute(Pixels(line_height)),
+                font,
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Top,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::WordOrGlyph,
+            },
+            Point::new(x, y),
+            color,
+            clip,
+        );
+    };
+    if let Some(signature) = &doc.signature {
+        let function = to_color(colors.syntax.function);
+        wrapped(renderer, signature, Font::MONOSPACE, metrics.font_size, metrics.line_height, function, y);
+        y += paragraph(signature, Font::MONOSPACE, metrics.font_size, metrics.line_height, inner).min_height() + 6.0;
+    }
+    if !doc.body.is_empty() {
+        wrapped(renderer, &doc.body, Font::DEFAULT, DOC_FONT_SIZE, doc_line_height(), colors.text, y);
+    }
+}
+
+fn panel(renderer: &mut iced::Renderer, bounds: Rectangle, colors: &Colors) {
+    renderer.fill_quad(
+        Quad {
+            bounds,
+            border: Border { color: colors.popup_border, width: 1.0, radius: 4.0.into() },
+            ..Quad::default()
+        },
+        colors.popup,
+    );
+}
+
+fn outline(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {
+    renderer.fill_quad(
+        Quad {
+            bounds,
+            border: Border { color, width: 1.0, radius: 2.0.into() },
+            ..Quad::default()
+        },
+        Color::TRANSPARENT,
+    );
 }
 
 fn fill(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {

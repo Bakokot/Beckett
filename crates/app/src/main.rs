@@ -1,21 +1,29 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod code_editor;
+mod completion;
+mod docs;
 mod explorer;
 mod lsp;
 mod problems;
 mod style;
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use editor_core::{Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
 use iced::widget::{button, center, column, container, pick_list, row, scrollable, space, text, Row};
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task};
-use lsp_client::{uri, Event, Position, Severity};
+use lsp_client::{uri, CompletionKind, Event, Position, Severity};
 
-use code_editor::{CodeEditor, Mark};
+use code_editor::{
+    CodeEditor, CompletionAction, CompletionPopup, CompletionRow, EditorEvent, HoverPopup, Mark,
+    SignaturePopup,
+};
+use completion::Completion;
+use docs::Doc;
 use explorer::Explorer;
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
@@ -39,7 +47,7 @@ pub enum Message {
     SelectTab(usize),
     CloseTab(usize),
     CloseActiveTab,
-    Edit(Command),
+    Edit(EditorEvent),
     Save,
     ThemeSelected(String),
     Lsp(LspEvent),
@@ -53,6 +61,17 @@ pub enum Message {
 /// What an in-flight LSP request was for.
 enum Pending {
     Definition,
+    Completion,
+    /// Docs for `items[index]` of the current completion.
+    Resolve(usize),
+    Hover(Pos),
+    Signature(Pos),
+}
+
+struct Signature {
+    label: String,
+    active: Option<Range<usize>>,
+    anchor: Pos,
 }
 
 struct App {
@@ -71,6 +90,10 @@ struct App {
     pending: HashMap<u64, Pending>,
     problems: Problems,
     show_problems: bool,
+    // Popups for the active tab.
+    completion: Option<Completion>,
+    hover: Option<(Pos, Doc)>,
+    signature: Option<Signature>,
 }
 
 struct Project {
@@ -126,6 +149,9 @@ impl App {
             pending: HashMap::new(),
             problems: Problems::default(),
             show_problems: false,
+            completion: None,
+            hover: None,
+            signature: None,
         };
         if let Some(path) = initial {
             app.open_path(path);
@@ -183,32 +209,26 @@ impl App {
                 }
             }
             Message::OpenFile(path) => {
+                self.dismiss_popups();
                 self.open_file(path);
             }
             Message::SelectTab(index) => {
                 if index < self.tabs.len() {
+                    self.dismiss_popups();
                     self.active = Some(index);
                 }
             }
-            Message::CloseTab(index) => self.close_tab(index),
+            Message::CloseTab(index) => {
+                self.dismiss_popups();
+                self.close_tab(index);
+            }
             Message::CloseActiveTab => {
                 if let Some(index) = self.active {
+                    self.dismiss_popups();
                     self.close_tab(index);
                 }
             }
-            Message::Edit(command) => {
-                if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
-                    let before = tab.buffer.version();
-                    tab.buffer.apply(command);
-                    if tab.buffer.version() != before {
-                        tab.dirty = true;
-                        tab.version += 1;
-                        if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
-                            let _ = client.did_change(&tab.path, tab.version, &tab.buffer.text());
-                        }
-                    }
-                }
-            }
+            Message::Edit(event) => self.on_editor(event),
             Message::Save => self.save_active(),
             Message::ThemeSelected(name) => {
                 if let Some(index) = self.themes.iter().position(|t| t.name == name) {
@@ -225,9 +245,253 @@ impl App {
             }
             Message::GotoDefinition => self.goto_definition(),
             Message::ToggleProblems => self.show_problems = !self.show_problems,
-            Message::JumpTo(path, line, character) => self.jump_to(path, line, character),
+            Message::JumpTo(path, line, character) => {
+                self.dismiss_popups();
+                self.jump_to(path, line, character);
+            }
         }
         Task::none()
+    }
+
+    fn on_editor(&mut self, event: EditorEvent) {
+        match event {
+            EditorEvent::Command(command) => {
+                let typed = match &command {
+                    Command::Insert(text) => text.chars().last(),
+                    _ => None,
+                };
+                let backspace = matches!(command, Command::Backspace { .. });
+                self.apply_command(command);
+                self.hover = None;
+                match typed {
+                    Some(c) => self.after_typing(c),
+                    None if backspace => self.refilter_completion(),
+                    None => {
+                        self.completion = None;
+                        self.signature = None;
+                    }
+                }
+            }
+            EditorEvent::Completion(action) => match action {
+                CompletionAction::Move(delta) => {
+                    if let Some(c) = &mut self.completion {
+                        let last = c.filtered.len().saturating_sub(1) as isize;
+                        c.selected = (c.selected as isize + delta).clamp(0, last) as usize;
+                        c.doc = None;
+                    }
+                    self.resolve_selected();
+                }
+                CompletionAction::Accept => self.accept_completion(None),
+                CompletionAction::AcceptIndex(index) => self.accept_completion(Some(index)),
+                CompletionAction::Dismiss => self.dismiss_popups(),
+            },
+            EditorEvent::TriggerCompletion => self.request_completion(None),
+            EditorEvent::Hover(pos) => self.request_hover(pos),
+            EditorEvent::HoverEnd => self.hover = None,
+        }
+    }
+
+    /// Applies an edit to the active tab and syncs it to the language server.
+    fn apply_command(&mut self, command: Command) {
+        let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) else {
+            return;
+        };
+        let before = tab.buffer.version();
+        tab.buffer.apply(command);
+        if tab.buffer.version() != before {
+            tab.dirty = true;
+            tab.version += 1;
+            if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
+                let _ = client.did_change(&tab.path, tab.version, &tab.buffer.text());
+            }
+        }
+    }
+
+    fn after_typing(&mut self, c: char) {
+        if c.is_alphanumeric() || c == '_' {
+            if self.completion.is_some() {
+                self.refilter_completion();
+            } else {
+                self.request_completion(None);
+            }
+        } else if matches!(c, '.' | '$' | '"' | '\'') {
+            self.request_completion(Some(c));
+        } else {
+            self.completion = None;
+        }
+        match c {
+            '(' | ',' => self.request_signature(),
+            ')' => self.signature = None,
+            _ => {}
+        }
+    }
+
+    fn dismiss_popups(&mut self) {
+        self.completion = None;
+        self.hover = None;
+        self.signature = None;
+    }
+
+    /// The active GDScript tab with a connected language server.
+    fn lsp_target(&self) -> Option<(lsp_client::Client, &Tab, Pos)> {
+        let tab = self.active_tab().filter(|t| t.language == Language::GDScript)?;
+        let client = self.lsp.client()?.clone();
+        let pos = tab.buffer.char_to_pos(tab.buffer.primary().head);
+        Some((client, tab, pos))
+    }
+
+    fn request_completion(&mut self, trigger: Option<char>) {
+        let Some((client, tab, pos)) = self.lsp_target() else {
+            return;
+        };
+        let anchor = tab.buffer.word_start(tab.buffer.primary().head);
+        if let Ok(id) = client.completion(&tab.path, to_lsp(pos), trigger) {
+            self.pending.insert(id, Pending::Completion);
+            self.completion = Some(Completion::new(id, anchor));
+        }
+    }
+
+    /// Narrows the completion list to the word typed since it opened.
+    fn refilter_completion(&mut self) {
+        let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
+            return;
+        };
+        let Some(c) = &mut self.completion else {
+            return;
+        };
+        let head = tab.buffer.primary().head;
+        let same_line = tab.buffer.char_to_pos(head).line == tab.buffer.char_to_pos(c.anchor).line;
+        let prefix = tab.buffer.slice(c.anchor, head);
+        if head < c.anchor || !same_line || !prefix.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+            self.completion = None;
+            return;
+        }
+        if c.request.is_some() {
+            return; // Narrowed when the answer arrives.
+        }
+        c.filtered = completion::rank(&c.items, &prefix);
+        if c.filtered.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let colors = code_editor::Colors::from_theme(&self.themes[self.theme_index]);
+        c.rows = c.filtered.iter().map(|&i| completion_row(&c.items[i], &colors)).collect();
+        c.selected = 0;
+        c.doc = None;
+        self.resolve_selected();
+    }
+
+    /// Shows the selected item's docs, asking the server if needed.
+    fn resolve_selected(&mut self) {
+        let client = self.lsp.client().cloned();
+        let Some(c) = &mut self.completion else {
+            return;
+        };
+        let Some((index, item)) = c.selected_item() else {
+            return;
+        };
+        match &item.documentation {
+            Some(markdown) => c.doc = Some(Doc::from_markdown(markdown)),
+            None => {
+                if let Some(Ok(id)) = client.map(|client| client.resolve_completion(item)) {
+                    self.pending.insert(id, Pending::Resolve(index));
+                }
+            }
+        }
+    }
+
+    fn accept_completion(&mut self, row: Option<usize>) {
+        let Some(c) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = c.filtered.get(row.unwrap_or(c.selected)).map(|&i| &c.items[i]) else {
+            return;
+        };
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let head = tab.buffer.primary().head;
+        let Some(delete) = head.checked_sub(c.anchor) else {
+            return;
+        };
+        let mut text = item.insert_text.clone();
+        // Functions without arguments come with "()"; add parens for the rest
+        // and put the cursor inside.
+        let callable = item.kind == CompletionKind::Function && !text.contains('(') && !text.ends_with(':');
+        if callable {
+            text.push_str("()");
+        }
+        let cursor_back = usize::from(callable);
+        self.apply_command(Command::ReplaceBefore { delete, text, cursor_back });
+        if callable {
+            self.request_signature();
+        }
+    }
+
+    fn request_hover(&mut self, pos: Pos) {
+        let Some((client, tab, _)) = self.lsp_target() else {
+            return;
+        };
+        if let Ok(id) = client.hover(&tab.path, to_lsp(pos)) {
+            self.pending.insert(id, Pending::Hover(pos));
+        }
+    }
+
+    fn request_signature(&mut self) {
+        let Some((client, tab, pos)) = self.lsp_target() else {
+            return;
+        };
+        if let Ok(id) = client.signature_help(&tab.path, to_lsp(pos)) {
+            self.pending.insert(id, Pending::Signature(pos));
+        }
+    }
+
+    fn on_response(&mut self, pending: Pending, id: u64, value: serde_json::Value) {
+        match pending {
+            Pending::Definition => match lsp_client::locations(&value).into_iter().next() {
+                Some(location) => {
+                    let start = location.range.start;
+                    self.dismiss_popups();
+                    self.jump_to(location.path, start.line, start.character);
+                }
+                None => self.status = Some("No definition found".to_string()),
+            },
+            Pending::Completion => {
+                if let Some(c) = &mut self.completion {
+                    if c.request == Some(id) {
+                        c.items = lsp_client::completion_items(&value);
+                        c.request = None;
+                        self.refilter_completion();
+                    }
+                }
+            }
+            Pending::Resolve(index) => {
+                let Some(resolved) = lsp_client::completion_item(&value) else {
+                    return;
+                };
+                let Some(c) = &mut self.completion else {
+                    return;
+                };
+                let Some(item) = c.items.get_mut(index).filter(|i| i.label == resolved.label) else {
+                    return;
+                };
+                // Remember "no docs" too, so it isn't requested again.
+                item.documentation = Some(resolved.documentation.unwrap_or_default());
+                if c.selected_item().is_some_and(|(i, _)| i == index) {
+                    c.doc = c.items[index].documentation.as_deref().map(Doc::from_markdown);
+                }
+            }
+            Pending::Hover(pos) => {
+                self.hover = lsp_client::hover_text(&value).map(|text| (pos, Doc::from_markdown(&text)));
+            }
+            Pending::Signature(anchor) => {
+                self.signature = lsp_client::signature_help(&value).map(|help| Signature {
+                    label: help.label.replace('\t', " "),
+                    active: help.active_parameter,
+                    anchor,
+                });
+            }
+        }
     }
 
     fn on_lsp(&mut self, event: LspEvent) {
@@ -246,19 +510,19 @@ impl App {
                 self.problems.set(path, diagnostics);
                 self.refresh_marks();
             }
-            LspEvent::Event(Event::Response { id, result }) => match self.pending.remove(&id) {
-                Some(Pending::Definition) => match result {
-                    Ok(value) => match lsp_client::locations(&value).into_iter().next() {
-                        Some(location) => {
-                            let start = location.range.start;
-                            self.jump_to(location.path, start.line, start.character);
+            LspEvent::Event(Event::Response { id, result }) => {
+                let Some(pending) = self.pending.remove(&id) else {
+                    return;
+                };
+                match result {
+                    Ok(value) => self.on_response(pending, id, value),
+                    Err(error) => {
+                        if matches!(pending, Pending::Definition) {
+                            self.status = Some(format!("Go to definition failed: {error}"));
                         }
-                        None => self.status = Some("No definition found".to_string()),
-                    },
-                    Err(error) => self.status = Some(format!("Go to definition failed: {error}")),
-                },
-                None => {}
-            },
+                    }
+                }
+            }
             LspEvent::Event(Event::Disconnected(reason)) => {
                 if let Some(reason) = reason {
                     self.status = Some(format!("Language server disconnected: {reason}"));
@@ -322,11 +586,7 @@ impl App {
             return;
         };
         let pos = tab.buffer.char_to_pos(tab.buffer.primary().head);
-        let position = Position {
-            line: pos.line as u32,
-            character: pos.column as u32,
-        };
-        match client.definition(&tab.path, position) {
+        match client.definition(&tab.path, to_lsp(pos)) {
             Ok(id) => {
                 self.pending.insert(id, Pending::Definition);
             }
@@ -528,7 +788,23 @@ impl App {
         };
 
         let colors = code_editor::Colors::from_theme(self.current_theme());
-        let editor = CodeEditor::new(&tab.buffer, colors, Message::Edit).marks(&tab.marks);
+        let completion = self.completion.as_ref().map(|c| CompletionPopup {
+            rows: &c.rows,
+            selected: c.selected,
+            anchor: tab.buffer.char_to_pos(c.anchor),
+            doc: c.doc.as_ref(),
+        });
+        let hover = self.hover.as_ref().map(|(pos, doc)| HoverPopup { pos: *pos, doc });
+        let signature = self.signature.as_ref().map(|s| SignaturePopup {
+            label: &s.label,
+            active: s.active.clone(),
+            anchor: s.anchor,
+        });
+        let editor = CodeEditor::new(&tab.buffer, colors, Message::Edit)
+            .marks(&tab.marks)
+            .completion(completion)
+            .hover(hover)
+            .signature(signature);
 
         column![self.tab_bar(), editor].into()
     }
@@ -655,4 +931,30 @@ async fn pick_folder() -> Option<PathBuf> {
         .pick_folder()
         .await
         .map(|handle| handle.path().to_path_buf())
+}
+
+fn to_lsp(pos: Pos) -> Position {
+    Position {
+        line: pos.line as u32,
+        character: pos.column as u32,
+    }
+}
+
+fn completion_row(item: &lsp_client::CompletionItem, colors: &code_editor::Colors) -> CompletionRow {
+    let syntax = &colors.syntax;
+    let (tag, color) = match item.kind {
+        CompletionKind::Function => ("fn", style::to_color(syntax.function)),
+        CompletionKind::Variable => ("var", colors.text),
+        CompletionKind::Class => ("cls", style::to_color(syntax.r#type)),
+        CompletionKind::Constant => ("const", style::to_color(syntax.constant)),
+        CompletionKind::Keyword => ("kw", style::to_color(syntax.keyword)),
+        CompletionKind::Signal => ("sig", style::to_color(syntax.annotation)),
+        CompletionKind::File => ("file", style::to_color(syntax.string)),
+        CompletionKind::Other => ("", colors.muted),
+    };
+    CompletionRow {
+        label: item.label.clone(),
+        tag,
+        color,
+    }
 }

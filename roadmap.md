@@ -102,7 +102,12 @@ crates/
 - [ ] Auto-reconnect (currently manual: click the indicator)
 - [ ] Warn when no installed Godot matches the project version
 - [x] Inline diagnostics (colored underlines, updated live as you type)
-- [ ] Completion, hover, signature help (popup overlay at the cursor — now unblocked)
+- [x] Completion: opens while typing identifiers, on `.` `$` quotes, and Ctrl+Space; client-side
+      ranking (prefix > substring > subsequence); kind tags; docs pane via `completionItem/resolve`;
+      Enter/Tab/click to accept, functions get `()` with the cursor inside
+- [x] Signature help on `(` and `,`, active parameter highlighted
+- [x] Hover docs after the mouse rests 500 ms on a word — not yet tested live (needs a real mouse)
+- [ ] Member completion after `.` not yet verified live (test harness can't type Shift chars on AZERTY)
 - [ ] Find references, rename
 
 **Godot awareness**

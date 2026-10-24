@@ -1135,6 +1135,7 @@ dependencies = [
  "iced",
  "lsp-client",
  "rfd",
+ "serde_json",
  "theme",
 ]
 

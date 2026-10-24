@@ -11,7 +11,10 @@ mod protocol;
 mod types;
 pub mod uri;
 
-pub use types::{locations, Diagnostic, Location, Position, Range, Severity};
+pub use types::{
+    completion_item, completion_items, hover_text, locations, signature_help, CompletionItem,
+    CompletionKind, Diagnostic, Location, Position, Range, Severity, SignatureHelp,
+};
 
 use std::fmt;
 use std::io::{self, BufReader};
@@ -171,6 +174,43 @@ impl Client {
     pub fn definition(&self, path: &Path, position: Position) -> io::Result<u64> {
         self.request(
             "textDocument/definition",
+            json!({ "textDocument": { "uri": path_to_uri(path) }, "position": position.to_json() }),
+        )
+    }
+
+    /// `trigger` is the character that opened completion, if any (e.g. `.`).
+    pub fn completion(&self, path: &Path, position: Position, trigger: Option<char>) -> io::Result<u64> {
+        let context = match trigger {
+            Some(c) => json!({ "triggerKind": 2, "triggerCharacter": c.to_string() }),
+            None => json!({ "triggerKind": 1 }),
+        };
+        self.request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": path_to_uri(path) },
+                "position": position.to_json(),
+                "context": context,
+            }),
+        )
+    }
+
+    /// Asks for an item's documentation; decode the answer with [`completion_item`].
+    pub fn resolve_completion(&self, item: &CompletionItem) -> io::Result<u64> {
+        self.request("completionItem/resolve", item.raw.clone())
+    }
+
+    /// Decode the answer with [`hover_text`].
+    pub fn hover(&self, path: &Path, position: Position) -> io::Result<u64> {
+        self.request(
+            "textDocument/hover",
+            json!({ "textDocument": { "uri": path_to_uri(path) }, "position": position.to_json() }),
+        )
+    }
+
+    /// Decode the answer with [`signature_help`].
+    pub fn signature_help(&self, path: &Path, position: Position) -> io::Result<u64> {
+        self.request(
+            "textDocument/signatureHelp",
             json!({ "textDocument": { "uri": path_to_uri(path) }, "position": position.to_json() }),
         )
     }
@@ -351,6 +391,9 @@ fn handshake(
                     "synchronization": { "didSave": true },
                     "publishDiagnostics": {},
                     "definition": { "linkSupport": false },
+                    "completion": { "completionItem": { "documentationFormat": ["markdown", "plaintext"] } },
+                    "hover": { "contentFormat": ["markdown", "plaintext"] },
+                    "signatureHelp": { "signatureInformation": { "documentationFormat": ["markdown"] } },
                 }},
             }),
         )

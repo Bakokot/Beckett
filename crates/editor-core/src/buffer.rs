@@ -91,6 +91,9 @@ pub enum Command {
     SelectNextOccurrence,
     /// Typed text; single characters get bracket/quote auto-closing.
     Insert(String),
+    /// At every cursor: delete `delete` chars before it, insert `text`, then
+    /// move back `cursor_back` chars (accepting a completion).
+    ReplaceBefore { delete: usize, text: String, cursor_back: usize },
     Paste(String),
     Newline,
     Backspace { word: bool },
@@ -405,6 +408,21 @@ impl Buffer {
             }
             Command::SelectNextOccurrence => self.select_next_occurrence(),
             Command::Insert(text) => self.insert(&text),
+            Command::ReplaceBefore { delete, text, cursor_back } => {
+                let len = text.chars().count();
+                let mut changes = Vec::new();
+                let mut after = Vec::new();
+                let mut delta = 0isize;
+                for sel in &self.selections {
+                    let end = sel.end();
+                    let start = sel.start().saturating_sub(delete);
+                    let s = (start as isize + delta) as usize;
+                    after.push(Selection::cursor(s + len - cursor_back.min(len)));
+                    delta += len as isize - (end - start) as isize;
+                    changes.push(change(start, end, &text));
+                }
+                self.edit(changes, Some(after), EditKind::Other);
+            }
             Command::Paste(text) => self.paste(&text.replace("\r\n", "\n")),
             Command::Newline => self.newline(),
             Command::Backspace { word } => self.backspace(word),
@@ -965,7 +983,26 @@ impl Buffer {
         if i == pos { i.saturating_sub(1) } else { i }
     }
 
-    /// The identifier around `pos` (empty range if none).
+    /// Start of the identifier that ends at `index` (`index` itself if none).
+    pub fn word_start(&self, index: usize) -> usize {
+        let mut start = index.min(self.len_chars());
+        while start > 0 && char_class(self.rope.char(start - 1)) == CharClass::Word {
+            start -= 1;
+        }
+        start
+    }
+
+    /// Text between two char indices.
+    pub fn slice(&self, start: usize, end: usize) -> String {
+        let end = end.min(self.len_chars());
+        self.rope.slice(start.min(end)..end).to_string()
+    }
+
+    /// The identifier around `index` (empty range if none).
+    pub fn word_range(&self, index: usize) -> (usize, usize) {
+        self.word_at(index)
+    }
+
     fn word_at(&self, pos: usize) -> (usize, usize) {
         let is_word = |i: usize| self.char_at(i).is_some_and(|c| char_class(c) == CharClass::Word);
         let anchor = if is_word(pos) {
@@ -1220,6 +1257,19 @@ mod tests {
         b.apply(Command::AddCursorBelow);
         b.apply(Command::Paste("1\n2".into()));
         assert_eq!(b.text(), "a1\nb2");
+    }
+
+    #[test]
+    fn replace_before_accepts_completion_at_every_cursor() {
+        let mut b = buf("v.len\nw.len");
+        at(&mut b, 0, 5);
+        b.apply(Command::AddCursorBelow);
+        assert_eq!(b.word_start(b.primary().head) , b.pos_to_char(Pos { line: 1, column: 2 }));
+        b.apply(Command::ReplaceBefore { delete: 3, text: "length()".into(), cursor_back: 1 });
+        assert_eq!(b.text(), "v.length()\nw.length()");
+        assert_eq!(b.char_to_pos(b.primary().head), Pos { line: 1, column: 9 });
+        b.apply(Command::Undo);
+        assert_eq!(b.text(), "v.len\nw.len");
     }
 
     #[test]
