@@ -1,6 +1,9 @@
-//! UI-independent editor logic: language detection and syntax lexing.
+//! UI-independent editor logic: text buffer, language detection, lexing.
 
+pub mod buffer;
 pub mod gdscript;
+
+pub use buffer::{Buffer, Command, Motion, Pos, Selection};
 
 use std::path::Path;
 

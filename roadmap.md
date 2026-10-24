@@ -16,9 +16,9 @@ the Godot editor.
 
 | Concern | Choice |
 |---|---|
-| UI | Iced (wgpu + cosmic-text) |
-| Text buffer | `ropey` |
-| Syntax highlighting | `tree-sitter` + `tree-sitter-gdscript` |
+| UI | Iced 0.14 (wgpu + cosmic-text), custom `CodeEditor` widget |
+| Text buffer | `ropey`, multi-selection change sets, grouped undo |
+| Syntax highlighting | Hand-written GDScript lexer (tree-sitter later for folding/outline) |
 | LSP / DAP client | `serde_json` + std threads, no async runtime (TCP to Godot: LSP 6005, DAP 6006) |
 | Terminal | `alacritty_terminal` + `portable-pty` |
 | File watching | `notify` |
@@ -64,19 +64,27 @@ crates/
 - [x] Open folder (dialog or CLI arg) + `project.godot` parsing (name, version, `res://`)
 
 **Known Phase 0 issues**
-- Tabs render 8 columns wide (Godot uses 4); fix with the custom editor widget, or sooner if iced exposes tab width
 - No bundled UI/icon font yet, so explorer arrows are ASCII
 
 **Deferred from Phase 0 → Phase 1**
-- Custom rope-based (`ropey`) editor widget — required for multi-cursor, column selection, folding
 - Tree-sitter — for folding/outline; the lexer stays as the fast highlighter
 - Explorer create / rename / delete / reveal in OS
 
 ## Phase 1 — MVP
 
-**Editor**
-- [ ] Multi-cursor, column selection, line duplicate/move, comment toggle
-- [ ] Bracket matching / auto-close, indentation guides
+**Editor** — custom widget (`app/src/code_editor.rs`) over `editor_core::Buffer`
+- [x] Rope buffer, line-number gutter, 4-wide tabs, current-line highlight, blinking cursor
+- [x] Mouse: click, shift+click, drag-select, double-click word, triple-click line, wheel scroll
+- [x] Multi-cursor: Alt+click, Ctrl+Alt+Up/Down, Ctrl+D (select next occurrence), Esc to collapse
+- [x] Line ops: Alt+Up/Down move, Shift+Alt+Up/Down duplicate, Ctrl+Shift+K delete,
+      Ctrl+K or Ctrl+/ toggle comment, Tab/Shift+Tab indent/outdent
+- [x] Smart Enter (keeps indent, indents after `:` and brackets), smart Home
+- [x] Bracket matching, auto-close brackets/quotes, wrap selection, step over closers
+- [x] Undo/redo grouped by typing runs; clipboard (multi-cursor paste distributes lines)
+- [x] AltGr typing on AZERTY etc. (Ctrl+Alt is treated as text, not a shortcut)
+- [ ] Indentation guides
+- [ ] Box (column) selection by Alt+drag
+- [ ] IME composition (CJK input)
 - [ ] Find/replace in file and across project (regex, case, whole word)
 - [ ] GDScript snippets (`_ready`, `_process`, `@export`, `@onready`, signals…)
 - [ ] External file change detection and reload
@@ -93,8 +101,8 @@ crates/
 - [x] Go to definition (F12)
 - [ ] Auto-reconnect (currently manual: click the indicator)
 - [ ] Warn when no installed Godot matches the project version
-- [ ] Inline diagnostics (squiggles) — needs the custom editor widget
-- [ ] Completion, hover, signature help — need the custom editor widget (popup at cursor)
+- [x] Inline diagnostics (colored underlines, updated live as you type)
+- [ ] Completion, hover, signature help (popup overlay at the cursor — now unblocked)
 - [ ] Find references, rename
 
 **Godot awareness**

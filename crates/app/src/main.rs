@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod code_editor;
 mod explorer;
-mod highlighter;
 mod lsp;
 mod problems;
 mod style;
@@ -9,16 +9,14 @@ mod style;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use editor_core::Language;
+use editor_core::{Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
-use iced::widget::{
-    button, center, column, container, pick_list, row, scrollable, space, text, text_editor, Row,
-};
-use iced::{keyboard, Alignment, Element, Font, Length, Subscription, Task};
-use lsp_client::{uri, Event, Position};
+use iced::widget::{button, center, column, container, pick_list, row, scrollable, space, text, Row};
+use iced::{keyboard, Alignment, Element, Length, Subscription, Task};
+use lsp_client::{uri, Event, Position, Severity};
 
+use code_editor::{CodeEditor, Mark};
 use explorer::Explorer;
-use highlighter::GdHighlighter;
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
 
@@ -41,7 +39,7 @@ pub enum Message {
     SelectTab(usize),
     CloseTab(usize),
     CloseActiveTab,
-    Edit(text_editor::Action),
+    Edit(Command),
     Save,
     ThemeSelected(String),
     Lsp(LspEvent),
@@ -84,10 +82,12 @@ struct Project {
 struct Tab {
     path: PathBuf,
     language: Language,
-    content: text_editor::Content,
+    buffer: Buffer,
     dirty: bool,
     /// LSP document version, bumped on every edit.
     version: i32,
+    /// Diagnostic underlines, rebuilt when diagnostics or the theme change.
+    marks: Vec<Mark>,
 }
 
 impl Tab {
@@ -196,15 +196,15 @@ impl App {
                     self.close_tab(index);
                 }
             }
-            Message::Edit(action) => {
+            Message::Edit(command) => {
                 if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
-                    let is_edit = action.is_edit();
-                    tab.content.perform(action);
-                    if is_edit {
+                    let before = tab.buffer.version();
+                    tab.buffer.apply(command);
+                    if tab.buffer.version() != before {
                         tab.dirty = true;
                         tab.version += 1;
                         if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
-                            let _ = client.did_change(&tab.path, tab.version, &tab.content.text());
+                            let _ = client.did_change(&tab.path, tab.version, &tab.buffer.text());
                         }
                     }
                 }
@@ -214,6 +214,7 @@ impl App {
                 if let Some(index) = self.themes.iter().position(|t| t.name == name) {
                     self.theme_index = index;
                     self.iced_theme = style::iced_theme(&self.themes[index]);
+                    self.refresh_marks();
                 }
             }
             Message::Lsp(event) => self.on_lsp(event),
@@ -233,7 +234,7 @@ impl App {
         match event {
             LspEvent::Connected { client, label } => {
                 for tab in self.tabs.iter().filter(|t| t.language == Language::GDScript) {
-                    let _ = client.did_open(&tab.path, tab.version, &tab.content.text());
+                    let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
                 }
                 self.lsp = Lsp::Ready { client, label };
             }
@@ -243,6 +244,7 @@ impl App {
             }
             LspEvent::Event(Event::Diagnostics { path, diagnostics }) => {
                 self.problems.set(path, diagnostics);
+                self.refresh_marks();
             }
             LspEvent::Event(Event::Response { id, result }) => match self.pending.remove(&id) {
                 Some(Pending::Definition) => match result {
@@ -264,6 +266,7 @@ impl App {
                 self.lsp = Lsp::Disconnected;
                 self.pending.clear();
                 self.problems.clear();
+                self.refresh_marks();
             }
             LspEvent::Event(Event::Notification { .. }) => {}
         }
@@ -276,6 +279,35 @@ impl App {
         self.lsp_generation += 1;
         self.pending.clear();
         self.problems.clear();
+        self.refresh_marks();
+    }
+
+    /// Rebuilds every tab's diagnostic underlines.
+    fn refresh_marks(&mut self) {
+        let ui = self.themes[self.theme_index].ui;
+        for tab in &mut self.tabs {
+            tab.marks = self
+                .problems
+                .for_path(&tab.path)
+                .iter()
+                .map(|d| {
+                    let color = match d.severity {
+                        Severity::Error => ui.danger,
+                        Severity::Warning => ui.warning,
+                        Severity::Information | Severity::Hint => ui.text_muted,
+                    };
+                    let (start, end) = (d.range.start, d.range.end);
+                    let line = start.line as usize;
+                    let end_column = if end.line == start.line { end.character } else { u32::MAX };
+                    Mark {
+                        line,
+                        start: start.character as usize,
+                        end: (end_column as usize).min(tab.buffer.line_len(line)),
+                        color: style::to_color(color),
+                    }
+                })
+                .collect();
+        }
     }
 
     fn goto_definition(&mut self) {
@@ -289,10 +321,10 @@ impl App {
             self.status = Some("Language server is not connected".to_string());
             return;
         };
-        let (line, column) = cursor_position(&tab.content);
+        let pos = tab.buffer.char_to_pos(tab.buffer.primary().head);
         let position = Position {
-            line: line as u32,
-            character: column as u32,
+            line: pos.line as u32,
+            character: pos.column as u32,
         };
         match client.definition(&tab.path, position) {
             Ok(id) => {
@@ -307,7 +339,10 @@ impl App {
             return;
         }
         if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
-            move_cursor(&mut tab.content, line, character);
+            tab.buffer.set_cursor(Pos {
+                line: line as usize,
+                column: character as usize,
+            });
         }
     }
 
@@ -344,18 +379,21 @@ impl App {
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
+                let language = Language::from_path(&path);
                 let tab = Tab {
-                    language: Language::from_path(&path),
-                    content: text_editor::Content::with_text(&text),
+                    language,
+                    buffer: Buffer::new(&text, language),
                     path,
                     dirty: false,
                     version: 1,
+                    marks: Vec::new(),
                 };
                 if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
                     let _ = client.did_open(&tab.path, tab.version, &text);
                 }
                 self.tabs.push(tab);
                 self.active = Some(self.tabs.len() - 1);
+                self.refresh_marks();
                 true
             }
             Err(error) => {
@@ -394,7 +432,7 @@ impl App {
         let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) else {
             return;
         };
-        let text = tab.content.text();
+        let text = tab.buffer.text();
         match std::fs::write(&tab.path, &text) {
             Ok(()) => {
                 tab.dirty = false;
@@ -489,21 +527,8 @@ impl App {
             return center(text("Open a file from the explorer").color(muted)).into();
         };
 
-        let editor = text_editor(&tab.content)
-            .on_action(Message::Edit)
-            .font(Font::MONOSPACE)
-            .size(14)
-            .padding(8)
-            .height(Length::Fill);
-        let editor: Element<'_, Message> = match tab.language {
-            Language::GDScript => editor
-                .highlight_with::<GdHighlighter>(
-                    self.current_theme().syntax,
-                    highlighter::to_format,
-                )
-                .into(),
-            Language::Plain => editor.into(),
-        };
+        let colors = code_editor::Colors::from_theme(self.current_theme());
+        let editor = CodeEditor::new(&tab.buffer, colors, Message::Edit).marks(&tab.marks);
 
         column![self.tab_bar(), editor].into()
     }
@@ -574,8 +599,13 @@ impl App {
 
         let mut right: Vec<Element<'_, Message>> = Vec::new();
         if let Some(tab) = self.active_tab() {
-            let (line, column) = cursor_position(&tab.content);
-            right.push(text(format!("Ln {}, Col {}", line + 1, column + 1)).size(12).into());
+            let pos = tab.buffer.char_to_pos(tab.buffer.primary().head);
+            let mut label = format!("Ln {}, Col {}", pos.line + 1, pos.column + 1);
+            let cursors = tab.buffer.selections().len();
+            if cursors > 1 {
+                label.push_str(&format!(" ({cursors} cursors)"));
+            }
+            right.push(text(label).size(12).into());
             right.push(text(tab.language.name()).size(12).into());
         }
         let names: Vec<String> = self.themes.iter().map(|t| t.name.clone()).collect();
@@ -617,22 +647,6 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Key::Character("w") if modifiers.command() => Some(Message::CloseActiveTab),
         _ => None,
     }
-}
-
-/// Zero-based (line, column) of the cursor.
-fn cursor_position(content: &text_editor::Content) -> (usize, usize) {
-    let position = content.cursor().position;
-    (position.line, position.column)
-}
-
-fn move_cursor(content: &mut text_editor::Content, line: u32, character: u32) {
-    content.move_to(text_editor::Cursor {
-        position: text_editor::Position {
-            line: line as usize,
-            column: character as usize,
-        },
-        selection: None,
-    });
 }
 
 async fn pick_folder() -> Option<PathBuf> {

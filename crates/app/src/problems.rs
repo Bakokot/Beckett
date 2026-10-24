@@ -26,6 +26,12 @@ impl Problems {
         }
     }
 
+    pub fn for_path(&self, path: &Path) -> &[Diagnostic] {
+        self.files
+            .get(&uri::path_key(path))
+            .map_or(&[], |(_, diagnostics)| diagnostics.as_slice())
+    }
+
     pub fn clear(&mut self) {
         self.files.clear();
     }
