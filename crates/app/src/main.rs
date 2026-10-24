@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 
 use editor_core::{Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
-use iced::widget::{button, center, column, container, pick_list, row, scrollable, space, text, tooltip, Row};
+use iced::widget::{
+    button, center, column, container, mouse_area, pick_list, row, scrollable, space, text, tooltip, Row,
+};
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task};
 use lsp_client::{uri, CompletionKind, Event, Position, Severity};
 
@@ -623,6 +625,10 @@ impl App {
             }
             PaletteMessage::Move(delta) => {
                 palette.move_selection(delta);
+                return Task::none();
+            }
+            PaletteMessage::Scroll(rows) => {
+                palette.scroll_by(rows);
                 return Task::none();
             }
             PaletteMessage::Accept => palette.selected_item().cloned(),
@@ -1450,16 +1456,28 @@ impl App {
                 }
                 let body = row![self.sidebar(project), main];
                 match &self.palette {
-                    // Drawn over everything, centered near the top.
+                    // Drawn over everything, centered near the top. A
+                    // backdrop under it catches clicks outside the box, which
+                    // close it (and don't reach the editor or panels).
                     Some(palette) => {
                         let ui = &self.current_theme().ui;
+                        let close = Message::Palette(PaletteMessage::Close);
+                        let backdrop = mouse_area(
+                            container(space())
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .style(|_| container::Style {
+                                    background: Some(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.15).into()),
+                                    ..container::Style::default()
+                                }),
+                        )
+                        .on_press(close.clone());
                         let palette = palette.view(ui).map(Message::Palette);
-                        let palette = on_escape::on_escape(palette, Message::Palette(PaletteMessage::Close));
+                        let palette = on_escape::on_escape(palette, close);
                         let layer = container(palette)
                             .center_x(Length::Fill)
-                            .height(Length::Fill)
                             .padding(iced::Padding { top: 48.0, ..iced::Padding::ZERO });
-                        iced::widget::stack![body, layer].into()
+                        iced::widget::stack![body, backdrop, layer].into()
                     }
                     None => body.into(),
                 }

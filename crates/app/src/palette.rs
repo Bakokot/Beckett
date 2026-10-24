@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use editor_core::fuzzy::fuzzy_match;
-use iced::widget::{button, column, container, row, space, text, text_input, Column, Row};
+use iced::mouse;
+use iced::widget::{button, column, container, mouse_area, row, space, text, text_input, Column, Row};
 use iced::{Background, Border, Element, Font, Length, Shadow, Vector};
 
 use crate::style;
@@ -19,6 +20,8 @@ const MAX_FILES: usize = 20_000;
 pub enum PaletteMessage {
     Input(String),
     Move(isize),
+    /// Mouse wheel over the list, in rows (positive is down).
+    Scroll(isize),
     Accept,
     /// A clicked row, as an index into the visible rows.
     AcceptRow(usize),
@@ -54,6 +57,8 @@ pub struct Palette<M> {
     pub input: String,
     pub items: Vec<Item<M>>,
     pub selected: usize,
+    /// First visible row; the wheel moves it independently of `selected`.
+    scroll: usize,
     /// Project files relative to the root, with `/` separators.
     files: Vec<String>,
     root: PathBuf,
@@ -67,12 +72,13 @@ impl<M: Clone> Palette<M> {
         collect(root, root, &mut files);
         files.sort();
         let recent = open.iter().filter_map(|p| relative(root, p)).collect();
-        Self { input, items: Vec::new(), selected: 0, files, root: root.to_path_buf(), recent }
+        Self { input, items: Vec::new(), selected: 0, scroll: 0, files, root: root.to_path_buf(), recent }
     }
 
     /// Rebuilds the list for the current input.
     pub fn refresh(&mut self, commands: &[CommandEntry<M>]) {
         self.selected = 0;
+        self.scroll = 0;
         self.items = if let Some(query) = self.input.strip_prefix('>') {
             command_items(query.trim(), commands)
         } else if let Some(target) = self.input.strip_prefix(':') {
@@ -82,14 +88,26 @@ impl<M: Clone> Palette<M> {
         };
     }
 
+    /// Moves the selection (keyboard), scrolling it into view.
     pub fn move_selection(&mut self, delta: isize) {
         let last = self.items.len().saturating_sub(1) as isize;
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + SHOWN {
+            self.scroll = self.selected + 1 - SHOWN;
+        }
     }
 
-    /// Index of the first visible row, so the selection stays in view.
+    /// Scrolls the list (mouse wheel) without moving the selection.
+    pub fn scroll_by(&mut self, rows: isize) {
+        let max = self.items.len().saturating_sub(SHOWN) as isize;
+        self.scroll = (self.scroll as isize + rows).clamp(0, max) as usize;
+    }
+
+    /// Index of the first visible row.
     pub fn first_shown(&self) -> usize {
-        self.selected.saturating_sub(SHOWN - 1)
+        self.scroll
     }
 
     pub fn placeholder(&self) -> &'static str {
@@ -177,7 +195,19 @@ impl<M: Clone> Palette<M> {
         let mut list = Column::with_children(rows);
         if self.items.is_empty() {
             list = list.push(container(text("No matches").size(13).color(muted)).padding([3, 8]));
+        } else if self.items.len() > SHOWN {
+            let last = (first + SHOWN).min(self.items.len());
+            let position = format!("{}-{} of {}", first + 1, last, self.items.len());
+            list = list.push(container(text(position).size(11).color(muted)).padding([2, 8]));
         }
+        // Wheel over the list scrolls it, three rows per notch.
+        let list = mouse_area(list).on_scroll(|delta| {
+            let rows = match delta {
+                mouse::ScrollDelta::Lines { y, .. } => -(y * 3.0),
+                mouse::ScrollDelta::Pixels { y, .. } => -(y / 20.0),
+            };
+            PaletteMessage::Scroll(rows.round() as isize)
+        });
 
         let (background, border) = (style::to_color(ui.surface), style::to_color(ui.border));
         container(column![input, list].spacing(4))
@@ -307,6 +337,7 @@ mod tests {
             input: String::new(),
             items: Vec::new(),
             selected: 0,
+            scroll: 0,
             files: files.iter().map(|f| f.to_string()).collect(),
             root: PathBuf::from("/game"),
             recent: vec!["scenes/main.gd".into()],
@@ -326,6 +357,29 @@ mod tests {
         p.refresh(&[]);
         assert_eq!(p.items[0].label, "main.gd");
         assert_eq!(p.items.len(), 3);
+    }
+
+    #[test]
+    fn wheel_scrolls_without_moving_the_selection_and_keys_scroll_into_view() {
+        let files: Vec<String> = (0..40).map(|i| format!("f{i:02}.gd")).collect();
+        let mut p = palette(&files.iter().map(String::as_str).collect::<Vec<_>>());
+        p.recent.clear();
+        p.refresh(&[]);
+        assert_eq!(p.items.len(), 40);
+
+        p.scroll_by(5);
+        assert_eq!((p.first_shown(), p.selected), (5, 0));
+        p.scroll_by(100);
+        assert_eq!(p.first_shown(), 40 - SHOWN);
+        p.scroll_by(-100);
+        assert_eq!(p.first_shown(), 0);
+
+        p.move_selection(SHOWN as isize);
+        assert_eq!(p.selected, SHOWN);
+        assert_eq!(p.first_shown(), 1);
+        assert_eq!(p.row(SHOWN - 1).unwrap().label, p.items[SHOWN].label);
+        p.move_selection(-(SHOWN as isize));
+        assert_eq!(p.first_shown(), 0);
     }
 
     #[test]
