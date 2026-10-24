@@ -46,12 +46,20 @@ impl Lsp {
     }
 }
 
-/// `generation` changes force a fresh connection (restart).
+/// Identifies a connection; changing any field (e.g. `generation` on
+/// restart) replaces it with a fresh one.
+#[derive(Debug, Clone, Hash)]
+struct Connection {
+    root: PathBuf,
+    wanted_version: Option<String>,
+    generation: u64,
+}
+
 pub fn connect(root: PathBuf, wanted_version: Option<String>, generation: u64) -> Subscription<LspEvent> {
-    let id = (root.clone(), generation);
-    Subscription::run_with_id(
-        id,
-        iced::stream::channel(64, move |mut output| async move {
+    let connection = Connection { root, wanted_version, generation };
+    Subscription::run_with(connection, |connection| {
+        let Connection { root, wanted_version, .. } = connection.clone();
+        iced::stream::channel(64, async move |mut output| {
             let (tx, mut rx) = mpsc::unbounded();
             std::thread::spawn(move || {
                 let installs = godot::discover();
@@ -80,8 +88,8 @@ pub fn connect(root: PathBuf, wanted_version: Option<String>, generation: u64) -
                 }
             }
             std::future::pending::<()>().await;
-        }),
-    )
+        })
+    })
 }
 
 fn describe(server: &Server, install: Option<&godot::GodotInstall>) -> String {

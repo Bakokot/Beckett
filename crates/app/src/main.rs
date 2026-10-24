@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 use editor_core::Language;
 use godot_project::GodotProject;
 use iced::widget::{
-    button, center, column, container, horizontal_space, pick_list, row, scrollable, text,
-    text_editor, Row,
+    button, center, column, container, pick_list, row, scrollable, space, text, text_editor, Row,
 };
 use iced::{keyboard, Alignment, Element, Font, Length, Subscription, Task};
 use lsp_client::{uri, Event, Position};
@@ -25,11 +24,12 @@ use problems::Problems;
 
 fn main() -> iced::Result {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
-    iced::application(App::title, App::update, App::view)
+    iced::application(move || App::new(initial.clone()), App::update, App::view)
+        .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
         .window_size((1280.0, 800.0))
-        .run_with(move || App::new(initial))
+        .run()
 }
 
 #[derive(Debug, Clone)]
@@ -154,13 +154,7 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keys = keyboard::on_key_press(|key, modifiers| match key.as_ref() {
-            keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
-            keyboard::Key::Character("s") if modifiers.command() => Some(Message::Save),
-            keyboard::Key::Character("o") if modifiers.command() => Some(Message::OpenFolderDialog),
-            keyboard::Key::Character("w") if modifiers.command() => Some(Message::CloseActiveTab),
-            _ => None,
-        });
+        let keys = keyboard::listen().filter_map(shortcut);
 
         let lsp = self
             .project
@@ -295,7 +289,7 @@ impl App {
             self.status = Some("Language server is not connected".to_string());
             return;
         };
-        let (line, column) = tab.content.cursor_position();
+        let (line, column) = cursor_position(&tab.content);
         let position = Position {
             line: line as u32,
             character: column as u32,
@@ -470,7 +464,7 @@ impl App {
     fn sidebar<'a>(&'a self, project: &'a Project) -> Element<'a, Message> {
         let header = row![
             text(self.project_name(project).to_uppercase()).size(12),
-            horizontal_space(),
+            space::horizontal(),
             button(text("Open…").size(12))
                 .on_press(Message::OpenFolderDialog)
                 .style(button::text)
@@ -580,7 +574,7 @@ impl App {
 
         let mut right: Vec<Element<'_, Message>> = Vec::new();
         if let Some(tab) = self.active_tab() {
-            let (line, column) = tab.content.cursor_position();
+            let (line, column) = cursor_position(&tab.content);
             right.push(text(format!("Ln {}, Col {}", line + 1, column + 1)).size(12).into());
             right.push(text(tab.language.name()).size(12).into());
         }
@@ -599,7 +593,7 @@ impl App {
         container(
             row![
                 Row::with_children(left).spacing(16).align_y(Alignment::Center),
-                horizontal_space(),
+                space::horizontal(),
                 Row::with_children(right).spacing(16).align_y(Alignment::Center),
             ]
             .align_y(Alignment::Center)
@@ -611,17 +605,34 @@ impl App {
     }
 }
 
-/// Places the cursor at a zero-based line/character using relative motions
-/// (iced 0.13's editor has no absolute cursor setter).
+/// Global shortcuts, for key presses no widget handled.
+fn shortcut(event: keyboard::Event) -> Option<Message> {
+    let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+        return None;
+    };
+    match key.as_ref() {
+        keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
+        keyboard::Key::Character("s") if modifiers.command() => Some(Message::Save),
+        keyboard::Key::Character("o") if modifiers.command() => Some(Message::OpenFolderDialog),
+        keyboard::Key::Character("w") if modifiers.command() => Some(Message::CloseActiveTab),
+        _ => None,
+    }
+}
+
+/// Zero-based (line, column) of the cursor.
+fn cursor_position(content: &text_editor::Content) -> (usize, usize) {
+    let position = content.cursor().position;
+    (position.line, position.column)
+}
+
 fn move_cursor(content: &mut text_editor::Content, line: u32, character: u32) {
-    use text_editor::{Action, Motion};
-    content.perform(Action::Move(Motion::DocumentStart));
-    for _ in 0..line {
-        content.perform(Action::Move(Motion::Down));
-    }
-    for _ in 0..character {
-        content.perform(Action::Move(Motion::Right));
-    }
+    content.move_to(text_editor::Cursor {
+        position: text_editor::Position {
+            line: line as usize,
+            column: character as usize,
+        },
+        selection: None,
+    });
 }
 
 async fn pick_folder() -> Option<PathBuf> {

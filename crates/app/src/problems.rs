@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use iced::widget::{button, column, container, horizontal_space, row, scrollable, text, Column};
+use iced::widget::{button, column, container, row, scrollable, space, text, Column};
 use iced::{Alignment, Element, Length};
 use lsp_client::{uri, Diagnostic, Severity};
 
@@ -80,7 +80,7 @@ impl Problems {
 
         let header = row![
             text("PROBLEMS").size(12),
-            horizontal_space(),
+            space::horizontal(),
             button(text("x").size(12))
                 .on_press(Message::ToggleProblems)
                 .style(button::text)

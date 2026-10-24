@@ -124,7 +124,7 @@ fn push_rows<'a>(
     rows.push(
         button(
             row![
-                Space::with_width(f32::from(depth) * 14.0),
+                Space::new().width(f32::from(depth) * 14.0),
                 text(icon).size(12).width(12),
                 text(&node.name).size(13),
             ]

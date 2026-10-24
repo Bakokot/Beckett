@@ -16,6 +16,7 @@ pub fn iced_theme(theme: &theme::Theme) -> iced::Theme {
             text: to_color(ui.text),
             primary: to_color(ui.accent),
             success: to_color(ui.success),
+            warning: to_color(ui.warning),
             danger: to_color(ui.danger),
         },
     )
