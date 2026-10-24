@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use editor_core::{Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
-use iced::widget::{button, center, column, container, pick_list, row, scrollable, space, text, Row};
+use iced::widget::{button, center, column, container, pick_list, row, scrollable, space, text, tooltip, Row};
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task};
 use lsp_client::{uri, CompletionKind, Event, Position, Severity};
 
@@ -1355,10 +1355,15 @@ impl App {
         let header = row![
             text(self.project_name(project).to_uppercase()).size(12),
             space::horizontal(),
-            button(text("Open…").size(12))
-                .on_press(Message::OpenFolderDialog)
-                .style(button::text)
-                .padding([2, 6]),
+            style::tip(
+                button(text("Open…").size(12))
+                    .on_press(Message::OpenFolderDialog)
+                    .style(button::text)
+                    .padding([2, 6]),
+                "Open a project folder (Ctrl+O)",
+                tooltip::Position::Bottom,
+                &self.current_theme().ui,
+            ),
         ]
         .align_y(Alignment::Center)
         .padding([6, 8]);
@@ -1416,8 +1421,9 @@ impl App {
         let theme = self.current_theme();
         let ui = &theme.ui;
         let muted = style::to_color(ui.text_muted);
-        let action = |label, message| {
-            button(text(label).size(12)).on_press(message).style(button::text).padding([0, 6])
+        let action = |label, message, description: &str| {
+            let button = button(text(label).size(12)).on_press(message).style(button::text).padding([0, 6]);
+            style::tip(button, description, tooltip::Position::Top, ui)
         };
 
         let (errors, warnings) = self.problems.counts();
@@ -1441,12 +1447,12 @@ impl App {
         }
         header = header.push(space::horizontal());
         match panel {
-            Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun)),
-            Panel::Output => header = header.push(action("clear", Message::ClearOutput)),
-            Panel::Terminal => header = header.push(action("kill", Message::KillTerminal)),
+            Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun, "Stop the game (F8)")),
+            Panel::Output => header = header.push(action("clear", Message::ClearOutput, "Clear the output")),
+            Panel::Terminal => header = header.push(action("kill", Message::KillTerminal, "End the shell; the next toggle starts a new one")),
             Panel::Problems | Panel::Search => {}
         }
-        header = header.push(action("x", Message::ClosePanel));
+        header = header.push(action("x", Message::ClosePanel, "Close the panel"));
 
         let body: Element<'_, Message> = match panel {
             Panel::Problems => self.problems.view(ui, |p| self.display_path(p)),
@@ -1519,10 +1525,15 @@ impl App {
                     .on_press(Message::SelectTab(index))
                     .style(style)
                     .padding([4, 10]),
-                button(text("×").size(13))
-                    .on_press(Message::CloseTab(index))
-                    .style(button::text)
-                    .padding([4, 6]),
+                style::tip(
+                    button(text("×").size(13))
+                        .on_press(Message::CloseTab(index))
+                        .style(button::text)
+                        .padding([4, 6]),
+                    "Close (Ctrl+W)",
+                    tooltip::Position::Bottom,
+                    &self.current_theme().ui,
+                ),
             ]
             .into()
         });
@@ -1543,57 +1554,50 @@ impl App {
             }
             if project.godot.is_some() {
                 let (errors, warnings) = self.problems.counts();
-                left.push(
-                    button(
-                        row![
-                            text(format!("E {errors}")).size(12).color(style::to_color(ui.danger)),
-                            text(format!("W {warnings}")).size(12).color(style::to_color(ui.warning)),
-                        ]
-                        .spacing(8),
-                    )
-                    .on_press(Message::ToggleProblems)
+                let counts = button(
+                    row![
+                        text(format!("E {errors}")).size(12).color(style::to_color(ui.danger)),
+                        text(format!("W {warnings}")).size(12).color(style::to_color(ui.warning)),
+                    ]
+                    .spacing(8),
+                )
+                .on_press(Message::ToggleProblems)
+                .style(button::text)
+                .padding([0, 4]);
+                let description = format!("{errors} errors, {warnings} warnings found by Godot. Click to list them");
+                left.push(style::tip(counts, description, tooltip::Position::Top, ui));
+                let lsp = button(text(self.lsp.label()).size(12))
+                    .on_press(Message::RestartLsp)
                     .style(button::text)
-                    .padding([0, 4])
-                    .into(),
-                );
-                left.push(
-                    button(text(self.lsp.label()).size(12))
-                        .on_press(Message::RestartLsp)
-                        .style(button::text)
-                        .padding([0, 4])
-                        .into(),
-                );
+                    .padding([0, 4]);
+                let description = "Godot's language server (completion, errors, go to definition). Click to restart it";
+                left.push(style::tip(lsp, description, tooltip::Position::Top, ui));
             }
         }
         if self.project.is_some() {
-            left.push(
-                button(text("Terminal").size(12))
-                    .on_press(Message::ToggleTerminal)
-                    .style(button::text)
-                    .padding([0, 4])
-                    .into(),
-            );
-            let (label, message, color) = if self.is_running() {
-                ("Stop (F8)", Message::StopRun, ui.danger)
+            let terminal = button(text("Terminal").size(12))
+                .on_press(Message::ToggleTerminal)
+                .style(button::text)
+                .padding([0, 4]);
+            left.push(style::tip(terminal, "Show or hide the terminal (Ctrl+J)", tooltip::Position::Top, ui));
+            let (label, message, color, description) = if self.is_running() {
+                ("Stop (F8)", Message::StopRun, ui.danger, "Stop the running game")
             } else {
-                ("Run (F5)", Message::RunProject, ui.success)
+                ("Run (F5)", Message::RunProject, ui.success, "Run the main scene. F6 runs the current scene")
             };
-            left.push(
-                button(text(label).size(12).color(style::to_color(color)))
-                    .on_press(message)
-                    .style(button::text)
-                    .padding([0, 4])
-                    .into(),
-            );
+            let run = button(text(label).size(12).color(style::to_color(color)))
+                .on_press(message)
+                .style(button::text)
+                .padding([0, 4]);
+            left.push(style::tip(run, description, tooltip::Position::Top, ui));
         }
         if self.active_tab().is_some_and(|t| t.disk_changed) {
-            left.push(
-                button(text("Reload from disk").size(12).color(style::to_color(ui.warning)))
-                    .on_press(Message::ReloadActive)
-                    .style(button::text)
-                    .padding([0, 4])
-                    .into(),
-            );
+            let reload = button(text("Reload from disk").size(12).color(style::to_color(ui.warning)))
+                .on_press(Message::ReloadActive)
+                .style(button::text)
+                .padding([0, 4]);
+            let description = "Take the version on disk and discard your unsaved edits. Ctrl+S keeps yours";
+            left.push(style::tip(reload, description, tooltip::Position::Top, ui));
         }
         if let Some(status) = &self.status {
             left.push(text(status).size(12).color(style::to_color(ui.text_muted)).into());

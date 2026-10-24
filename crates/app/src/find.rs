@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use editor_core::search::{matching_lines, LineMatch, Matcher, Query};
 use editor_core::Buffer;
+use iced::widget::tooltip::Position;
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input, Column};
 use iced::{Alignment, Element, Font, Length};
 
@@ -106,13 +107,12 @@ impl Find {
 
     pub fn view<'a>(&'a self, ui: &theme::UiColors) -> Element<'a, FindMessage> {
         let muted = style::to_color(ui.text_muted);
-        let toggle = |label: &'static str, on: bool, message: FindMessage| {
-            let style: fn(&iced::Theme, button::Status) -> button::Style =
-                if on { button::primary } else { button::text };
-            button(text(label).size(12).font(Font::MONOSPACE)).on_press(message).style(style).padding([2, 6])
+        let toggle = |label: &'static str, on: bool, message: FindMessage, description: &'static str| {
+            style::tip(toggle_button(label, on, message), description, Position::Bottom, ui)
         };
-        let action = |label: &'static str, message: FindMessage| {
-            button(text(label).size(12)).on_press(message).style(button::text).padding([2, 6])
+        let action = |label: &'static str, message: FindMessage, description: &'static str| {
+            let button = button(text(label).size(12)).on_press(message).style(button::text).padding([2, 6]);
+            style::tip(button, description, Position::Bottom, ui)
         };
         let count = match (&self.error, self.current) {
             (Some(error), _) => text(error.clone()).size(12).color(style::to_color(ui.danger)),
@@ -123,7 +123,7 @@ impl Find {
 
         let expand = if self.show_replace { "v" } else { ">" };
         let find_row = row![
-            action(expand, FindMessage::ToggleReplace),
+            action(expand, FindMessage::ToggleReplace, "Show or hide Replace (Ctrl+H)"),
             text_input("Find", &self.query.text)
                 .id(FIND_INPUT)
                 .on_input(FindMessage::Query)
@@ -131,15 +131,15 @@ impl Find {
                 .size(13)
                 .padding([3, 6])
                 .width(280),
-            toggle("Aa", self.query.case_sensitive, FindMessage::ToggleCase),
-            toggle("W", self.query.whole_word, FindMessage::ToggleWord),
-            toggle(".*", self.query.regex, FindMessage::ToggleRegex),
+            toggle("Aa", self.query.case_sensitive, FindMessage::ToggleCase, MATCH_CASE),
+            toggle("W", self.query.whole_word, FindMessage::ToggleWord, WHOLE_WORD),
+            toggle(".*", self.query.regex, FindMessage::ToggleRegex, REGEX),
             count,
             space::horizontal(),
-            action("prev", FindMessage::Previous),
-            action("next", FindMessage::Next),
-            action("all", FindMessage::SelectAll),
-            action("x", FindMessage::Close),
+            action("prev", FindMessage::Previous, "Previous match (Shift+Enter, Shift+F3)"),
+            action("next", FindMessage::Next, "Next match (Enter, F3)"),
+            action("all", FindMessage::SelectAll, "Select all matches, one cursor each"),
+            action("x", FindMessage::Close, "Close (Escape)"),
         ]
         .spacing(6)
         .align_y(Alignment::Center);
@@ -156,8 +156,8 @@ impl Find {
                         .size(13)
                         .padding([3, 6])
                         .width(280),
-                    action("replace", FindMessage::ReplaceOne),
-                    action("replace all", FindMessage::ReplaceAll),
+                    action("replace", FindMessage::ReplaceOne, "Replace this match and go to the next (Enter)"),
+                    action("replace all", FindMessage::ReplaceAll, "Replace every match (undo with Ctrl+Z)"),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -165,6 +165,16 @@ impl Find {
         }
         container(content).padding([4, 8]).width(Length::Fill).style(style::surface(ui)).into()
     }
+}
+
+const MATCH_CASE: &str = "Match case: \"Speed\" won't match \"speed\"";
+const WHOLE_WORD: &str = "Match whole word: \"hp\" won't match \"max_hp\"";
+const REGEX: &str = "Use regular expression ($1 in Replace inserts group 1)";
+
+/// A search option button, highlighted while it is on.
+fn toggle_button<'a, Message: Clone + 'a>(label: &'a str, on: bool, message: Message) -> iced::widget::Button<'a, Message> {
+    let style: fn(&iced::Theme, button::Status) -> button::Style = if on { button::primary } else { button::text };
+    button(text(label).size(12).font(Font::MONOSPACE)).on_press(message).style(style).padding([2, 6])
 }
 
 // ---- Project search ----
@@ -201,10 +211,8 @@ pub struct ProjectSearch {
 impl ProjectSearch {
     pub fn view<'a>(&'a self, ui: &theme::UiColors, display: impl Fn(&Path) -> String) -> Element<'a, SearchMessage> {
         let muted = style::to_color(ui.text_muted);
-        let toggle = |label: &'static str, on: bool, message: SearchMessage| {
-            let style: fn(&iced::Theme, button::Status) -> button::Style =
-                if on { button::primary } else { button::text };
-            button(text(label).size(12).font(Font::MONOSPACE)).on_press(message).style(style).padding([2, 6])
+        let toggle = |label: &'static str, on: bool, message: SearchMessage, description: &'static str| {
+            style::tip(toggle_button(label, on, message), description, Position::Bottom, ui)
         };
         let total: usize = self.results.iter().map(|f| f.lines.len()).sum();
         let summary = match (&self.error, self.running, &self.searched) {
@@ -225,9 +233,9 @@ impl ProjectSearch {
                 .size(13)
                 .padding([3, 6])
                 .width(320),
-            toggle("Aa", self.query.case_sensitive, SearchMessage::ToggleCase),
-            toggle("W", self.query.whole_word, SearchMessage::ToggleWord),
-            toggle(".*", self.query.regex, SearchMessage::ToggleRegex),
+            toggle("Aa", self.query.case_sensitive, SearchMessage::ToggleCase, MATCH_CASE),
+            toggle("W", self.query.whole_word, SearchMessage::ToggleWord, WHOLE_WORD),
+            toggle(".*", self.query.regex, SearchMessage::ToggleRegex, REGEX),
             summary,
         ]
         .spacing(6)
