@@ -6,6 +6,7 @@ mod docs;
 mod explorer;
 mod lsp;
 mod problems;
+mod runner;
 mod style;
 mod terminal_panel;
 mod terminal_view;
@@ -29,6 +30,7 @@ use docs::Doc;
 use explorer::Explorer;
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
+use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
 use terminal_panel::TerminalEvent;
 use terminal_view::TerminalView;
 
@@ -64,6 +66,17 @@ pub enum Message {
     KillTerminal,
     FocusTerminal,
     Terminal(TerminalEvent),
+    ShowPanel(Panel),
+    ClosePanel,
+    /// Run the main scene (F5).
+    RunProject,
+    /// Run the scene of the active tab (F6).
+    RunScene,
+    StopRun,
+    Run(RunEvent),
+    ClearOutput,
+    /// A `res://` link in the output: path and 1-based line.
+    OpenOutputLink(String, u32),
 }
 
 /// Which panel receives keyboard input.
@@ -73,13 +86,34 @@ enum Focus {
     Terminal,
 }
 
+/// Tabs of the bottom panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    Problems,
+    Output,
+    Terminal,
+}
+
 #[derive(Default)]
 struct TerminalState {
     session: Option<std::sync::Arc<terminal::Terminal>>,
-    open: bool,
     title: Option<String>,
     /// Bumped to start a new shell.
     generation: u64,
+}
+
+const MAX_OUTPUT_LINES: usize = 5000;
+
+#[derive(Default)]
+struct RunState {
+    /// The current run; its subscription lives until the process exits.
+    request: Option<RunRequest>,
+    /// Dropping it stops the game.
+    handle: Option<std::sync::Arc<RunHandle>>,
+    output: Vec<OutputLine>,
+    next_id: u64,
+    /// Godot binary for running, found on first use.
+    godot: Option<PathBuf>,
 }
 
 /// What an in-flight LSP request was for.
@@ -113,7 +147,9 @@ struct App {
     lsp_generation: u64,
     pending: HashMap<u64, Pending>,
     problems: Problems,
-    show_problems: bool,
+    /// Open tab of the bottom panel, if it is shown.
+    panel: Option<Panel>,
+    run: RunState,
     // Popups for the active tab.
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
@@ -174,7 +210,8 @@ impl App {
             lsp_generation: 0,
             pending: HashMap::new(),
             problems: Problems::default(),
-            show_problems: false,
+            panel: None,
+            run: RunState::default(),
             completion: None,
             hover: None,
             signature: None,
@@ -225,7 +262,7 @@ impl App {
         let terminal = self
             .project
             .as_ref()
-            .filter(|_| self.terminal.open || self.terminal.session.is_some())
+            .filter(|_| self.panel == Some(Panel::Terminal) || self.terminal.session.is_some())
             .map(|project| {
                 let version = project.godot.as_ref().and_then(GodotProject::godot_version);
                 terminal_panel::spawn(self.terminal.generation, project.root.clone(), version)
@@ -233,7 +270,14 @@ impl App {
             })
             .unwrap_or_else(Subscription::none);
 
-        Subscription::batch([keys, lsp, terminal])
+        let run = self
+            .run
+            .request
+            .clone()
+            .map(|request| runner::run(request).map(Message::Run))
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([keys, lsp, terminal, run])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -284,16 +328,43 @@ impl App {
                 }
             }
             Message::GotoDefinition => self.goto_definition(),
-            Message::ToggleProblems => self.show_problems = !self.show_problems,
+            Message::ToggleProblems => self.toggle_panel(Panel::Problems),
             Message::JumpTo(path, line, character) => {
                 self.dismiss_popups();
                 self.jump_to(path, line, character);
             }
             Message::ToggleTerminal => {
                 if self.project.is_some() {
-                    self.terminal.open = !self.terminal.open;
-                    self.focus = if self.terminal.open { Focus::Terminal } else { Focus::Editor };
+                    self.toggle_panel(Panel::Terminal);
+                }
+            }
+            Message::ShowPanel(panel) => self.show_panel(panel),
+            Message::ClosePanel => {
+                self.panel = None;
+                self.focus = Focus::Editor;
+            }
+            Message::RunProject => self.start_run(None),
+            Message::RunScene => match self.current_scene() {
+                Ok(scene) => self.start_run(Some(scene)),
+                Err(reason) => self.status = Some(reason),
+            },
+            Message::StopRun => {
+                if self.run.handle.take().is_some() {
+                    self.push_output(OutputLine::info("Stopping..."));
+                }
+            }
+            Message::Run(event) => self.on_run(event),
+            Message::ClearOutput => self.run.output.clear(),
+            Message::OpenOutputLink(res_path, line) => {
+                let path = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.godot.as_ref())
+                    .and_then(|g| g.resolve(&res_path));
+                if let Some(path) = path {
                     self.dismiss_popups();
+                    self.focus = Focus::Editor;
+                    self.jump_to(path, line.saturating_sub(1), 0);
                 }
             }
             Message::KillTerminal => self.reset_terminal(),
@@ -316,11 +387,110 @@ impl App {
         Task::none()
     }
 
-    /// Ends the shell (if any) and hides the panel; the next toggle starts
+    fn show_panel(&mut self, panel: Panel) {
+        self.panel = Some(panel);
+        self.focus = if panel == Panel::Terminal { Focus::Terminal } else { Focus::Editor };
+        self.dismiss_popups();
+    }
+
+    fn toggle_panel(&mut self, panel: Panel) {
+        if self.panel == Some(panel) {
+            self.panel = None;
+            self.focus = Focus::Editor;
+        } else {
+            self.show_panel(panel);
+        }
+    }
+
+    /// The `res://` scene to run for the active tab: the scene itself, or
+    /// a scene its script is attached to.
+    fn current_scene(&self) -> Result<String, String> {
+        let godot = self
+            .project
+            .as_ref()
+            .and_then(|p| p.godot.as_ref())
+            .ok_or("Not a Godot project")?;
+        let tab = self.active_tab().ok_or("No file open")?;
+        let res_path = godot.to_res_path(&tab.path).ok_or("File is outside the project")?;
+        if res_path.ends_with(".tscn") {
+            return Ok(res_path);
+        }
+        let scenes = godot.scenes_using(&res_path);
+        let scene = scenes.first().ok_or_else(|| format!("No scene uses {res_path}"))?;
+        godot.to_res_path(scene).ok_or_else(|| "Scene is outside the project".to_string())
+    }
+
+    fn start_run(&mut self, scene: Option<String>) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let Some(godot) = &project.godot else {
+            self.status = Some("Not a Godot project (no project.godot)".to_string());
+            return;
+        };
+        if self.run.godot.is_none() {
+            let installs = lsp_client::godot::discover();
+            let wanted = godot.godot_version();
+            self.run.godot = lsp_client::godot::pick(&installs, wanted.as_deref())
+                .map(|install| lsp_client::godot::console_variant(&install.path));
+        }
+        let Some(exe) = self.run.godot.clone() else {
+            self.status = Some("No Godot executable found (set GODOT_BIN)".to_string());
+            return;
+        };
+        let root = project.root.clone();
+        self.save_all();
+
+        // Replacing the handle stops a game that is still running.
+        self.run.handle = None;
+        self.run.next_id += 1;
+        let request = RunRequest { id: self.run.next_id, godot: exe, root, scene };
+        self.run.output.clear();
+        self.push_output(OutputLine::info(format!("> {}", request.command_line())));
+        self.run.request = Some(request);
+        self.show_panel(Panel::Output);
+    }
+
+    fn on_run(&mut self, event: RunEvent) {
+        match event {
+            RunEvent::Started(handle) => self.run.handle = Some(handle),
+            RunEvent::Line(line) => self.push_output(line),
+            RunEvent::Exited(code) => {
+                let message = match code {
+                    Some(code) => format!("Process exited with code {code}"),
+                    None => "Process stopped".to_string(),
+                };
+                self.push_output(OutputLine::info(message));
+                self.run.handle = None;
+                self.run.request = None;
+            }
+            RunEvent::Failed(error) => {
+                self.push_output(OutputLine { kind: runner::LineKind::Error, ..OutputLine::info(error) });
+                self.run.request = None;
+            }
+        }
+    }
+
+    fn push_output(&mut self, line: OutputLine) {
+        let output = &mut self.run.output;
+        output.push(line);
+        if output.len() > MAX_OUTPUT_LINES {
+            output.drain(..output.len() - MAX_OUTPUT_LINES);
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.run.handle.is_some()
+    }
+
+    /// Ends the shell (if any) and hides its panel; the next toggle starts
     /// a fresh one.
     fn reset_terminal(&mut self) {
         let generation = self.terminal.generation + 1;
         self.terminal = TerminalState { generation, ..TerminalState::default() };
+        if self.panel == Some(Panel::Terminal) {
+            self.panel = None;
+        }
         self.focus = Focus::Editor;
     }
 
@@ -698,8 +868,10 @@ impl App {
         });
         self.tabs.clear();
         self.active = None;
-        // A shell started in the previous project's folder is stale.
+        // A shell or game started for the previous project is stale.
         self.reset_terminal();
+        self.run = RunState::default();
+        self.panel = None;
         if let Some(file) = file {
             self.open_file(file);
         }
@@ -763,20 +935,38 @@ impl App {
     }
 
     fn save_active(&mut self) {
-        let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) else {
-            return;
+        if let Some(index) = self.active {
+            if self.save_tab(index) {
+                self.status = Some(format!("Saved {}", self.tabs[index].title()));
+            }
+        }
+    }
+
+    /// Saves every unsaved tab (Godot runs from the files on disk).
+    fn save_all(&mut self) {
+        for index in 0..self.tabs.len() {
+            if self.tabs[index].dirty {
+                self.save_tab(index);
+            }
+        }
+    }
+
+    fn save_tab(&mut self, index: usize) -> bool {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return false;
         };
         let text = tab.buffer.text();
         match std::fs::write(&tab.path, &text) {
             Ok(()) => {
                 tab.dirty = false;
-                self.status = Some(format!("Saved {}", tab.title()));
                 if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
                     let _ = client.did_save(&tab.path, &text);
                 }
+                true
             }
             Err(error) => {
                 self.status = Some(format!("Cannot save {}: {error}", tab.title()));
+                false
             }
         }
     }
@@ -809,12 +999,8 @@ impl App {
             None => self.welcome(),
             Some(project) => {
                 let mut main = column![self.editor_area()];
-                if self.show_problems {
-                    let ui = &self.current_theme().ui;
-                    main = main.push(self.problems.view(ui, |p| self.display_path(p)));
-                }
-                if self.terminal.open {
-                    main = main.push(self.terminal_panel());
+                if let Some(panel) = self.panel {
+                    main = main.push(self.bottom_panel(panel));
                 }
                 row![self.sidebar(project), main].into()
             }
@@ -887,40 +1073,91 @@ impl App {
         column![self.tab_bar(), editor].into()
     }
 
-    fn terminal_panel(&self) -> Element<'_, Message> {
+    /// The bottom panel: Problems / Output / Terminal tabs and the open one.
+    fn bottom_panel(&self, panel: Panel) -> Element<'_, Message> {
         let theme = self.current_theme();
         let ui = &theme.ui;
-        let title = self.terminal.title.as_deref().unwrap_or("");
-        let header = row![
-            text("TERMINAL").size(12),
-            text(title).size(12).color(style::to_color(ui.text_muted)),
-            space::horizontal(),
-            button(text("kill").size(12))
-                .on_press(Message::KillTerminal)
-                .style(button::text)
-                .padding([0, 6]),
-            button(text("x").size(12))
-                .on_press(Message::ToggleTerminal)
-                .style(button::text)
-                .padding([0, 6]),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center)
-        .padding([4, 8]);
-
-        let body: Element<'_, Message> = match &self.terminal.session {
-            Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
-                .focused(self.focus == Focus::Terminal)
-                .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
-                .into(),
-            None => center(text("Starting shell...").size(12).color(style::to_color(ui.text_muted))).into(),
+        let muted = style::to_color(ui.text_muted);
+        let action = |label, message| {
+            button(text(label).size(12)).on_press(message).style(button::text).padding([0, 6])
         };
 
-        container(column![header, body])
+        let (errors, warnings) = self.problems.counts();
+        let tabs = [
+            (Panel::Problems, format!("PROBLEMS  {errors}/{warnings}")),
+            (Panel::Output, if self.is_running() { "OUTPUT (running)".to_string() } else { "OUTPUT".to_string() }),
+            (Panel::Terminal, "TERMINAL".to_string()),
+        ]
+        .into_iter()
+        .map(|(tab, label)| {
+            let style: fn(&iced::Theme, button::Status) -> button::Style =
+                if tab == panel { button::secondary } else { button::text };
+            button(text(label).size(12)).on_press(Message::ShowPanel(tab)).style(style).padding([2, 8]).into()
+        });
+
+        let mut header = Row::with_children(tabs).spacing(4).align_y(Alignment::Center);
+        if panel == Panel::Terminal {
+            let title = self.terminal.title.as_deref().unwrap_or("");
+            header = header.push(text(title).size(12).color(muted));
+        }
+        header = header.push(space::horizontal());
+        match panel {
+            Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun)),
+            Panel::Output => header = header.push(action("clear", Message::ClearOutput)),
+            Panel::Terminal => header = header.push(action("kill", Message::KillTerminal)),
+            Panel::Problems => {}
+        }
+        header = header.push(action("x", Message::ClosePanel));
+
+        let body: Element<'_, Message> = match panel {
+            Panel::Problems => self.problems.view(ui, |p| self.display_path(p)),
+            Panel::Output => self.output_view(),
+            Panel::Terminal => match &self.terminal.session {
+                Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
+                    .focused(self.focus == Focus::Terminal)
+                    .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
+                    .into(),
+                None => center(text("Starting shell...").size(12).color(muted)).into(),
+            },
+        };
+
+        container(column![header.padding([4, 8]), body])
             .width(Length::Fill)
             .height(260)
             .style(style::surface(ui))
             .into()
+    }
+
+    fn output_view(&self) -> Element<'_, Message> {
+        const SHOWN: usize = 1000;
+        let ui = &self.current_theme().ui;
+        let skip = self.run.output.len().saturating_sub(SHOWN);
+        let lines = self.run.output[skip..].iter().map(|line| {
+            let color = match line.kind {
+                runner::LineKind::Error => ui.danger,
+                runner::LineKind::Warning => ui.warning,
+                runner::LineKind::Info => ui.text_muted,
+                runner::LineKind::Normal => ui.text,
+            };
+            let label = text(&line.text).size(12).font(iced::Font::MONOSPACE).color(style::to_color(color));
+            match &line.link {
+                Some((path, number)) => button(label)
+                    .on_press(Message::OpenOutputLink(path.clone(), *number))
+                    .style(button::text)
+                    .padding([0, 8])
+                    .into(),
+                None => container(label).padding([0, 8]).into(),
+            }
+        });
+        let body: Element<'_, Message> = if self.run.output.is_empty() {
+            center(text("Press F5 to run the project, F6 to run the current scene.").size(12).color(style::to_color(ui.text_muted))).into()
+        } else {
+            scrollable(iced::widget::Column::with_children(lines).width(Length::Fill))
+                .anchor_bottom()
+                .height(Length::Fill)
+                .into()
+        };
+        body
     }
 
     fn tab_bar(&self) -> Element<'_, Message> {
@@ -991,6 +1228,18 @@ impl App {
                     .padding([0, 4])
                     .into(),
             );
+            let (label, message, color) = if self.is_running() {
+                ("Stop (F8)", Message::StopRun, ui.danger)
+            } else {
+                ("Run (F5)", Message::RunProject, ui.success)
+            };
+            left.push(
+                button(text(label).size(12).color(style::to_color(color)))
+                    .on_press(message)
+                    .style(button::text)
+                    .padding([0, 4])
+                    .into(),
+            );
         }
         if let Some(status) = &self.status {
             left.push(text(status).size(12).color(style::to_color(ui.text_muted)).into());
@@ -1041,6 +1290,11 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
     };
     match key.as_ref() {
         keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
+        // Godot editor bindings: F5 run, F6 run current scene, F8 stop.
+        keyboard::Key::Named(keyboard::key::Named::F5) if modifiers.shift() => Some(Message::StopRun),
+        keyboard::Key::Named(keyboard::key::Named::F5) => Some(Message::RunProject),
+        keyboard::Key::Named(keyboard::key::Named::F6) => Some(Message::RunScene),
+        keyboard::Key::Named(keyboard::key::Named::F8) => Some(Message::StopRun),
         keyboard::Key::Character("s") if modifiers.command() => Some(Message::Save),
         keyboard::Key::Character("o") if modifiers.command() => Some(Message::OpenFolderDialog),
         keyboard::Key::Character("w") if modifiers.command() => Some(Message::CloseActiveTab),

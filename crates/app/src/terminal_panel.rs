@@ -90,7 +90,7 @@ fn shell_options(session: &Session) -> Options {
     let mut env_vars = HashMap::new();
     let installs = godot::discover();
     if let Some(install) = godot::pick(&installs, session.wanted_version.as_deref()) {
-        let exe = console_variant(&install.path);
+        let exe = godot::console_variant(&install.path);
         env_vars.insert("GODOT".to_string(), exe.display().to_string());
         if let Some(dir) = write_shim(&exe) {
             let path = env::var_os("PATH").unwrap_or_default();
@@ -118,16 +118,6 @@ fn default_shell() -> Option<(String, Vec<String>)> {
     let has_pwsh = env::split_paths(&path).any(|dir| dir.join("pwsh.exe").is_file());
     let program = if has_pwsh { "pwsh.exe" } else { "powershell.exe" };
     Some((program.to_string(), vec!["-NoLogo".to_string()]))
-}
-
-/// On Windows, `Godot_..._win64.exe` doesn't print to a console; its
-/// `_console.exe` sibling does.
-fn console_variant(exe: &Path) -> PathBuf {
-    let (Some(stem), Some(dir)) = (exe.file_stem(), exe.parent()) else {
-        return exe.to_path_buf();
-    };
-    let console = dir.join(format!("{}_console.exe", stem.to_string_lossy()));
-    if cfg!(windows) && console.is_file() { console } else { exe.to_path_buf() }
 }
 
 /// Writes a `godot` launcher into the IDE's data folder and returns that

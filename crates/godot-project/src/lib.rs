@@ -70,6 +70,43 @@ impl GodotProject {
     }
 }
 
+impl GodotProject {
+    /// Scene files (`.tscn`) that reference the resource at `res_path`,
+    /// e.g. the scenes a script is attached to.
+    pub fn scenes_using(&self, res_path: &str) -> Vec<PathBuf> {
+        let mut scenes = Vec::new();
+        collect_scenes(&self.root, &mut scenes);
+        scenes.retain(|scene| {
+            std::fs::read_to_string(scene).is_ok_and(|text| scene_references(&text, res_path))
+        });
+        scenes.sort();
+        scenes
+    }
+}
+
+fn collect_scenes(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() && !is_hidden(&name, true) => collect_scenes(&path, out),
+            Ok(t) if t.is_file() && name.ends_with(".tscn") => out.push(path),
+            _ => {}
+        }
+    }
+}
+
+/// Whether scene text has an `ext_resource` pointing at `res_path`.
+fn scene_references(text: &str, res_path: &str) -> bool {
+    let quoted = format!("path=\"{res_path}\"");
+    text.lines()
+        .filter(|line| line.starts_with("[ext_resource"))
+        .any(|line| line.contains(&quoted))
+}
+
 /// Finds the nearest directory at or above `start` containing `project.godot`.
 pub fn find_root(start: &Path) -> Option<PathBuf> {
     start
@@ -115,6 +152,16 @@ mod tests {
         assert_eq!(p.to_res_path(&path).as_deref(), Some("res://scenes/main.tscn"));
         assert_eq!(p.resolve("res://../secret"), None);
         assert_eq!(p.resolve("user://save.dat"), None);
+    }
+
+    #[test]
+    fn detects_scene_references() {
+        let scene = "[gd_scene load_steps=2 format=3 uid=\"uid://b1\"]\n\n\
+            [ext_resource type=\"Script\" uid=\"uid://c2\" path=\"res://scenes/player.gd\" id=\"1_abc\"]\n\n\
+            [node name=\"Player\" type=\"CharacterBody2D\"]\nscript = ExtResource(\"1_abc\")\n";
+        assert!(scene_references(scene, "res://scenes/player.gd"));
+        assert!(!scene_references(scene, "res://player.gd"));
+        assert!(!scene_references("[node name=\"x\"]\n# path=\"res://scenes/player.gd\"", "res://scenes/player.gd"));
     }
 
     #[test]

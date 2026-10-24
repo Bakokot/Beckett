@@ -114,9 +114,14 @@ crates/
 - [ ] `res://` / `uid://` resolution: click to open, path completion in strings
 - [ ] "Open in Godot editor" for current scene
 
-**Run**
-- [ ] Run project / run current scene / stop
-- [ ] Output panel with clickable `res://…:line` links
+**Run** — `app/src/runner.rs`
+- [x] F5 run project, F6 run current scene (a `.tscn`, or the scene a `.gd` is attached to),
+      F8 / Shift+F5 stop; status bar Run/Stop button; unsaved tabs are saved first
+- [x] Output tab: ANSI stripped, errors/warnings colored (backtrace lines inherit), clickable
+      `res://…:line` links, exit code; the game (and its child process) dies with the IDE
+- [x] Bottom panel is now tabbed: Problems / Output / Terminal
+- [ ] Pick among several scenes using the same script (currently the first one)
+- [ ] Feed runtime errors into the Problems panel
 
 **Terminal** — `terminal` crate (`alacritty_terminal` + ConPTY), panel widget in `app`
 - [x] Integrated PTY terminal (PowerShell 7 if installed, else Windows PowerShell; login shell elsewhere)

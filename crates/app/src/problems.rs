@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use iced::widget::{button, column, container, row, scrollable, space, text, Column};
-use iced::{Alignment, Element, Length};
+use iced::widget::{button, container, row, scrollable, text, Column};
+use iced::{Element, Length};
 use lsp_client::{uri, Diagnostic, Severity};
 
 use crate::{style, Message};
@@ -83,22 +83,8 @@ impl Problems {
         if rows.is_empty() {
             rows.push(container(text("No problems").size(12).color(muted)).padding([2, 8]).into());
         }
-
-        let header = row![
-            text("PROBLEMS").size(12),
-            space::horizontal(),
-            button(text("x").size(12))
-                .on_press(Message::ToggleProblems)
-                .style(button::text)
-                .padding([0, 6]),
-        ]
-        .align_y(Alignment::Center)
-        .padding([4, 8]);
-
-        container(column![header, scrollable(Column::with_children(rows)).height(Length::Fill)])
-            .width(Length::Fill)
-            .height(180)
-            .style(style::surface(ui))
+        scrollable(Column::with_children(rows).width(Length::Fill))
+            .height(Length::Fill)
             .into()
     }
 }

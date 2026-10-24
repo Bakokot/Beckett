@@ -27,6 +27,20 @@ impl GodotInstall {
     }
 }
 
+/// On Windows, `Godot_..._win64.exe` doesn't print to a console; its
+/// `_console.exe` sibling does. Elsewhere, and if there is none, `exe` itself.
+pub fn console_variant(exe: &Path) -> PathBuf {
+    let (Some(stem), Some(dir)) = (exe.file_stem(), exe.parent()) else {
+        return exe.to_path_buf();
+    };
+    let console = dir.join(format!("{}_console.exe", stem.to_string_lossy()));
+    if cfg!(windows) && console.is_file() {
+        console
+    } else {
+        exe.to_path_buf()
+    }
+}
+
 /// Godot executables from `GODOT_BIN`/`GODOT`, `PATH`, and the usual
 /// download and install folders.
 pub fn discover() -> Vec<GodotInstall> {

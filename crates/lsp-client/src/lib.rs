@@ -6,7 +6,7 @@
 
 pub mod godot;
 #[cfg(windows)]
-mod job;
+pub mod job;
 mod protocol;
 mod types;
 pub mod uri;
