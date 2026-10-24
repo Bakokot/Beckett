@@ -13,6 +13,7 @@ mod runner;
 mod style;
 mod terminal_panel;
 mod terminal_view;
+mod theme_editor;
 mod watcher;
 
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ use problems::Problems;
 use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
 use terminal_panel::TerminalEvent;
 use terminal_view::TerminalView;
+use theme_editor::{ThemeEditor, ThemeMessage};
 
 fn main() -> iced::Result {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
@@ -99,6 +101,13 @@ pub enum Message {
     /// Open the palette with this input ("" files, ">" commands, ":" go to line).
     OpenPalette(String),
     Palette(PaletteMessage),
+    OpenThemeEditor,
+    ThemeEditor(ThemeMessage),
+    ThemeImportPicked(Option<PathBuf>),
+    ThemeExportPicked(Option<PathBuf>),
+    ThemeCodePasted(Option<String>),
+    /// A file dropped on the window: a theme to import, or a file to open.
+    FileDropped(PathBuf),
 }
 
 /// Which panel receives keyboard input.
@@ -180,6 +189,9 @@ struct App {
     search: ProjectSearch,
     modifiers: keyboard::Modifiers,
     palette: Option<Palette<Message>>,
+    /// Where each theme was loaded from (`None` for built-in ones).
+    theme_paths: Vec<Option<PathBuf>>,
+    theme_editor: Option<ThemeEditor>,
     // Popups for the active tab.
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
@@ -219,10 +231,14 @@ impl Tab {
 impl App {
     fn new(initial: Option<PathBuf>) -> (Self, Task<Message>) {
         let mut themes = theme::builtin();
+        let mut theme_paths = vec![None; themes.len()];
         let mut status = None;
         if let Some(dir) = theme::user_themes_dir() {
             let (user, errors) = theme::load_dir(&dir);
-            themes.extend(user);
+            for (path, theme) in user {
+                themes.push(theme);
+                theme_paths.push(Some(path));
+            }
             if let Some(error) = errors.first() {
                 status = Some(format!("Theme error: {error}"));
             }
@@ -248,6 +264,8 @@ impl App {
             search: ProjectSearch::default(),
             modifiers: keyboard::Modifiers::default(),
             palette: None,
+            theme_paths,
+            theme_editor: None,
             completion: None,
             hover: None,
             signature: None,
@@ -276,8 +294,18 @@ impl App {
         self.iced_theme.clone()
     }
 
+    /// The theme in effect: the theme editor's draft while it is open.
     fn current_theme(&self) -> &theme::Theme {
-        &self.themes[self.theme_index]
+        match &self.theme_editor {
+            Some(editor) => &editor.draft,
+            None => &self.themes[self.theme_index],
+        }
+    }
+
+    /// Re-applies the current theme after it changed.
+    fn apply_theme(&mut self) {
+        self.iced_theme = style::iced_theme(self.current_theme());
+        self.refresh_marks();
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -319,7 +347,12 @@ impl App {
             .map(|project| watcher::watch(project.root.clone()).map(Message::FilesChanged))
             .unwrap_or_else(Subscription::none);
 
-        Subscription::batch([keys, lsp, terminal, run, files])
+        let dropped = iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
+            _ => None,
+        });
+
+        Subscription::batch([keys, lsp, terminal, run, files, dropped])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -374,8 +407,44 @@ impl App {
             Message::ThemeSelected(name) => {
                 if let Some(index) = self.themes.iter().position(|t| t.name == name) {
                     self.theme_index = index;
-                    self.iced_theme = style::iced_theme(&self.themes[index]);
-                    self.refresh_marks();
+                    // While editing, picking a theme starts editing that one.
+                    let builtin = self.theme_paths[index].is_none();
+                    if let Some(editor) = &mut self.theme_editor {
+                        editor.reset(self.themes[index].clone(), index, builtin);
+                    }
+                    self.apply_theme();
+                }
+            }
+            Message::OpenThemeEditor => {
+                let index = self.theme_index;
+                let builtin = self.theme_paths[index].is_none();
+                self.theme_editor = Some(ThemeEditor::new(self.themes[index].clone(), index, builtin));
+                self.focus = Focus::Input;
+                self.dismiss_popups();
+                self.apply_theme();
+            }
+            Message::ThemeEditor(message) => return self.on_theme_editor(message),
+            Message::ThemeImportPicked(Some(path)) => self.import_theme_file(&path),
+            Message::ThemeImportPicked(None) | Message::ThemeExportPicked(None) => {}
+            Message::ThemeExportPicked(Some(path)) => {
+                let theme = self.current_theme().clone();
+                self.status = Some(match theme.to_toml().map_err(|e| e.to_string()).and_then(|t| {
+                    std::fs::write(&path, t).map_err(|e| e.to_string())
+                }) {
+                    Ok(()) => format!("Exported theme to {}", path.display()),
+                    Err(error) => format!("Cannot export theme: {error}"),
+                });
+            }
+            Message::ThemeCodePasted(text) => match theme::from_share_code(text.as_deref().unwrap_or("")) {
+                Ok(theme) => self.install_theme(theme, "share code"),
+                Err(error) => self.status = Some(error),
+            },
+            Message::FileDropped(path) => {
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("toml")) {
+                    self.import_theme_file(&path);
+                } else if path.is_file() {
+                    self.dismiss_popups();
+                    self.open_file(path);
                 }
             }
             Message::Lsp(event) => self.on_lsp(event),
@@ -596,6 +665,160 @@ impl App {
         }
     }
 
+    /// Color edits need the editor open; import, export and share codes work
+    /// on the current theme either way (they are also palette commands).
+    fn on_theme_editor(&mut self, message: ThemeMessage) -> Task<Message> {
+        if let Some(editor) = &mut self.theme_editor {
+            if editor.apply(&message) {
+                self.apply_theme();
+                return Task::none();
+            }
+        }
+        match message {
+            ThemeMessage::Save => self.save_theme(),
+            ThemeMessage::Revert => {
+                if let Some(editor) = &mut self.theme_editor {
+                    let base = editor.base;
+                    editor.reset(self.themes[base].clone(), base, self.theme_paths[base].is_none());
+                    self.apply_theme();
+                }
+            }
+            ThemeMessage::Close => {
+                self.theme_editor = None;
+                self.focus = Focus::Editor;
+                self.apply_theme();
+            }
+            ThemeMessage::Import => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Import theme")
+                            .add_filter("Godot IDE theme", &["toml"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::ThemeImportPicked,
+                );
+            }
+            ThemeMessage::Export => {
+                let name = theme::file_name(&self.current_theme().name);
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Export theme")
+                            .add_filter("Godot IDE theme", &["toml"])
+                            .set_file_name(name)
+                            .save_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::ThemeExportPicked,
+                );
+            }
+            ThemeMessage::CopyCode => {
+                let code = theme::to_share_code(self.current_theme());
+                self.status = Some(format!("Theme code copied ({} characters)", code.len()));
+                return iced::clipboard::write(code);
+            }
+            ThemeMessage::PasteCode => return iced::clipboard::read().map(Message::ThemeCodePasted),
+            _ => {}
+        }
+        Task::none()
+    }
+
+    /// Writes the editor's draft to the user themes folder. A built-in theme
+    /// is never overwritten: its edited version is saved as a copy.
+    fn save_theme(&mut self) {
+        let Some(editor) = &mut self.theme_editor else {
+            return;
+        };
+        let mut theme = editor.draft.clone();
+        theme.name = theme.name.trim().to_string();
+        if theme.name.is_empty() {
+            theme.name = "My Theme".to_string();
+        }
+        let clashes_with_builtin = self
+            .themes
+            .iter()
+            .zip(&self.theme_paths)
+            .any(|(t, path)| path.is_none() && t.name == theme.name);
+        if clashes_with_builtin {
+            theme.name = format!("{} (custom)", theme.name);
+        }
+        match self.write_user_theme(&theme) {
+            Ok(path) => {
+                let index = self.add_theme(theme.clone(), path.clone());
+                self.theme_index = index;
+                if let Some(editor) = &mut self.theme_editor {
+                    editor.reset(theme, index, false);
+                }
+                self.status = Some(format!("Saved theme to {}", path.display()));
+                self.apply_theme();
+            }
+            Err(error) => self.status = Some(format!("Cannot save theme: {error}")),
+        }
+    }
+
+    fn write_user_theme(&self, theme: &theme::Theme) -> Result<PathBuf, String> {
+        let dir = theme::user_themes_dir().ok_or("No user config folder")?;
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(theme::file_name(&theme.name));
+        let text = theme.to_toml().map_err(|e| e.to_string())?;
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    /// Adds a theme to the list, replacing a user theme of the same name.
+    fn add_theme(&mut self, theme: theme::Theme, path: PathBuf) -> usize {
+        let existing = self
+            .themes
+            .iter()
+            .zip(&self.theme_paths)
+            .position(|(t, p)| p.is_some() && t.name == theme.name);
+        match existing {
+            Some(index) => {
+                self.themes[index] = theme;
+                self.theme_paths[index] = Some(path);
+                index
+            }
+            None => {
+                self.themes.push(theme);
+                self.theme_paths.push(Some(path));
+                self.themes.len() - 1
+            }
+        }
+    }
+
+    fn import_theme_file(&mut self, path: &Path) {
+        let result = std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| theme::Theme::from_toml(&text).map_err(|e| e.to_string()));
+        match result {
+            Ok(theme) => self.install_theme(theme, &path.display().to_string()),
+            Err(error) => self.status = Some(format!("Cannot import theme: {error}")),
+        }
+    }
+
+    /// Copies a theme into the user themes folder and switches to it.
+    fn install_theme(&mut self, mut theme: theme::Theme, source: &str) {
+        if self.themes.iter().zip(&self.theme_paths).any(|(t, p)| p.is_none() && t.name == theme.name) {
+            theme.name = format!("{} (imported)", theme.name);
+        }
+        match self.write_user_theme(&theme) {
+            Ok(path) => {
+                let index = self.add_theme(theme.clone(), path);
+                self.theme_index = index;
+                if let Some(editor) = &mut self.theme_editor {
+                    editor.reset(theme.clone(), index, false);
+                }
+                self.status = Some(format!("Imported theme \"{}\" from {source}", theme.name));
+                self.apply_theme();
+            }
+            Err(error) => self.status = Some(format!("Cannot import theme: {error}")),
+        }
+    }
+
     fn open_palette(&mut self, input: String) -> Task<Message> {
         let Some(project) = &self.project else {
             return Task::none();
@@ -691,6 +914,11 @@ impl App {
             ("Edit: Add Cursor Above", "Ctrl+Alt+Up", edit(Command::AddCursorAbove)),
             ("Edit: Add Cursor Below", "Ctrl+Alt+Down", edit(Command::AddCursorBelow)),
             ("Edit: Trigger Completion", "Ctrl+Space", Message::Edit(EditorEvent::TriggerCompletion)),
+            ("Theme: Edit Colors", "", Message::OpenThemeEditor),
+            ("Theme: Import File...", "", Message::ThemeEditor(ThemeMessage::Import)),
+            ("Theme: Export File...", "", Message::ThemeEditor(ThemeMessage::Export)),
+            ("Theme: Copy Share Code", "", Message::ThemeEditor(ThemeMessage::CopyCode)),
+            ("Theme: Paste Share Code", "", Message::ThemeEditor(ThemeMessage::PasteCode)),
         ];
         let themes: Vec<(String, Message)> = self
             .themes
@@ -1528,6 +1756,9 @@ impl App {
     }
 
     fn editor_area(&self) -> Element<'_, Message> {
+        if let Some(editor) = &self.theme_editor {
+            return editor.view().map(Message::ThemeEditor);
+        }
         let Some(tab) = self.active_tab() else {
             let muted = style::to_color(self.current_theme().ui.text_muted);
             return center(text("Open a file from the explorer").color(muted)).into();
@@ -1767,13 +1998,18 @@ impl App {
         right.push(
             pick_list(
                 names,
-                Some(self.current_theme().name.clone()),
+                Some(self.themes[self.theme_index].name.clone()),
                 Message::ThemeSelected,
             )
             .text_size(12)
             .padding([2, 6])
             .into(),
         );
+        let edit = button(text("edit").size(12))
+            .on_press(Message::OpenThemeEditor)
+            .style(button::text)
+            .padding([0, 4]);
+        right.push(style::tip(edit, "Edit, import or share themes", tooltip::Position::Top, ui));
 
         container(
             row![

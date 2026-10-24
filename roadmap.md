@@ -140,10 +140,11 @@ crates/
 - [ ] Mouse reporting for TUI apps, cursor blink, resizable panel height
 
 **Theming**
-- [ ] Single-file theme: UI, syntax, terminal ANSI colors, fonts
-- [ ] Live theme editor with instant preview
-- [ ] Built-in themes, including a Godot-default look-alike
-- [ ] Theme export/import (file, drag & drop)
+- [x] Single-file theme (TOML): UI, syntax and terminal ANSI colors (fonts still to come)
+- [x] Live theme editor ("edit" in the status bar): all 38 colors, HSV + opacity sliders, hex
+      input, code + terminal preview; the whole IDE updates live; built-ins are saved as a copy
+- [x] Built-in themes: Godot Dark (Godot editor colors) and Godot Light
+- [x] Theme export/import: .toml file dialogs, drag & drop a .toml on the window
 - [ ] Custom fonts, ligatures, line height, UI scale
 
 **Workspace**
@@ -177,7 +178,7 @@ crates/
 - [ ] Clickable paths and URLs
 
 **Theming**
-- [ ] Shareable copy-paste theme codes
+- [x] Shareable copy-paste theme codes (`GDTHEME1:` + compressed TOML, ~1 KB)
 - [ ] Import VS Code themes and Godot editor theme settings
 - [ ] Light/dark variants, follow OS
 

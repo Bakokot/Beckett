@@ -1,8 +1,12 @@
-//! Theme format: a single TOML file with UI and syntax colors.
+//! Theme format: a single TOML file with UI, syntax and terminal colors.
 
 mod color;
+mod share;
+mod slots;
 
 pub use color::{Color, ParseColorError};
+pub use share::{from_share_code, to_share_code};
+pub use slots::{Section, Slot, SLOTS};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -172,8 +176,23 @@ impl fmt::Display for LoadError {
     }
 }
 
-/// Loads every `*.toml` theme in `dir`. A missing directory is not an error.
-pub fn load_dir(dir: &Path) -> (Vec<Theme>, Vec<LoadError>) {
+/// A file name for a theme: lowercase letters, digits and dashes.
+pub fn file_name(theme_name: &str) -> String {
+    let mut slug = String::new();
+    for c in theme_name.chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_end_matches('-');
+    format!("{}.toml", if slug.is_empty() { "theme" } else { slug })
+}
+
+/// Loads every `*.toml` theme in `dir`, with the file it came from. A
+/// missing directory is not an error.
+pub fn load_dir(dir: &Path) -> (Vec<(PathBuf, Theme)>, Vec<LoadError>) {
     let mut themes = Vec::new();
     let mut errors = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -190,7 +209,7 @@ pub fn load_dir(dir: &Path) -> (Vec<Theme>, Vec<LoadError>) {
             .map_err(|e| e.to_string())
             .and_then(|text| Theme::from_toml(&text).map_err(|e| e.to_string()));
         match result {
-            Ok(theme) => themes.push(theme),
+            Ok(theme) => themes.push((path, theme)),
             Err(message) => errors.push(LoadError { path, message }),
         }
     }
@@ -207,6 +226,13 @@ mod tests {
             let text = theme.to_toml().unwrap();
             assert_eq!(Theme::from_toml(&text).unwrap(), theme);
         }
+    }
+
+    #[test]
+    fn file_names_are_safe() {
+        assert_eq!(file_name("Godot Dark (custom)"), "godot-dark-custom.toml");
+        assert_eq!(file_name("Thé été!"), "thé-été.toml");
+        assert_eq!(file_name("../.."), "theme.toml");
     }
 
     #[test]

@@ -30,7 +30,10 @@ To install a shared theme, drop its `.toml` into:
 - Linux: `~/.config/godot-ide/themes/`
 - macOS: `~/Library/Application Support/godot-ide/themes/`
 
-and pick it from the status bar.
+and pick it from the status bar, or drop the file on the IDE window.
+
+Click **edit** next to the theme picker to change colors live, save your own themes,
+export or import `.toml` files, and copy or paste a one-line share code (`GDTHEME1:...`).
 
 ## Layout
 

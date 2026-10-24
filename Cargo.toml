@@ -24,6 +24,8 @@ toml = "0.8"
 dirs = "5"
 alacritty_terminal = "0.25"
 notify = "8"
+base64 = "0.22"
+miniz_oxide = "0.8"
 windows-sys = "0.59"
 
 [profile.release]
