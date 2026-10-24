@@ -810,6 +810,7 @@ impl App {
                         start: start.character as usize,
                         end: (end_column as usize).min(tab.buffer.line_len(line)),
                         color: style::to_color(color),
+                        message: Some(d.message.split_whitespace().collect::<Vec<_>>().join(" ")),
                     }
                 })
                 .collect();

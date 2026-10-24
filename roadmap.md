@@ -101,7 +101,8 @@ crates/
 - [x] Go to definition (F12)
 - [ ] Auto-reconnect (currently manual: click the indicator)
 - [ ] Warn when no installed Godot matches the project version
-- [x] Inline diagnostics (colored underlines, updated live as you type)
+- [x] Inline diagnostics: colored underlines plus the message, faded, at the end of the line
+      (most severe one per line), updated live as you type
 - [x] Completion: opens while typing identifiers, on `.` `$` quotes, and Ctrl+Space; client-side
       ranking (prefix > substring > subsequence); kind tags; docs pane via `completionItem/resolve`;
       Enter/Tab/click to accept, functions get `()` with the cursor inside

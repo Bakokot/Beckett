@@ -55,14 +55,21 @@ pub enum CompletionAction {
     Dismiss,
 }
 
-/// An underline over a char-column range (e.g. a diagnostic).
-#[derive(Debug, Clone, Copy)]
+/// An underline over a char-column range (e.g. a diagnostic), with an
+/// optional message shown faded after the end of the line.
+#[derive(Debug, Clone)]
 pub struct Mark {
     pub line: usize,
     pub start: usize,
     pub end: usize,
     pub color: Color,
+    pub message: Option<String>,
 }
+
+/// Opacity of inline diagnostic messages.
+const INLINE_MESSAGE_ALPHA: f32 = 0.55;
+/// Columns between the end of a line and its inline message.
+const INLINE_MESSAGE_GAP: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct CompletionRow {
@@ -826,6 +833,22 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     let point = Point::new(g.col_x(visual, scroll), y);
                     draw_text(r, segment, point, colors.token(kind), metrics, g.text_area);
                 }
+            }
+
+            // Inline messages: one per line, the first mark's (marks come
+            // sorted most severe first).
+            let mut shown = std::collections::HashSet::new();
+            for mark in self.marks.iter().filter(|m| (first..last).contains(&m.line)) {
+                let Some(message) = &mark.message else {
+                    continue;
+                };
+                if !shown.insert(mark.line) {
+                    continue;
+                }
+                let end = buffer.visual_col(mark.line, buffer.line_len(mark.line));
+                let point = Point::new(g.col_x(end + INLINE_MESSAGE_GAP, scroll), g.line_y(mark.line, scroll));
+                let color = mark.color.scale_alpha(INLINE_MESSAGE_ALPHA);
+                draw_text(r, message.clone(), point, color, metrics, g.text_area);
             }
 
             // Cursors.
