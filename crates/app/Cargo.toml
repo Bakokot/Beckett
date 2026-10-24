@@ -10,6 +10,8 @@ godot-project.workspace = true
 lsp-client.workspace = true
 theme.workspace = true
 iced.workspace = true
+terminal.workspace = true
+dirs.workspace = true
 rfd.workspace = true
 serde_json.workspace = true
 

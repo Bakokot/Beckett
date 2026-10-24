@@ -118,10 +118,14 @@ crates/
 - [ ] Run project / run current scene / stop
 - [ ] Output panel with clickable `res://…:line` links
 
-**Terminal**
-- [ ] Integrated PTY terminal (PowerShell, cmd, bash, zsh)
-- [ ] Opens in project root with `godot` on PATH
-- [ ] Colors follow IDE theme
+**Terminal** — `terminal` crate (`alacritty_terminal` + ConPTY), panel widget in `app`
+- [x] Integrated PTY terminal (PowerShell 7 if installed, else Windows PowerShell; login shell elsewhere)
+- [x] Opens in project root; `godot` on PATH via a shim (console build on Windows), `$GODOT` set
+- [x] Colors follow IDE theme (`[terminal]` ANSI palette in theme files)
+- [x] Ctrl+J / Ctrl+` / Ctrl+² or status bar button to toggle; shell survives hiding; "kill" restarts
+- [x] Selection (drag, double-click word, triple-click line), Ctrl+C copies when selected, Ctrl+V paste
+      (bracketed paste), wheel scrollback, keyboard focus switches between editor and terminal
+- [ ] Mouse reporting for TUI apps, cursor blink, resizable panel height
 
 **Theming**
 - [ ] Single-file theme: UI, syntax, terminal ANSI colors, fonts

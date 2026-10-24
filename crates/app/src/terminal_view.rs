@@ -1,0 +1,412 @@
+//! Terminal widget: draws a `terminal::Terminal` grid and forwards input to
+//! the shell. Writes go straight to the pty; redraws are driven by the
+//! terminal's wakeup events.
+
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::renderer::{self, Quad};
+use iced::advanced::text::{self, Renderer as _};
+use iced::advanced::widget::{tree, Tree, Widget};
+use iced::advanced::{clipboard, mouse, Clipboard, Renderer as _, Shell};
+use iced::keyboard::{self, key::Named, Modifiers};
+use iced::{
+    alignment, font, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size,
+    Theme,
+};
+use terminal::{encode_key, CellView, Key, Mods, Palette, Rgb, SelectionKind, Terminal};
+
+use crate::code_editor::{measure, Metrics};
+
+const PADDING: f32 = 6.0;
+
+pub struct TerminalView<'a, Message> {
+    terminal: &'a Terminal,
+    palette: Palette,
+    selection: Color,
+    focused: bool,
+    on_focus: Message,
+    font_size: f32,
+}
+
+impl<'a, Message: Clone> TerminalView<'a, Message> {
+    pub fn new(terminal: &'a Terminal, palette: Palette, on_focus: Message) -> Self {
+        Self {
+            terminal,
+            palette,
+            selection: Color::from_rgba8(0x47, 0x8c, 0xbf, 0.4),
+            focused: false,
+            on_focus,
+            font_size: 14.0,
+        }
+    }
+
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    pub fn selection_color(mut self, color: Color) -> Self {
+        self.selection = color;
+        self
+    }
+}
+
+#[derive(Default)]
+struct State {
+    metrics: Option<Metrics>,
+    modifiers: Modifiers,
+    dragging: bool,
+    moved: bool,
+    last_click: Option<mouse::Click>,
+}
+
+fn color(rgb: Rgb) -> Color {
+    Color::from_rgb8(rgb.r, rgb.g, rgb.b)
+}
+
+/// Grid cell under `point`.
+fn cell_at(bounds: Rectangle, metrics: Metrics, point: Point) -> (usize, usize) {
+    let column = ((point.x - bounds.x - PADDING) / metrics.char_width).max(0.0) as usize;
+    let row = ((point.y - bounds.y - PADDING) / metrics.line_height).max(0.0) as usize;
+    (row, column)
+}
+
+fn to_key(key: &keyboard::Key, text: Option<&str>, ctrl: bool) -> Option<Key> {
+    Some(match key.as_ref() {
+        keyboard::Key::Named(named) => match named {
+            Named::Enter => Key::Enter,
+            Named::Backspace => Key::Backspace,
+            Named::Tab => Key::Tab,
+            Named::Escape => Key::Escape,
+            Named::ArrowUp => Key::Up,
+            Named::ArrowDown => Key::Down,
+            Named::ArrowLeft => Key::Left,
+            Named::ArrowRight => Key::Right,
+            Named::Home => Key::Home,
+            Named::End => Key::End,
+            Named::PageUp => Key::PageUp,
+            Named::PageDown => Key::PageDown,
+            Named::Insert => Key::Insert,
+            Named::Delete => Key::Delete,
+            Named::Space => Key::Char(" ".to_string()),
+            Named::F1 => Key::F(1),
+            Named::F2 => Key::F(2),
+            Named::F3 => Key::F(3),
+            Named::F4 => Key::F(4),
+            Named::F5 => Key::F(5),
+            Named::F6 => Key::F(6),
+            Named::F7 => Key::F(7),
+            Named::F8 => Key::F(8),
+            Named::F9 => Key::F(9),
+            Named::F10 => Key::F(10),
+            Named::F11 => Key::F(11),
+            Named::F12 => Key::F(12),
+            _ => return None,
+        },
+        // With Ctrl the produced text is a control code; use the key itself.
+        keyboard::Key::Character(c) if ctrl => Key::Char(c.to_string()),
+        keyboard::Key::Character(c) => Key::Char(text.unwrap_or(c).to_string()),
+        keyboard::Key::Unidentified => Key::Char(text?.to_string()),
+    })
+}
+
+impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView<'a, Message> {
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<State>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(State::default())
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        _renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let state = tree.state.downcast_mut::<State>();
+        let metrics = *state.metrics.get_or_insert_with(|| measure(self.font_size));
+        let size = limits.resolve(Length::Fill, Length::Fill, Size::ZERO);
+        let columns = ((size.width - PADDING * 2.0) / metrics.char_width).floor().max(2.0) as usize;
+        let lines = ((size.height - PADDING * 2.0) / metrics.line_height).floor().max(1.0) as usize;
+        let cell = (metrics.char_width.round() as u16, metrics.line_height.round() as u16);
+        self.terminal.resize(columns, lines, cell);
+        layout::Node::new(size)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<State>();
+        let Some(metrics) = state.metrics else {
+            return;
+        };
+        let bounds = layout.bounds();
+
+        match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let Some(point) = cursor.position_over(bounds) else {
+                    return;
+                };
+                if !self.focused {
+                    shell.publish(self.on_focus.clone());
+                }
+                let click = mouse::Click::new(point, mouse::Button::Left, state.last_click);
+                state.last_click = Some(click);
+                let (row, column) = cell_at(bounds, metrics, point);
+                let kind = match click.kind() {
+                    mouse::click::Kind::Single => SelectionKind::Simple,
+                    mouse::click::Kind::Double => SelectionKind::Word,
+                    mouse::click::Kind::Triple => SelectionKind::Line,
+                };
+                self.terminal.start_selection(row, column, kind);
+                state.dragging = true;
+                state.moved = kind != SelectionKind::Simple;
+                shell.request_redraw();
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
+                let (row, column) = cell_at(bounds, metrics, *position);
+                self.terminal.extend_selection(row, column);
+                state.moved = true;
+                shell.request_redraw();
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
+                state.dragging = false;
+                // A plain click selects nothing.
+                if !state.moved {
+                    self.terminal.clear_selection();
+                }
+                shell.request_redraw();
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
+                let lines = match *delta {
+                    mouse::ScrollDelta::Lines { y, .. } => y * 3.0,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / metrics.line_height,
+                };
+                self.terminal.scroll(lines.round() as i32);
+                shell.request_redraw();
+                shell.capture_event();
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })
+                if self.focused =>
+            {
+                let mods = Mods { ctrl: modifiers.control(), alt: modifiers.alt(), shift: modifiers.shift() };
+                if mods.ctrl && !mods.alt {
+                    if let keyboard::Key::Character(c) = key.as_ref() {
+                        match c.to_lowercase().as_str() {
+                            // Left to the app (panel toggle).
+                            "j" | "`" | "²" => return,
+                            // Copy when something is selected, else send ^C.
+                            "c" if mods.shift || self.terminal.selected_text().is_some() => {
+                                if let Some(selected) = self.terminal.selected_text() {
+                                    clipboard.write(clipboard::Kind::Standard, selected);
+                                }
+                                self.terminal.clear_selection();
+                                shell.capture_event();
+                                return;
+                            }
+                            "v" => {
+                                if let Some(pasted) = clipboard.read(clipboard::Kind::Standard) {
+                                    self.terminal.paste(&pasted);
+                                }
+                                shell.capture_event();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let Some(key) = to_key(key, text.as_deref(), mods.ctrl && !mods.alt) else {
+                    return;
+                };
+                let app_cursor = self.terminal.input_modes().app_cursor;
+                if let Some(bytes) = encode_key(&key, mods, app_cursor) {
+                    self.terminal.write(bytes);
+                    self.terminal.clear_selection();
+                    self.terminal.scroll_to_bottom();
+                }
+                shell.capture_event();
+            }
+            _ => {}
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_ref::<State>();
+        let Some(metrics) = state.metrics else {
+            return;
+        };
+        let bounds = layout.bounds();
+        let (cw, lh) = (metrics.char_width, metrics.line_height);
+        let snapshot = self.terminal.snapshot(&self.palette);
+        let origin = Point::new(bounds.x + PADDING, bounds.y + PADDING);
+        let cell_rect = |row: usize, column: usize, width: usize| {
+            Rectangle::new(
+                Point::new(origin.x + column as f32 * cw, origin.y + row as f32 * lh),
+                Size::new(width as f32 * cw, lh),
+            )
+        };
+
+        renderer.with_layer(bounds, |r| {
+            fill(r, bounds, color(self.palette.background));
+
+            for (row, cells) in snapshot.rows.iter().enumerate() {
+                // Backgrounds and selection.
+                for (column, cell) in cells {
+                    let width = if cell.wide { 2 } else { 1 };
+                    if let Some(bg) = cell.bg {
+                        fill(r, cell_rect(row, *column, width), color(bg));
+                    }
+                    if cell.selected {
+                        fill(r, cell_rect(row, *column, width), self.selection);
+                    }
+                }
+
+                // Text, in runs of cells that share a style.
+                let mut run = String::new();
+                let mut run_start = 0;
+                let mut run_style: Option<(Rgb, bool, bool)> = None;
+                let mut next_column = 0;
+                let flush = |r: &mut iced::Renderer, run: &mut String, start: usize, style: Option<(Rgb, bool, bool)>| {
+                    if let Some((fg, bold, italic)) = style {
+                        if !run.trim().is_empty() {
+                            draw_text(r, std::mem::take(run), cell_rect(row, start, 1).position(), color(fg), bold, italic, metrics, bounds);
+                        }
+                    }
+                    run.clear();
+                };
+                for (column, cell) in cells {
+                    let style = Some((cell.fg, cell.bold, cell.italic));
+                    let contiguous = *column == next_column && !cell.wide;
+                    if style != run_style || !contiguous {
+                        flush(r, &mut run, run_start, run_style);
+                        run_start = *column;
+                        run_style = style;
+                    }
+                    if cell.wide {
+                        // Wide glyphs are drawn alone at their own column.
+                        let point = cell_rect(row, *column, 2).position();
+                        draw_text(r, cell.c.to_string(), point, color(cell.fg), cell.bold, cell.italic, metrics, bounds);
+                        run_style = None;
+                        next_column = column + 2;
+                        continue;
+                    }
+                    run.push(if cell.c == '\0' { ' ' } else { cell.c });
+                    next_column = column + 1;
+                    if cell.underline {
+                        let rect = cell_rect(row, *column, 1);
+                        fill(r, Rectangle { y: rect.y + lh - 2.0, height: 1.0, ..rect }, color(cell.fg));
+                    }
+                }
+                flush(r, &mut run, run_start, run_style);
+            }
+
+            // Cursor: a block when focused, an outline otherwise.
+            if let Some((row, column)) = snapshot.cursor {
+                let rect = cell_rect(row, column, 1);
+                let cursor = color(self.palette.cursor);
+                if self.focused {
+                    fill(r, rect, cursor);
+                    let under: Option<&CellView> = snapshot.rows[row]
+                        .iter()
+                        .find(|(c, _)| *c == column)
+                        .map(|(_, cell)| cell);
+                    if let Some(cell) = under.filter(|c| !c.c.is_whitespace()) {
+                        draw_text(r, cell.c.to_string(), rect.position(), color(self.palette.background), cell.bold, cell.italic, metrics, bounds);
+                    }
+                } else {
+                    r.fill_quad(
+                        Quad { bounds: rect, border: Border { color: cursor, width: 1.0, radius: 0.0.into() }, ..Quad::default() },
+                        Color::TRANSPARENT,
+                    );
+                }
+            }
+        });
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        if cursor.is_over(layout.bounds()) {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::None
+        }
+    }
+}
+
+impl<'a, Message: Clone + 'a> From<TerminalView<'a, Message>> for Element<'a, Message> {
+    fn from(view: TerminalView<'a, Message>) -> Self {
+        Element::new(view)
+    }
+}
+
+fn fill(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {
+    renderer.fill_quad(Quad { bounds, ..Quad::default() }, color);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    renderer: &mut iced::Renderer,
+    content: String,
+    position: Point,
+    color: Color,
+    bold: bool,
+    italic: bool,
+    metrics: Metrics,
+    clip: Rectangle,
+) {
+    let font = Font {
+        weight: if bold { font::Weight::Bold } else { font::Weight::Normal },
+        style: if italic { font::Style::Italic } else { font::Style::Normal },
+        ..Font::MONOSPACE
+    };
+    let shaping = if content.is_ascii() { text::Shaping::Basic } else { text::Shaping::Advanced };
+    renderer.fill_text(
+        text::Text {
+            content,
+            bounds: Size::new(f32::INFINITY, metrics.line_height),
+            size: Pixels(metrics.font_size),
+            line_height: text::LineHeight::Absolute(Pixels(metrics.line_height)),
+            font,
+            align_x: text::Alignment::Left,
+            align_y: alignment::Vertical::Top,
+            shaping,
+            wrapping: text::Wrapping::None,
+        },
+        position,
+        color,
+        clip,
+    );
+}

@@ -42,6 +42,8 @@ pub enum EditorEvent {
     Hover(Pos),
     /// The mouse left the hovered word.
     HoverEnd,
+    /// Clicked while another panel had keyboard focus.
+    Focused,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +160,8 @@ pub struct CodeEditor<'a, Message> {
     completion: Option<CompletionPopup<'a>>,
     hover: Option<HoverPopup<'a>>,
     signature: Option<SignaturePopup<'a>>,
+    /// Whether this editor owns keyboard focus in the app.
+    focused: bool,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
@@ -175,7 +179,13 @@ impl<'a, Message> CodeEditor<'a, Message> {
             completion: None,
             hover: None,
             signature: None,
+            focused: true,
         }
+    }
+
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
     }
 
     pub fn marks(mut self, marks: &'a [Mark]) -> Self {
@@ -204,10 +214,10 @@ impl<'a, Message> CodeEditor<'a, Message> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Metrics {
-    font_size: f32,
-    char_width: f32,
-    line_height: f32,
+pub(crate) struct Metrics {
+    pub(crate) font_size: f32,
+    pub(crate) char_width: f32,
+    pub(crate) line_height: f32,
 }
 
 /// Tracks the mouse resting over text, for hover requests.
@@ -603,6 +613,9 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 };
                 state.focused = true;
                 state.focused_at = Instant::now();
+                if !self.focused {
+                    self.emit(shell, EditorEvent::Focused);
+                }
 
                 // A click on the completion list accepts that row.
                 if let Some(popup) = &self.completion {
@@ -677,7 +690,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })
-                if state.focused =>
+                if state.focused && self.focused =>
             {
                 let page = geometry.page_lines();
                 let Some(action) = self.key_action(key, *modifiers, text.as_deref(), page) else {
@@ -791,7 +804,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
 
             // Matching brackets.
-            if state.focused && primary.is_empty() {
+            if state.focused && self.focused && primary.is_empty() {
                 if let Some((open, close)) = buffer.matching_bracket(primary.head) {
                     for index in [open, close] {
                         let pos = buffer.char_to_pos(index);
@@ -816,7 +829,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
 
             // Cursors.
-            if state.cursor_visible() {
+            if self.focused && state.cursor_visible() {
                 for sel in buffer.selections() {
                     let pos = buffer.char_to_pos(sel.head);
                     if !(first..last).contains(&pos.line) {
@@ -918,7 +931,7 @@ impl<'a, Message: 'a> From<CodeEditor<'a, Message>> for Element<'a, Message> {
     }
 }
 
-fn measure(font_size: f32) -> Metrics {
+pub(crate) fn measure(font_size: f32) -> Metrics {
     const SAMPLE: &str = "MMMMMMMMMMMMMMMMMMMM";
     let line_height = (font_size * LINE_HEIGHT_FACTOR).round();
     let paragraph = paragraph(SAMPLE, Font::MONOSPACE, font_size, line_height, f32::INFINITY);

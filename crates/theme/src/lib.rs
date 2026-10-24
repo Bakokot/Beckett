@@ -18,6 +18,78 @@ pub struct Theme {
     pub kind: ThemeKind,
     pub ui: UiColors,
     pub syntax: SyntaxColors,
+    /// ANSI colors for the integrated terminal.
+    #[serde(default)]
+    pub terminal: TerminalColors,
+}
+
+/// The 16 ANSI colors; foreground/background come from `ui`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TerminalColors {
+    pub black: Color,
+    pub red: Color,
+    pub green: Color,
+    pub yellow: Color,
+    pub blue: Color,
+    pub magenta: Color,
+    pub cyan: Color,
+    pub white: Color,
+    pub bright_black: Color,
+    pub bright_red: Color,
+    pub bright_green: Color,
+    pub bright_yellow: Color,
+    pub bright_blue: Color,
+    pub bright_magenta: Color,
+    pub bright_cyan: Color,
+    pub bright_white: Color,
+}
+
+impl TerminalColors {
+    /// In ANSI order: the 8 base colors, then their bright variants.
+    pub fn ansi(&self) -> [Color; 16] {
+        [
+            self.black,
+            self.red,
+            self.green,
+            self.yellow,
+            self.blue,
+            self.magenta,
+            self.cyan,
+            self.white,
+            self.bright_black,
+            self.bright_red,
+            self.bright_green,
+            self.bright_yellow,
+            self.bright_blue,
+            self.bright_magenta,
+            self.bright_cyan,
+            self.bright_white,
+        ]
+    }
+}
+
+impl Default for TerminalColors {
+    /// A dark palette, for themes that don't define one.
+    fn default() -> Self {
+        Self {
+            black: Color::rgb(0x4c, 0x56, 0x6a),
+            red: Color::rgb(0xff, 0x70, 0x85),
+            green: Color::rgb(0x8e, 0xef, 0x97),
+            yellow: Color::rgb(0xff, 0xed, 0xa1),
+            blue: Color::rgb(0x57, 0xb3, 0xff),
+            magenta: Color::rgb(0xff, 0x8c, 0xcc),
+            cyan: Color::rgb(0x42, 0xff, 0xc2),
+            white: Color::rgb(0xcd, 0xcf, 0xd2),
+            bright_black: Color::rgb(0x6b, 0x71, 0x7c),
+            bright_red: Color::rgb(0xff, 0x9a, 0xb0),
+            bright_green: Color::rgb(0xb6, 0xff, 0xbe),
+            bright_yellow: Color::rgb(0xff, 0xf4, 0xc4),
+            bright_blue: Color::rgb(0x8f, 0xd0, 0xff),
+            bright_magenta: Color::rgb(0xff, 0xb3, 0xe0),
+            bright_cyan: Color::rgb(0x8f, 0xff, 0xdb),
+            bright_white: Color::rgb(0xff, 0xff, 0xff),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

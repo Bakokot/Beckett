@@ -7,6 +7,8 @@ mod explorer;
 mod lsp;
 mod problems;
 mod style;
+mod terminal_panel;
+mod terminal_view;
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -27,6 +29,8 @@ use docs::Doc;
 use explorer::Explorer;
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
+use terminal_panel::TerminalEvent;
+use terminal_view::TerminalView;
 
 fn main() -> iced::Result {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
@@ -56,6 +60,26 @@ pub enum Message {
     ToggleProblems,
     /// Open a file and put the cursor at a zero-based line/character.
     JumpTo(PathBuf, u32, u32),
+    ToggleTerminal,
+    KillTerminal,
+    FocusTerminal,
+    Terminal(TerminalEvent),
+}
+
+/// Which panel receives keyboard input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Editor,
+    Terminal,
+}
+
+#[derive(Default)]
+struct TerminalState {
+    session: Option<std::sync::Arc<terminal::Terminal>>,
+    open: bool,
+    title: Option<String>,
+    /// Bumped to start a new shell.
+    generation: u64,
 }
 
 /// What an in-flight LSP request was for.
@@ -94,6 +118,8 @@ struct App {
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
     signature: Option<Signature>,
+    terminal: TerminalState,
+    focus: Focus,
 }
 
 struct Project {
@@ -152,6 +178,8 @@ impl App {
             completion: None,
             hover: None,
             signature: None,
+            terminal: TerminalState::default(),
+            focus: Focus::Editor,
         };
         if let Some(path) = initial {
             app.open_path(path);
@@ -193,7 +221,19 @@ impl App {
             })
             .unwrap_or_else(Subscription::none);
 
-        Subscription::batch([keys, lsp])
+        // The shell keeps running while its panel is hidden.
+        let terminal = self
+            .project
+            .as_ref()
+            .filter(|_| self.terminal.open || self.terminal.session.is_some())
+            .map(|project| {
+                let version = project.godot.as_ref().and_then(GodotProject::godot_version);
+                terminal_panel::spawn(self.terminal.generation, project.root.clone(), version)
+                    .map(Message::Terminal)
+            })
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([keys, lsp, terminal])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -249,8 +289,39 @@ impl App {
                 self.dismiss_popups();
                 self.jump_to(path, line, character);
             }
+            Message::ToggleTerminal => {
+                if self.project.is_some() {
+                    self.terminal.open = !self.terminal.open;
+                    self.focus = if self.terminal.open { Focus::Terminal } else { Focus::Editor };
+                    self.dismiss_popups();
+                }
+            }
+            Message::KillTerminal => self.reset_terminal(),
+            Message::FocusTerminal => {
+                self.focus = Focus::Terminal;
+                self.dismiss_popups();
+            }
+            Message::Terminal(event) => match event {
+                TerminalEvent::Ready(session) => self.terminal.session = Some(session),
+                // Nothing to update: the view redraws from the live grid.
+                TerminalEvent::Wakeup => {}
+                TerminalEvent::Title(title) => self.terminal.title = Some(title),
+                TerminalEvent::Exit => self.reset_terminal(),
+                TerminalEvent::Failed(error) => {
+                    self.status = Some(format!("Cannot start terminal: {error}"));
+                    self.reset_terminal();
+                }
+            },
         }
         Task::none()
+    }
+
+    /// Ends the shell (if any) and hides the panel; the next toggle starts
+    /// a fresh one.
+    fn reset_terminal(&mut self) {
+        let generation = self.terminal.generation + 1;
+        self.terminal = TerminalState { generation, ..TerminalState::default() };
+        self.focus = Focus::Editor;
     }
 
     fn on_editor(&mut self, event: EditorEvent) {
@@ -288,6 +359,7 @@ impl App {
             EditorEvent::TriggerCompletion => self.request_completion(None),
             EditorEvent::Hover(pos) => self.request_hover(pos),
             EditorEvent::HoverEnd => self.hover = None,
+            EditorEvent::Focused => self.focus = Focus::Editor,
         }
     }
 
@@ -626,6 +698,8 @@ impl App {
         });
         self.tabs.clear();
         self.active = None;
+        // A shell started in the previous project's folder is stale.
+        self.reset_terminal();
         if let Some(file) = file {
             self.open_file(file);
         }
@@ -739,6 +813,9 @@ impl App {
                     let ui = &self.current_theme().ui;
                     main = main.push(self.problems.view(ui, |p| self.display_path(p)));
                 }
+                if self.terminal.open {
+                    main = main.push(self.terminal_panel());
+                }
                 row![self.sidebar(project), main].into()
             }
         };
@@ -804,9 +881,46 @@ impl App {
             .marks(&tab.marks)
             .completion(completion)
             .hover(hover)
-            .signature(signature);
+            .signature(signature)
+            .focused(self.focus == Focus::Editor);
 
         column![self.tab_bar(), editor].into()
+    }
+
+    fn terminal_panel(&self) -> Element<'_, Message> {
+        let theme = self.current_theme();
+        let ui = &theme.ui;
+        let title = self.terminal.title.as_deref().unwrap_or("");
+        let header = row![
+            text("TERMINAL").size(12),
+            text(title).size(12).color(style::to_color(ui.text_muted)),
+            space::horizontal(),
+            button(text("kill").size(12))
+                .on_press(Message::KillTerminal)
+                .style(button::text)
+                .padding([0, 6]),
+            button(text("x").size(12))
+                .on_press(Message::ToggleTerminal)
+                .style(button::text)
+                .padding([0, 6]),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .padding([4, 8]);
+
+        let body: Element<'_, Message> = match &self.terminal.session {
+            Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
+                .focused(self.focus == Focus::Terminal)
+                .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
+                .into(),
+            None => center(text("Starting shell...").size(12).color(style::to_color(ui.text_muted))).into(),
+        };
+
+        container(column![header, body])
+            .width(Length::Fill)
+            .height(260)
+            .style(style::surface(ui))
+            .into()
     }
 
     fn tab_bar(&self) -> Element<'_, Message> {
@@ -869,6 +983,15 @@ impl App {
                 );
             }
         }
+        if self.project.is_some() {
+            left.push(
+                button(text("Terminal").size(12))
+                    .on_press(Message::ToggleTerminal)
+                    .style(button::text)
+                    .padding([0, 4])
+                    .into(),
+            );
+        }
         if let Some(status) = &self.status {
             left.push(text(status).size(12).color(style::to_color(ui.text_muted)).into());
         }
@@ -921,6 +1044,8 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Key::Character("s") if modifiers.command() => Some(Message::Save),
         keyboard::Key::Character("o") if modifiers.command() => Some(Message::OpenFolderDialog),
         keyboard::Key::Character("w") if modifiers.command() => Some(Message::CloseActiveTab),
+        // Ctrl+J (VS Code), Ctrl+` and Ctrl+² (the key left of 1 on AZERTY).
+        keyboard::Key::Character("j" | "`" | "²") if modifiers.command() => Some(Message::ToggleTerminal),
         _ => None,
     }
 }

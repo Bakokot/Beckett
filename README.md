@@ -16,7 +16,8 @@ cargo run -p godot-ide -- path/to/project # open a project directly
 cargo test                                # run unit tests
 ```
 
-Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab.
+Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to definition,
+`Ctrl+Space` completion, `Ctrl+J` (or `Ctrl+²`) toggle terminal.
 
 ## Themes
 
@@ -34,6 +35,8 @@ and pick it from the status bar.
 | Crate | Purpose |
 |---|---|
 | `app` (`godot-ide`) | Iced application and UI |
-| `editor-core` | Language detection, GDScript lexer |
+| `editor-core` | Text buffer (multi-cursor, undo), GDScript lexer |
 | `godot-project` | `project.godot` parsing, `res://` paths |
 | `theme` | Theme format, built-in themes, loading |
+| `lsp-client` | Godot language server client, Godot discovery |
+| `terminal` | Integrated terminal (pty + VT parsing) |
