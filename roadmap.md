@@ -19,7 +19,7 @@ the Godot editor.
 | UI | Iced (wgpu + cosmic-text) |
 | Text buffer | `ropey` |
 | Syntax highlighting | `tree-sitter` + `tree-sitter-gdscript` |
-| LSP / DAP client | `lsp-types` + `tokio` (TCP to Godot: LSP 6005, DAP 6006) |
+| LSP / DAP client | `serde_json` + std threads, no async runtime (TCP to Godot: LSP 6005, DAP 6006) |
 | Terminal | `alacritty_terminal` + `portable-pty` |
 | File watching | `notify` |
 | Fuzzy finder | `nucleo` |
@@ -81,13 +81,21 @@ crates/
 - [ ] GDScript snippets (`_ready`, `_process`, `@export`, `@onready`, signals…)
 - [ ] External file change detection and reload
 
-**LSP**
-- [ ] Detect Godot install, spawn `godot --headless --editor --lsp-port N` per project
-- [ ] Attach to an already-running Godot editor if present; auto-reconnect
-- [ ] Completion, hover, signature help
-- [ ] Go to definition, find references, rename
-- [ ] Diagnostics inline + Problems panel
-- [ ] Status bar LSP indicator (state, Godot version, port)
+**LSP** — `lsp-client` crate; verified against Godot 4.7.1 (`cargo run -p lsp-client --example probe`)
+- [x] Detect Godot installs (env, PATH, Desktop/Downloads/Program Files/Steam/scoop/winget), pick
+      the one matching the project version, spawn `godot --headless --editor --lsp-port N`
+- [x] Spawned Godot is killed with the IDE, even on crash (Windows Job Object)
+- [x] Attach to a running Godot editor on :6005 when it has the same project open
+      (checked via `gdscript_client/changeWorkspace`) — attach path not yet tested live
+- [x] Document sync: didOpen / didChange (full text) / didSave / didClose
+- [x] Status bar LSP indicator (state, Godot version, port); click to restart
+- [x] Problems panel (click to jump) + error/warning counts in status bar
+- [x] Go to definition (F12)
+- [ ] Auto-reconnect (currently manual: click the indicator)
+- [ ] Warn when no installed Godot matches the project version
+- [ ] Inline diagnostics (squiggles) — needs the custom editor widget
+- [ ] Completion, hover, signature help — need the custom editor widget (popup at cursor)
+- [ ] Find references, rename
 
 **Godot awareness**
 - [ ] `res://` / `uid://` resolution: click to open, path completion in strings

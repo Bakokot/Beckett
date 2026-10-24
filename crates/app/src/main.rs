@@ -2,8 +2,11 @@
 
 mod explorer;
 mod highlighter;
+mod lsp;
+mod problems;
 mod style;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use editor_core::Language;
@@ -13,9 +16,12 @@ use iced::widget::{
     text_editor, Row,
 };
 use iced::{keyboard, Alignment, Element, Font, Length, Subscription, Task};
+use lsp_client::{uri, Event, Position};
 
 use explorer::Explorer;
 use highlighter::GdHighlighter;
+use lsp::{Lsp, LspEvent};
+use problems::Problems;
 
 fn main() -> iced::Result {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
@@ -38,6 +44,17 @@ pub enum Message {
     Edit(text_editor::Action),
     Save,
     ThemeSelected(String),
+    Lsp(LspEvent),
+    RestartLsp,
+    GotoDefinition,
+    ToggleProblems,
+    /// Open a file and put the cursor at a zero-based line/character.
+    JumpTo(PathBuf, u32, u32),
+}
+
+/// What an in-flight LSP request was for.
+enum Pending {
+    Definition,
 }
 
 struct App {
@@ -50,6 +67,12 @@ struct App {
     /// Dirty tab the user already tried to close once; a second close discards it.
     pending_close: Option<PathBuf>,
     status: Option<String>,
+    lsp: Lsp,
+    /// Bumped to restart the language server subscription.
+    lsp_generation: u64,
+    pending: HashMap<u64, Pending>,
+    problems: Problems,
+    show_problems: bool,
 }
 
 struct Project {
@@ -63,6 +86,8 @@ struct Tab {
     language: Language,
     content: text_editor::Content,
     dirty: bool,
+    /// LSP document version, bumped on every edit.
+    version: i32,
 }
 
 impl Tab {
@@ -96,6 +121,11 @@ impl App {
             iced_theme,
             pending_close: None,
             status,
+            lsp: Lsp::Off,
+            lsp_generation: 0,
+            pending: HashMap::new(),
+            problems: Problems::default(),
+            show_problems: false,
         };
         if let Some(path) = initial {
             app.open_path(path);
@@ -124,17 +154,26 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        keyboard::on_key_press(|key, modifiers| {
-            if !modifiers.command() {
-                return None;
-            }
-            match key.as_ref() {
-                keyboard::Key::Character("s") => Some(Message::Save),
-                keyboard::Key::Character("o") => Some(Message::OpenFolderDialog),
-                keyboard::Key::Character("w") => Some(Message::CloseActiveTab),
-                _ => None,
-            }
-        })
+        let keys = keyboard::on_key_press(|key, modifiers| match key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
+            keyboard::Key::Character("s") if modifiers.command() => Some(Message::Save),
+            keyboard::Key::Character("o") if modifiers.command() => Some(Message::OpenFolderDialog),
+            keyboard::Key::Character("w") if modifiers.command() => Some(Message::CloseActiveTab),
+            _ => None,
+        });
+
+        let lsp = self
+            .project
+            .as_ref()
+            .and_then(|project| {
+                let godot = project.godot.as_ref()?;
+                let connection =
+                    lsp::connect(project.root.clone(), godot.godot_version(), self.lsp_generation);
+                Some(connection.map(Message::Lsp))
+            })
+            .unwrap_or_else(Subscription::none);
+
+        Subscription::batch([keys, lsp])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -149,7 +188,9 @@ impl App {
                     project.explorer.toggle(&path);
                 }
             }
-            Message::OpenFile(path) => self.open_file(path),
+            Message::OpenFile(path) => {
+                self.open_file(path);
+            }
             Message::SelectTab(index) => {
                 if index < self.tabs.len() {
                     self.active = Some(index);
@@ -163,10 +204,15 @@ impl App {
             }
             Message::Edit(action) => {
                 if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
-                    if action.is_edit() {
-                        tab.dirty = true;
-                    }
+                    let is_edit = action.is_edit();
                     tab.content.perform(action);
+                    if is_edit {
+                        tab.dirty = true;
+                        tab.version += 1;
+                        if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
+                            let _ = client.did_change(&tab.path, tab.version, &tab.content.text());
+                        }
+                    }
                 }
             }
             Message::Save => self.save_active(),
@@ -176,8 +222,99 @@ impl App {
                     self.iced_theme = style::iced_theme(&self.themes[index]);
                 }
             }
+            Message::Lsp(event) => self.on_lsp(event),
+            Message::RestartLsp => {
+                if self.project.as_ref().is_some_and(|p| p.godot.is_some()) {
+                    self.reset_lsp(Lsp::Starting);
+                }
+            }
+            Message::GotoDefinition => self.goto_definition(),
+            Message::ToggleProblems => self.show_problems = !self.show_problems,
+            Message::JumpTo(path, line, character) => self.jump_to(path, line, character),
         }
         Task::none()
+    }
+
+    fn on_lsp(&mut self, event: LspEvent) {
+        match event {
+            LspEvent::Connected { client, label } => {
+                for tab in self.tabs.iter().filter(|t| t.language == Language::GDScript) {
+                    let _ = client.did_open(&tab.path, tab.version, &tab.content.text());
+                }
+                self.lsp = Lsp::Ready { client, label };
+            }
+            LspEvent::Failed(error) => {
+                self.status = Some(error);
+                self.lsp = Lsp::Failed;
+            }
+            LspEvent::Event(Event::Diagnostics { path, diagnostics }) => {
+                self.problems.set(path, diagnostics);
+            }
+            LspEvent::Event(Event::Response { id, result }) => match self.pending.remove(&id) {
+                Some(Pending::Definition) => match result {
+                    Ok(value) => match lsp_client::locations(&value).into_iter().next() {
+                        Some(location) => {
+                            let start = location.range.start;
+                            self.jump_to(location.path, start.line, start.character);
+                        }
+                        None => self.status = Some("No definition found".to_string()),
+                    },
+                    Err(error) => self.status = Some(format!("Go to definition failed: {error}")),
+                },
+                None => {}
+            },
+            LspEvent::Event(Event::Disconnected(reason)) => {
+                if let Some(reason) = reason {
+                    self.status = Some(format!("Language server disconnected: {reason}"));
+                }
+                self.lsp = Lsp::Disconnected;
+                self.pending.clear();
+                self.problems.clear();
+            }
+            LspEvent::Event(Event::Notification { .. }) => {}
+        }
+    }
+
+    /// Drops the current connection (stopping a spawned Godot) and lets the
+    /// subscription start over.
+    fn reset_lsp(&mut self, state: Lsp) {
+        self.lsp = state;
+        self.lsp_generation += 1;
+        self.pending.clear();
+        self.problems.clear();
+    }
+
+    fn goto_definition(&mut self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.language != Language::GDScript {
+            return;
+        }
+        let Some(client) = self.lsp.client() else {
+            self.status = Some("Language server is not connected".to_string());
+            return;
+        };
+        let (line, column) = tab.content.cursor_position();
+        let position = Position {
+            line: line as u32,
+            character: column as u32,
+        };
+        match client.definition(&tab.path, position) {
+            Ok(id) => {
+                self.pending.insert(id, Pending::Definition);
+            }
+            Err(error) => self.status = Some(format!("Go to definition failed: {error}")),
+        }
+    }
+
+    fn jump_to(&mut self, path: PathBuf, line: u32, character: u32) {
+        if !self.open_file(path) {
+            return;
+        }
+        if let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) {
+            move_cursor(&mut tab.content, line, character);
+        }
     }
 
     /// Opens a project folder, or a file together with its project.
@@ -192,6 +329,7 @@ impl App {
         self.status = godot
             .is_none()
             .then(|| "No project.godot found in this folder".to_string());
+        self.reset_lsp(if godot.is_some() { Lsp::Starting } else { Lsp::Off });
         self.project = Some(Project {
             explorer: Explorer::new(root.clone()),
             root,
@@ -204,23 +342,31 @@ impl App {
         }
     }
 
-    fn open_file(&mut self, path: PathBuf) {
-        if let Some(index) = self.tabs.iter().position(|t| t.path == path) {
+    /// Opens (or focuses) a file tab. Returns whether it is now active.
+    fn open_file(&mut self, path: PathBuf) -> bool {
+        if let Some(index) = self.tabs.iter().position(|t| uri::same_path(&t.path, &path)) {
             self.active = Some(index);
-            return;
+            return true;
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                self.tabs.push(Tab {
+                let tab = Tab {
                     language: Language::from_path(&path),
                     content: text_editor::Content::with_text(&text),
                     path,
                     dirty: false,
-                });
+                    version: 1,
+                };
+                if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
+                    let _ = client.did_open(&tab.path, tab.version, &text);
+                }
+                self.tabs.push(tab);
                 self.active = Some(self.tabs.len() - 1);
+                true
             }
             Err(error) => {
                 self.status = Some(format!("Cannot open {}: {error}", path.display()));
+                false
             }
         }
     }
@@ -237,6 +383,9 @@ impl App {
             ));
             return;
         }
+        if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
+            let _ = client.did_close(&tab.path);
+        }
         self.pending_close = None;
         self.tabs.remove(index);
         self.active = match self.active {
@@ -251,10 +400,14 @@ impl App {
         let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) else {
             return;
         };
-        match std::fs::write(&tab.path, tab.content.text()) {
+        let text = tab.content.text();
+        match std::fs::write(&tab.path, &text) {
             Ok(()) => {
                 tab.dirty = false;
                 self.status = Some(format!("Saved {}", tab.title()));
+                if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
+                    let _ = client.did_save(&tab.path, &text);
+                }
             }
             Err(error) => {
                 self.status = Some(format!("Cannot save {}: {error}", tab.title()));
@@ -275,10 +428,27 @@ impl App {
             .unwrap_or_else(|| project.root.display().to_string())
     }
 
+    /// `res://` path when inside the project, file name otherwise.
+    fn display_path(&self, path: &Path) -> String {
+        self.project
+            .as_ref()
+            .and_then(|p| p.godot.as_ref())
+            .and_then(|g| g.to_res_path(path))
+            .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
     fn view(&self) -> Element<'_, Message> {
         let body: Element<'_, Message> = match &self.project {
             None => self.welcome(),
-            Some(project) => row![self.sidebar(project), self.editor_area()].into(),
+            Some(project) => {
+                let mut main = column![self.editor_area()];
+                if self.show_problems {
+                    let ui = &self.current_theme().ui;
+                    main = main.push(self.problems.view(ui, |p| self.display_path(p)));
+                }
+                row![self.sidebar(project), main].into()
+            }
         };
         column![container(body).height(Length::Fill), self.status_bar()].into()
     }
@@ -373,15 +543,39 @@ impl App {
     }
 
     fn status_bar(&self) -> Element<'_, Message> {
+        let ui = &self.current_theme().ui;
         let mut left: Vec<Element<'_, Message>> = Vec::new();
         if let Some(project) = &self.project {
             left.push(text(self.project_name(project)).size(12).into());
             if let Some(version) = project.godot.as_ref().and_then(GodotProject::godot_version) {
                 left.push(text(format!("Godot {version}")).size(12).into());
             }
+            if project.godot.is_some() {
+                let (errors, warnings) = self.problems.counts();
+                left.push(
+                    button(
+                        row![
+                            text(format!("E {errors}")).size(12).color(style::to_color(ui.danger)),
+                            text(format!("W {warnings}")).size(12).color(style::to_color(ui.warning)),
+                        ]
+                        .spacing(8),
+                    )
+                    .on_press(Message::ToggleProblems)
+                    .style(button::text)
+                    .padding([0, 4])
+                    .into(),
+                );
+                left.push(
+                    button(text(self.lsp.label()).size(12))
+                        .on_press(Message::RestartLsp)
+                        .style(button::text)
+                        .padding([0, 4])
+                        .into(),
+                );
+            }
         }
         if let Some(status) = &self.status {
-            left.push(text(status).size(12).into());
+            left.push(text(status).size(12).color(style::to_color(ui.text_muted)).into());
         }
 
         let mut right: Vec<Element<'_, Message>> = Vec::new();
@@ -412,8 +606,21 @@ impl App {
             .padding([2, 8]),
         )
         .width(Length::Fill)
-        .style(style::surface(&self.current_theme().ui))
+        .style(style::surface(ui))
         .into()
+    }
+}
+
+/// Places the cursor at a zero-based line/character using relative motions
+/// (iced 0.13's editor has no absolute cursor setter).
+fn move_cursor(content: &mut text_editor::Content, line: u32, character: u32) {
+    use text_editor::{Action, Motion};
+    content.perform(Action::Move(Motion::DocumentStart));
+    for _ in 0..line {
+        content.perform(Action::Move(Motion::Down));
+    }
+    for _ in 0..character {
+        content.perform(Action::Move(Motion::Right));
     }
 }
 
