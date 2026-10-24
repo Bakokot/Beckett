@@ -7,6 +7,7 @@ mod explorer;
 mod find;
 mod lsp;
 mod on_escape;
+mod palette;
 mod problems;
 mod runner;
 mod style;
@@ -32,6 +33,7 @@ use completion::Completion;
 use docs::Doc;
 use explorer::Explorer;
 use find::{Find, FindMessage, ProjectSearch, SearchMessage};
+use palette::{CommandEntry, Palette, PaletteMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
 use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
@@ -92,6 +94,9 @@ pub enum Message {
     /// Ctrl+Shift+F.
     OpenSearch,
     ModifiersChanged(keyboard::Modifiers),
+    /// Open the palette with this input ("" files, ">" commands, ":" go to line).
+    OpenPalette(String),
+    Palette(PaletteMessage),
 }
 
 /// Which panel receives keyboard input.
@@ -172,6 +177,7 @@ struct App {
     find: Option<Find>,
     search: ProjectSearch,
     modifiers: keyboard::Modifiers,
+    palette: Option<Palette<Message>>,
     // Popups for the active tab.
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
@@ -239,6 +245,7 @@ impl App {
             find: None,
             search: ProjectSearch::default(),
             modifiers: keyboard::Modifiers::default(),
+            palette: None,
             completion: None,
             hover: None,
             signature: None,
@@ -414,6 +421,8 @@ impl App {
             Message::OpenSearch => return self.open_search(),
             Message::Search(message) => return self.on_search(message),
             Message::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+            Message::OpenPalette(input) => return self.open_palette(input),
+            Message::Palette(message) => return self.on_palette(message),
             Message::OpenOutputLink(res_path, line) => {
                 let path = self
                     .project
@@ -583,6 +592,111 @@ impl App {
             },
             _ => Vec::new(),
         }
+    }
+
+    fn open_palette(&mut self, input: String) -> Task<Message> {
+        let Some(project) = &self.project else {
+            return Task::none();
+        };
+        let open: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        let mut palette = Palette::new(&project.root, &open, input);
+        palette.refresh(&self.commands());
+        self.palette = Some(palette);
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        Task::batch([
+            iced::widget::operation::focus(palette::INPUT),
+            iced::widget::operation::move_cursor_to_end(palette::INPUT),
+        ])
+    }
+
+    fn on_palette(&mut self, message: PaletteMessage) -> Task<Message> {
+        let commands = self.commands();
+        let Some(palette) = &mut self.palette else {
+            return Task::none();
+        };
+        let item = match message {
+            PaletteMessage::Input(input) => {
+                palette.input = input;
+                palette.refresh(&commands);
+                return Task::none();
+            }
+            PaletteMessage::Move(delta) => {
+                palette.move_selection(delta);
+                return Task::none();
+            }
+            PaletteMessage::Accept => palette.selected_item().cloned(),
+            PaletteMessage::AcceptRow(row) => palette.row(row).cloned(),
+            PaletteMessage::Close => None,
+        };
+        self.palette = None;
+        self.focus = Focus::Editor;
+        match item.map(|item| item.action) {
+            Some(palette::Action::Open(path)) => {
+                self.dismiss_popups();
+                self.open_file(path);
+            }
+            Some(palette::Action::GotoLine(line, column)) => {
+                if let Some(path) = self.active_tab().map(|t| t.path.clone()) {
+                    self.jump_to(path, line, column);
+                }
+            }
+            Some(palette::Action::Run(message)) => return self.handle(message),
+            None => {}
+        }
+        Task::none()
+    }
+
+    /// Everything the command palette offers.
+    fn commands(&self) -> Vec<CommandEntry<Message>> {
+        let edit = |command: Command| Message::Edit(EditorEvent::Command(command));
+        let mut commands: Vec<(&str, &'static str, Message)> = vec![
+            ("File: Save", "Ctrl+S", Message::Save),
+            ("File: Open Folder", "Ctrl+O", Message::OpenFolderDialog),
+            ("File: Close Tab", "Ctrl+W", Message::CloseActiveTab),
+            ("File: Reload from Disk", "", Message::ReloadActive),
+            ("Go to File", "Ctrl+P", Message::OpenPalette(String::new())),
+            ("Go to Line", "Ctrl+G", Message::OpenPalette(":".to_string())),
+            ("Go to Definition", "F12", Message::GotoDefinition),
+            ("Find", "Ctrl+F", Message::OpenFind { replace: false }),
+            ("Replace", "Ctrl+H", Message::OpenFind { replace: true }),
+            ("Search in Project", "Ctrl+Shift+F", Message::OpenSearch),
+            ("Run: Project", "F5", Message::RunProject),
+            ("Run: Current Scene", "F6", Message::RunScene),
+            ("Run: Stop", "F8", Message::StopRun),
+            ("View: Toggle Terminal", "Ctrl+J", Message::ToggleTerminal),
+            ("View: Problems", "", Message::ShowPanel(Panel::Problems)),
+            ("View: Output", "", Message::ShowPanel(Panel::Output)),
+            ("View: Search Results", "", Message::ShowPanel(Panel::Search)),
+            ("Terminal: Kill", "", Message::KillTerminal),
+            ("Output: Clear", "", Message::ClearOutput),
+            ("Language Server: Restart", "", Message::RestartLsp),
+            ("Edit: Undo", "Ctrl+Z", edit(Command::Undo)),
+            ("Edit: Redo", "Ctrl+Y", edit(Command::Redo)),
+            ("Edit: Select All", "Ctrl+A", edit(Command::SelectAll)),
+            ("Edit: Toggle Comment", "Ctrl+K", edit(Command::ToggleComment)),
+            ("Edit: Duplicate Line", "Shift+Alt+Down", edit(Command::DuplicateLines)),
+            ("Edit: Delete Line", "Ctrl+Shift+K", edit(Command::DeleteLines)),
+            ("Edit: Move Line Up", "Alt+Up", edit(Command::MoveLinesUp)),
+            ("Edit: Move Line Down", "Alt+Down", edit(Command::MoveLinesDown)),
+            ("Edit: Indent", "Tab", edit(Command::Indent)),
+            ("Edit: Outdent", "Shift+Tab", edit(Command::Outdent)),
+            ("Edit: Select Next Occurrence", "Ctrl+D", edit(Command::SelectNextOccurrence)),
+            ("Edit: Add Cursor Above", "Ctrl+Alt+Up", edit(Command::AddCursorAbove)),
+            ("Edit: Add Cursor Below", "Ctrl+Alt+Down", edit(Command::AddCursorBelow)),
+            ("Edit: Trigger Completion", "Ctrl+Space", Message::Edit(EditorEvent::TriggerCompletion)),
+        ];
+        let themes: Vec<(String, Message)> = self
+            .themes
+            .iter()
+            .map(|t| (format!("Theme: {}", t.name), Message::ThemeSelected(t.name.clone())))
+            .collect();
+        let mut entries: Vec<CommandEntry<Message>> = commands
+            .drain(..)
+            .map(|(name, shortcut, message)| CommandEntry { name: name.to_string(), shortcut, message })
+            .collect();
+        entries.extend(themes.into_iter().map(|(name, message)| CommandEntry { name, shortcut: "", message }));
+        entries
     }
 
     fn open_search(&mut self) -> Task<Message> {
@@ -853,7 +967,10 @@ impl App {
             EditorEvent::TriggerCompletion => self.request_completion(None),
             EditorEvent::Hover(pos) => self.request_hover(pos),
             EditorEvent::HoverEnd => self.hover = None,
-            EditorEvent::Focused => self.focus = Focus::Editor,
+            EditorEvent::Focused => {
+                self.focus = Focus::Editor;
+                self.palette = None;
+            }
         }
     }
 
@@ -1331,7 +1448,21 @@ impl App {
                 if let Some(panel) = self.panel {
                     main = main.push(self.bottom_panel(panel));
                 }
-                row![self.sidebar(project), main].into()
+                let body = row![self.sidebar(project), main];
+                match &self.palette {
+                    // Drawn over everything, centered near the top.
+                    Some(palette) => {
+                        let ui = &self.current_theme().ui;
+                        let palette = palette.view(ui).map(Message::Palette);
+                        let palette = on_escape::on_escape(palette, Message::Palette(PaletteMessage::Close));
+                        let layer = container(palette)
+                            .center_x(Length::Fill)
+                            .height(Length::Fill)
+                            .padding(iced::Padding { top: 48.0, ..iced::Padding::ZERO });
+                        iced::widget::stack![body, layer].into()
+                    }
+                    None => body.into(),
+                }
             }
         };
         column![container(body).height(Length::Fill), self.status_bar()].into()
@@ -1654,6 +1785,17 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
             Some(Message::Find(FindMessage::Previous))
         }
         keyboard::Key::Named(keyboard::key::Named::F3) => Some(Message::Find(FindMessage::Next)),
+        // Palette list navigation; ignored while it is closed. (Text inputs
+        // leave these keys alone, and the editor captures them itself.)
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(Message::Palette(PaletteMessage::Move(-1))),
+        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(Message::Palette(PaletteMessage::Move(1))),
+        keyboard::Key::Named(keyboard::key::Named::PageUp) => Some(Message::Palette(PaletteMessage::Move(-12))),
+        keyboard::Key::Named(keyboard::key::Named::PageDown) => Some(Message::Palette(PaletteMessage::Move(12))),
+        keyboard::Key::Character("p" | "P") if modifiers.command() && modifiers.shift() => {
+            Some(Message::OpenPalette(">".to_string()))
+        }
+        keyboard::Key::Character("p") if modifiers.command() => Some(Message::OpenPalette(String::new())),
+        keyboard::Key::Character("g") if modifiers.command() => Some(Message::OpenPalette(":".to_string())),
         keyboard::Key::Character("f" | "F") if modifiers.command() && modifiers.shift() => Some(Message::OpenSearch),
         keyboard::Key::Character("f") if modifiers.command() => Some(Message::OpenFind { replace: false }),
         keyboard::Key::Character("h") if modifiers.command() => Some(Message::OpenFind { replace: true }),

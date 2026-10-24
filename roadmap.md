@@ -147,8 +147,9 @@ crates/
 - [ ] Custom fonts, ligatures, line height, UI scale
 
 **Workspace**
-- [ ] Command palette (Ctrl+Shift+P)
-- [ ] Quick open (Ctrl+P, fuzzy)
+- [x] Command palette (Ctrl+Shift+P, or `>` in the box): ~35 commands incl. editor actions and themes
+- [x] Quick open (Ctrl+P): fuzzy file search (`editor_core::fuzzy`), file-name matches first,
+      open tabs listed first; go to line with `:` (Ctrl+G), `:line:column` supported
 - [ ] Recent projects / welcome screen
 
 ## Phase 2 — v1
