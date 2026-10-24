@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod gdscript;
+pub mod search;
 
 pub use buffer::{Buffer, Command, Motion, Pos, Selection};
 

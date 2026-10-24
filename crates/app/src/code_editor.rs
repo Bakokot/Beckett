@@ -113,6 +113,8 @@ pub struct Colors {
     pub bracket: Color,
     pub popup: Color,
     pub popup_border: Color,
+    pub find_match: Color,
+    pub find_current: Color,
     pub syntax: theme::SyntaxColors,
 }
 
@@ -134,6 +136,8 @@ impl Colors {
             bracket: text.scale_alpha(0.5),
             popup: to_color(ui.surface),
             popup_border: to_color(ui.border),
+            find_match: to_color(ui.warning).scale_alpha(0.22),
+            find_current: to_color(ui.warning),
             syntax: theme.syntax,
         }
     }
@@ -167,6 +171,9 @@ pub struct CodeEditor<'a, Message> {
     completion: Option<CompletionPopup<'a>>,
     hover: Option<HoverPopup<'a>>,
     signature: Option<SignaturePopup<'a>>,
+    /// Sorted char ranges to highlight (search matches) and the current one.
+    highlights: &'a [(usize, usize)],
+    current_highlight: Option<usize>,
     /// Whether this editor owns keyboard focus in the app.
     focused: bool,
 }
@@ -186,8 +193,16 @@ impl<'a, Message> CodeEditor<'a, Message> {
             completion: None,
             hover: None,
             signature: None,
+            highlights: &[],
+            current_highlight: None,
             focused: true,
         }
+    }
+
+    pub fn highlights(mut self, ranges: &'a [(usize, usize)], current: Option<usize>) -> Self {
+        self.highlights = ranges;
+        self.current_highlight = current;
+        self
     }
 
     pub fn focused(mut self, focused: bool) -> Self {
@@ -366,6 +381,36 @@ impl<'a, Message> CodeEditor<'a, Message> {
     fn screen_point(&self, geometry: &Geometry, scroll: Vector, pos: Pos) -> Point {
         let visual = self.buffer.visual_col(pos.line, pos.column);
         Point::new(geometry.col_x(visual, scroll), geometry.line_y(pos.line, scroll))
+    }
+
+    /// Rectangles covering a char range, one per visible line; a range that
+    /// continues past a line end also covers the line break.
+    fn range_rects(
+        &self,
+        g: &Geometry,
+        scroll: Vector,
+        start: usize,
+        end: usize,
+        first: usize,
+        last: usize,
+    ) -> Vec<Rectangle> {
+        let buffer = self.buffer;
+        let start = buffer.char_to_pos(start);
+        let end = buffer.char_to_pos(end);
+        (start.line.max(first)..=end.line.min(last.saturating_sub(1)))
+            .map(|line| {
+                let from = if line == start.line { buffer.visual_col(line, start.column) } else { 0 };
+                let to = if line == end.line {
+                    buffer.visual_col(line, end.column)
+                } else {
+                    buffer.visual_col(line, buffer.line_len(line)) + 1
+                };
+                Rectangle::new(
+                    Point::new(g.col_x(from, scroll), g.line_y(line, scroll)),
+                    Size::new(to.saturating_sub(from) as f32 * g.char_width, g.line_height),
+                )
+            })
+            .collect()
     }
 
     /// Scrolls so the primary cursor is visible.
@@ -779,22 +824,25 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 fill(r, Rectangle { y, height: lh, ..g.text_area }, colors.current_line);
             }
 
+            // Search matches (sorted), only those on visible lines.
+            let visible_start = buffer.pos_to_char(Pos { line: first, column: 0 });
+            let visible_end = buffer.pos_to_char(Pos { line: last, column: 0 });
+            let skip = self.highlights.partition_point(|&(_, end)| end < visible_start);
+            for (index, &(start, end)) in self.highlights.iter().enumerate().skip(skip) {
+                if start > visible_end {
+                    break;
+                }
+                for rect in self.range_rects(&g, scroll, start, end, first, last) {
+                    fill(r, rect, colors.find_match);
+                    if self.current_highlight == Some(index) {
+                        outline(r, rect, colors.find_current);
+                    }
+                }
+            }
+
             // Selections.
             for sel in buffer.selections().iter().filter(|s| !s.is_empty()) {
-                let start = buffer.char_to_pos(sel.start());
-                let end = buffer.char_to_pos(sel.end());
-                for line in start.line.max(first)..=end.line.min(last.saturating_sub(1)) {
-                    let from = if line == start.line { buffer.visual_col(line, start.column) } else { 0 };
-                    let to = if line == end.line {
-                        buffer.visual_col(line, end.column)
-                    } else {
-                        buffer.visual_col(line, buffer.line_len(line)) + 1
-                    };
-                    let x = g.col_x(from, scroll);
-                    let rect = Rectangle::new(
-                        Point::new(x, g.line_y(line, scroll)),
-                        Size::new((to - from) as f32 * cw, lh),
-                    );
+                for rect in self.range_rects(&g, scroll, sel.start(), sel.end(), first, last) {
                     fill(r, rect, colors.selection);
                 }
             }

@@ -4,7 +4,9 @@ mod code_editor;
 mod completion;
 mod docs;
 mod explorer;
+mod find;
 mod lsp;
+mod on_escape;
 mod problems;
 mod runner;
 mod style;
@@ -29,6 +31,7 @@ use code_editor::{
 use completion::Completion;
 use docs::Doc;
 use explorer::Explorer;
+use find::{Find, FindMessage, ProjectSearch, SearchMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
 use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
@@ -82,6 +85,13 @@ pub enum Message {
     FilesChanged(Vec<PathBuf>),
     /// Discard the active tab's edits and reload it from disk.
     ReloadActive,
+    Find(FindMessage),
+    /// Ctrl+F, or Ctrl+H with the replace row.
+    OpenFind { replace: bool },
+    Search(SearchMessage),
+    /// Ctrl+Shift+F.
+    OpenSearch,
+    ModifiersChanged(keyboard::Modifiers),
 }
 
 /// Which panel receives keyboard input.
@@ -89,6 +99,8 @@ pub enum Message {
 enum Focus {
     Editor,
     Terminal,
+    /// A text field (find bar, project search) has focus.
+    Input,
 }
 
 /// Tabs of the bottom panel.
@@ -97,6 +109,7 @@ pub enum Panel {
     Problems,
     Output,
     Terminal,
+    Search,
 }
 
 #[derive(Default)]
@@ -155,6 +168,10 @@ struct App {
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
+    /// Find bar of the active tab.
+    find: Option<Find>,
+    search: ProjectSearch,
+    modifiers: keyboard::Modifiers,
     // Popups for the active tab.
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
@@ -219,6 +236,9 @@ impl App {
             problems: Problems::default(),
             panel: None,
             run: RunState::default(),
+            find: None,
+            search: ProjectSearch::default(),
+            modifiers: keyboard::Modifiers::default(),
             completion: None,
             hover: None,
             signature: None,
@@ -294,6 +314,21 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let before = self.find_key();
+        let task = self.handle(message);
+        // Keep find matches in step with whichever buffer is active.
+        if self.find.is_some() && self.find_key() != before {
+            self.recompute_find();
+        }
+        task
+    }
+
+    /// Identifies the active buffer's contents.
+    fn find_key(&self) -> Option<(PathBuf, u64)> {
+        self.active_tab().map(|tab| (tab.path.clone(), tab.buffer.version()))
+    }
+
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::OpenFolderDialog => {
                 return Task::perform(pick_folder(), Message::FolderPicked);
@@ -374,6 +409,11 @@ impl App {
                     self.reload_tab(index);
                 }
             }
+            Message::OpenFind { replace } => return self.open_find(replace),
+            Message::Find(message) => return self.on_find(message),
+            Message::OpenSearch => return self.open_search(),
+            Message::Search(message) => return self.on_search(message),
+            Message::ModifiersChanged(modifiers) => self.modifiers = modifiers,
             Message::OpenOutputLink(res_path, line) => {
                 let path = self
                     .project
@@ -408,8 +448,206 @@ impl App {
 
     fn show_panel(&mut self, panel: Panel) {
         self.panel = Some(panel);
-        self.focus = if panel == Panel::Terminal { Focus::Terminal } else { Focus::Editor };
+        self.focus = match panel {
+            Panel::Terminal => Focus::Terminal,
+            Panel::Search => Focus::Input,
+            Panel::Problems | Panel::Output => Focus::Editor,
+        };
         self.dismiss_popups();
+    }
+
+    /// A single-line selection, to prefill a search box.
+    fn selection_query(&self) -> Option<String> {
+        let selected = self.active_tab()?.buffer.selected_text();
+        (!selected.is_empty() && !selected.contains('\n')).then_some(selected)
+    }
+
+    fn open_find(&mut self, replace: bool) -> Task<Message> {
+        if self.active_tab().is_none() {
+            return Task::none();
+        }
+        let prefill = self.selection_query();
+        let find = self
+            .find
+            .get_or_insert_with(|| Find::new(editor_core::search::Query::default(), replace));
+        if let Some(text) = prefill {
+            find.query.text = text;
+        }
+        find.show_replace |= replace;
+        self.recompute_find();
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        let input = if replace { find::REPLACE_INPUT } else { find::FIND_INPUT };
+        Task::batch([
+            iced::widget::operation::focus(input),
+            iced::widget::operation::select_all(input),
+        ])
+    }
+
+    fn recompute_find(&mut self) {
+        if let (Some(find), Some(tab)) = (&mut self.find, self.active.and_then(|i| self.tabs.get(i))) {
+            find.recompute(&tab.buffer);
+        }
+    }
+
+    /// Selects the current match in the editor, which also scrolls to it.
+    fn select_current_match(&mut self) {
+        if let Some(range) = self.find.as_ref().and_then(Find::current_range) {
+            self.apply_command(Command::Select { ranges: vec![range], primary: 0 });
+        }
+    }
+
+    fn on_find(&mut self, message: FindMessage) -> Task<Message> {
+        let Some(find) = &mut self.find else {
+            return Task::none();
+        };
+        match message {
+            FindMessage::Query(text) => {
+                find.query.text = text;
+                self.recompute_find();
+                self.select_current_match();
+            }
+            FindMessage::Replace(text) => find.replace = text,
+            FindMessage::ToggleCase | FindMessage::ToggleWord | FindMessage::ToggleRegex => {
+                let q = &mut find.query;
+                match message {
+                    FindMessage::ToggleCase => q.case_sensitive = !q.case_sensitive,
+                    FindMessage::ToggleWord => q.whole_word = !q.whole_word,
+                    _ => q.regex = !q.regex,
+                }
+                self.recompute_find();
+                self.select_current_match();
+            }
+            FindMessage::ToggleReplace => find.show_replace = !find.show_replace,
+            FindMessage::Next | FindMessage::Previous | FindMessage::Submit => {
+                let forward = match message {
+                    FindMessage::Previous => false,
+                    FindMessage::Submit => !self.modifiers.shift(),
+                    _ => true,
+                };
+                // Step from the match under the cursor, not from a stale index.
+                self.recompute_find();
+                let selection = self.active_tab().map(|tab| tab.buffer.primary());
+                if let Some(find) = &mut self.find {
+                    let on_match = selection
+                        .zip(find.current_range())
+                        .is_some_and(|(sel, range)| (sel.start(), sel.end()) == range);
+                    if on_match || !forward {
+                        find.step(forward);
+                    }
+                }
+                self.select_current_match();
+            }
+            FindMessage::ReplaceOne => {
+                let Some(range) = find.current_range() else {
+                    return Task::none();
+                };
+                let selected = self.active_tab().map(|t| t.buffer.primary()).is_some_and(|s| (s.start(), s.end()) == range);
+                if selected {
+                    let edits = self.find_replacements(&[range]);
+                    self.apply_command(Command::Replace(edits));
+                    self.recompute_find();
+                }
+                self.select_current_match();
+            }
+            FindMessage::ReplaceAll => {
+                let matches = find.matches.clone();
+                let count = matches.len();
+                if count > 0 {
+                    let edits = self.find_replacements(&matches);
+                    self.apply_command(Command::Replace(edits));
+                    self.recompute_find();
+                    self.status = Some(format!("Replaced {count} occurrence{}", if count == 1 { "" } else { "s" }));
+                }
+            }
+            FindMessage::SelectAll => {
+                let ranges = find.matches.clone();
+                let primary = find.current.unwrap_or(0);
+                self.find = None;
+                self.focus = Focus::Editor;
+                self.apply_command(Command::Select { ranges, primary });
+            }
+            FindMessage::Close => {
+                self.find = None;
+                self.focus = Focus::Editor;
+            }
+        }
+        Task::none()
+    }
+
+    fn find_replacements(&self, ranges: &[(usize, usize)]) -> Vec<(usize, usize, String)> {
+        match (&self.find, self.active_tab()) {
+            (Some(find), Some(tab)) => match find.matcher() {
+                Some(matcher) => tab.buffer.replacements(matcher, ranges, &find.replace),
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    fn open_search(&mut self) -> Task<Message> {
+        if self.project.is_none() {
+            return Task::none();
+        }
+        if let Some(text) = self.selection_query() {
+            self.search.query.text = text;
+        }
+        self.show_panel(Panel::Search);
+        Task::batch([
+            iced::widget::operation::focus(find::SEARCH_INPUT),
+            iced::widget::operation::select_all(find::SEARCH_INPUT),
+        ])
+    }
+
+    fn on_search(&mut self, message: SearchMessage) -> Task<Message> {
+        let query = &mut self.search.query;
+        match message {
+            SearchMessage::Query(text) => query.text = text,
+            SearchMessage::ToggleCase => query.case_sensitive = !query.case_sensitive,
+            SearchMessage::ToggleWord => query.whole_word = !query.whole_word,
+            SearchMessage::ToggleRegex => query.regex = !query.regex,
+            SearchMessage::Run => {
+                let Some(project) = &self.project else {
+                    return Task::none();
+                };
+                self.search.next_id += 1;
+                let id = self.search.next_id;
+                self.search.running = Some(id);
+                self.search.error = None;
+                let root = project.root.clone();
+                let query = self.search.query.clone();
+                // Unsaved edits are searched instead of the files on disk.
+                let open: Vec<(PathBuf, String)> = self
+                    .tabs
+                    .iter()
+                    .filter(|t| t.dirty)
+                    .map(|t| (t.path.clone(), t.buffer.text()))
+                    .collect();
+                return Task::perform(
+                    async move { find::search_project(&root, &query, &open) },
+                    move |result| Message::Search(SearchMessage::Done(id, result)),
+                );
+            }
+            SearchMessage::Done(id, result) => {
+                if self.search.running != Some(id) {
+                    return Task::none();
+                }
+                self.search.running = None;
+                match result {
+                    Ok(results) => {
+                        self.search.results = results;
+                        self.search.searched = Some(self.search.query.text.clone());
+                    }
+                    Err(error) => self.search.error = Some(error),
+                }
+            }
+            SearchMessage::Open(path, line, column) => {
+                self.dismiss_popups();
+                self.focus = Focus::Editor;
+                self.jump_to(path, line as u32, column as u32);
+            }
+        }
+        Task::none()
     }
 
     fn toggle_panel(&mut self, panel: Panel) {
@@ -631,6 +869,9 @@ impl App {
             tab.version += 1;
             if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
                 let _ = client.did_change(&tab.path, tab.version, &tab.buffer.text());
+            }
+            if self.find.is_some() {
+                self.recompute_find();
             }
         }
     }
@@ -1158,7 +1399,16 @@ impl App {
             .signature(signature)
             .focused(self.focus == Focus::Editor);
 
-        column![self.tab_bar(), editor].into()
+        let mut area = column![self.tab_bar()];
+        let editor = match &self.find {
+            Some(find) => {
+                let bar = find.view(&self.current_theme().ui).map(Message::Find);
+                area = area.push(on_escape::on_escape(bar, Message::Find(FindMessage::Close)));
+                editor.highlights(&find.matches, find.current)
+            }
+            None => editor,
+        };
+        area.push(editor).into()
     }
 
     /// The bottom panel: Problems / Output / Terminal tabs and the open one.
@@ -1175,6 +1425,7 @@ impl App {
             (Panel::Problems, format!("PROBLEMS  {errors}/{warnings}")),
             (Panel::Output, if self.is_running() { "OUTPUT (running)".to_string() } else { "OUTPUT".to_string() }),
             (Panel::Terminal, "TERMINAL".to_string()),
+            (Panel::Search, "SEARCH".to_string()),
         ]
         .into_iter()
         .map(|(tab, label)| {
@@ -1193,12 +1444,13 @@ impl App {
             Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun)),
             Panel::Output => header = header.push(action("clear", Message::ClearOutput)),
             Panel::Terminal => header = header.push(action("kill", Message::KillTerminal)),
-            Panel::Problems => {}
+            Panel::Problems | Panel::Search => {}
         }
         header = header.push(action("x", Message::ClosePanel));
 
         let body: Element<'_, Message> = match panel {
             Panel::Problems => self.problems.view(ui, |p| self.display_path(p)),
+            Panel::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),
             Panel::Output => self.output_view(),
             Panel::Terminal => match &self.terminal.session {
                 Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
@@ -1387,11 +1639,20 @@ impl App {
 
 /// Global shortcuts, for key presses no widget handled.
 fn shortcut(event: keyboard::Event) -> Option<Message> {
-    let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
-        return None;
+    let (key, modifiers) = match event {
+        keyboard::Event::KeyPressed { key, modifiers, .. } => (key, modifiers),
+        keyboard::Event::ModifiersChanged(modifiers) => return Some(Message::ModifiersChanged(modifiers)),
+        keyboard::Event::KeyReleased { .. } => return None,
     };
     match key.as_ref() {
         keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
+        keyboard::Key::Named(keyboard::key::Named::F3) if modifiers.shift() => {
+            Some(Message::Find(FindMessage::Previous))
+        }
+        keyboard::Key::Named(keyboard::key::Named::F3) => Some(Message::Find(FindMessage::Next)),
+        keyboard::Key::Character("f" | "F") if modifiers.command() && modifiers.shift() => Some(Message::OpenSearch),
+        keyboard::Key::Character("f") if modifiers.command() => Some(Message::OpenFind { replace: false }),
+        keyboard::Key::Character("h") if modifiers.command() => Some(Message::OpenFind { replace: true }),
         // Godot editor bindings: F5 run, F6 run current scene, F8 stop.
         keyboard::Key::Named(keyboard::key::Named::F5) if modifiers.shift() => Some(Message::StopRun),
         keyboard::Key::Named(keyboard::key::Named::F5) => Some(Message::RunProject),

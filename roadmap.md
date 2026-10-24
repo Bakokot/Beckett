@@ -85,7 +85,11 @@ crates/
 - [ ] Indentation guides
 - [ ] Box (column) selection by Alt+drag
 - [ ] IME composition (CJK input)
-- [ ] Find/replace in file and across project (regex, case, whole word)
+- [x] Find/replace in file: Ctrl+F / Ctrl+H bar, case / whole word / regex (with `$1` groups),
+      match highlights, Enter / Shift+Enter / F3 to step, replace one / all (one undo step),
+      "all" turns matches into cursors, Escape closes
+- [x] Project search: Ctrl+Shift+F, SEARCH tab, results grouped by file (unsaved edits included)
+- [ ] Replace across the project
 - [ ] GDScript snippets (`_ready`, `_process`, `@export`, `@onready`, signals…)
 - [x] External file change detection (`notify`): unchanged tabs reload silently; tabs with unsaved
       edits are flagged "(changed on disk)" with a Reload button; explorer folders refresh

@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use ropey::Rope;
 
 use crate::gdscript::{self, LineState, Token};
+use crate::search::Matcher;
 use crate::Language;
 
 pub const TAB_WIDTH: usize = 4;
@@ -108,6 +109,10 @@ pub enum Command {
     DeleteLines,
     Undo,
     Redo,
+    /// Select exact char ranges (e.g. search matches); `primary` indexes them.
+    Select { ranges: Vec<(usize, usize)>, primary: usize },
+    /// Replace char ranges (sorted, non-overlapping) as one undo step.
+    Replace(Vec<(usize, usize, String)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,7 +468,49 @@ impl Buffer {
             Command::DeleteLines => self.delete_lines(),
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
+            Command::Select { ranges, primary } => {
+                if ranges.is_empty() {
+                    return;
+                }
+                let selections = ranges.iter().map(|&(start, end)| Selection::new(start, end)).collect();
+                self.set_selections(selections, primary);
+            }
+            Command::Replace(replacements) => {
+                let changes = replacements
+                    .iter()
+                    .map(|(start, end, text)| change(*start, *end, text))
+                    .collect();
+                self.edit(changes, None, EditKind::Other);
+            }
         }
+    }
+
+    /// Char ranges of every match of `matcher`.
+    pub fn find(&self, matcher: &Matcher) -> Vec<(usize, usize)> {
+        let text = self.rope.to_string();
+        matcher
+            .find_all(&text)
+            .into_iter()
+            .map(|(start, end)| (self.rope.byte_to_char(start), self.rope.byte_to_char(end)))
+            .collect()
+    }
+
+    /// Replacement edits for match `ranges` (char indices), with `$1`-style
+    /// groups expanded in regex mode. Feed the result to [`Command::Replace`].
+    pub fn replacements(
+        &self,
+        matcher: &Matcher,
+        ranges: &[(usize, usize)],
+        template: &str,
+    ) -> Vec<(usize, usize, String)> {
+        let text = self.rope.to_string();
+        ranges
+            .iter()
+            .map(|&(start, end)| {
+                let bytes = (self.rope.char_to_byte(start), self.rope.char_to_byte(end));
+                (start, end, matcher.replacement(&text, bytes, template))
+            })
+            .collect()
     }
 
     fn moved(&self, sel: Selection, motion: Motion, extend: bool) -> Selection {
@@ -1288,6 +1335,26 @@ mod tests {
         assert_eq!(b.char_to_pos(b.primary().head), Pos { line: 1, column: 9 });
         b.apply(Command::Undo);
         assert_eq!(b.text(), "v.len\nw.len");
+    }
+
+    #[test]
+    fn find_and_replace_all_in_one_undo_step() {
+        use crate::search::Query;
+        let mut b = buf("var é = hp\nhp += 1");
+        let query = Query { text: "hp".into(), whole_word: true, ..Query::default() };
+        let matcher = Matcher::new(&query).unwrap().unwrap();
+        let found = b.find(&matcher);
+        assert_eq!(found, vec![(8, 10), (11, 13)]);
+
+        b.apply(Command::Select { ranges: found.clone(), primary: 1 });
+        assert_eq!(b.selections().len(), 2);
+        assert_eq!(b.primary().start(), 11);
+
+        let edits = b.replacements(&matcher, &found, "health");
+        b.apply(Command::Replace(edits));
+        assert_eq!(b.text(), "var é = health\nhealth += 1");
+        b.apply(Command::Undo);
+        assert_eq!(b.text(), "var é = hp\nhp += 1");
     }
 
     #[test]
