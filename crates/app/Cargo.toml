@@ -1,0 +1,12 @@
+[package]
+name = "godot-ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+editor-core.workspace = true
+godot-project.workspace = true
+theme.workspace = true
+iced.workspace = true
+rfd.workspace = true

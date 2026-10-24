@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+editor-core = { path = "crates/editor-core" }
+godot-project = { path = "crates/godot-project" }
+theme = { path = "crates/theme" }
+
+iced = { version = "0.13", features = ["advanced"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Keep debug builds responsive: the UI stack is slow unoptimized.
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,30 @@
+# Matches the default Godot 4 editor theme.
+name = "Godot Dark"
+author = "Godot IDE"
+kind = "dark"
+
+[ui]
+background = "#1d2229"
+surface = "#262c3b"
+text = "#cdcfd2"
+text_muted = "#8a8f98"
+accent = "#478cbf"
+border = "#14171c"
+success = "#45ff8b"
+warning = "#ffdd65"
+danger = "#ff5d5d"
+
+[syntax]
+text = "#cdcfd2"
+keyword = "#ff7085"
+control_flow = "#ff8ccc"
+type = "#42ffc2"
+function = "#57b3ff"
+annotation = "#ffb373"
+string = "#ffeda1"
+string_name = "#ffc2a6"
+node_path = "#b8c47d"
+number = "#a1ffe0"
+comment = "#cdcfd280"
+constant = "#bce0ff"
+symbol = "#abc9ff"
