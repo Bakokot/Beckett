@@ -189,7 +189,9 @@ crates/
 - [x] Hot exit: unsaved edits kept in the session on close (and every 30 s), restored as unsaved;
       flagged "(changed on disk)" when the file changed meanwhile — seen on screen
 - [ ] Persistent undo
-- [ ] Format on save (gdformat or LSP)
+- [x] Format Document (Shift+Alt+F) and opt-in format on save (`"format_on_save": true` in
+      settings.json): gdformat when installed (Godot's LSP has no formatter), else trailing whitespace
+      and final newline tidied; one undo step — unit-tested, gdformat path untested (not installed)
 - [x] Highlighting for `.gdshader`, `.tscn`, `.tres`, `project.godot`, `.cfg`, `.import`, JSON, Markdown
       (theme syntax colors; Toggle Comment uses `//` in shaders, `;` in config files) — seen on screen
 

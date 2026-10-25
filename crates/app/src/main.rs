@@ -5,6 +5,7 @@ mod completion;
 mod docs;
 mod explorer;
 mod find;
+mod format;
 mod lsp;
 mod on_escape;
 mod outline;
@@ -1157,6 +1158,7 @@ impl App {
         let edit = |command: Command| Message::Edit(EditorEvent::Command(command));
         let mut commands: Vec<(&str, &'static str, Message)> = vec![
             ("File: Save", "Ctrl+S", Message::Save),
+            ("Format Document", "Shift+Alt+F", Message::Edit(EditorEvent::FormatDocument)),
             ("File: Open Folder", "Ctrl+O", Message::OpenFolderDialog),
             ("File: Close Folder", "", Message::CloseFolder),
             ("File: Close Tab", "Ctrl+W", Message::CloseActiveTab),
@@ -1697,6 +1699,7 @@ impl App {
             },
             EditorEvent::TriggerCompletion => self.request_completion(None),
             EditorEvent::GotoDefinition => self.goto_definition(),
+            EditorEvent::FormatDocument => self.format_active(),
             EditorEvent::LinkHover(index) => self.on_link_hover(index),
             EditorEvent::NextTabStop | EditorEvent::PreviousTabStop => {
                 self.completion = None;
@@ -2541,6 +2544,43 @@ impl App {
         }
     }
 
+    fn format_active(&mut self) {
+        let Some(index) = self.active else {
+            return;
+        };
+        self.status = Some(match self.format_tab(index) {
+            Ok(None) => "Already formatted".to_string(),
+            Ok(Some(tool)) => format!("Formatted with {tool}"),
+            Err(error) => error,
+        });
+    }
+
+    /// Formats a tab as one undo step: gdformat for GDScript when it is
+    /// installed, else trailing whitespace and final newline tidied.
+    /// Returns the tool used, or `None` if nothing changed.
+    fn format_tab(&mut self, index: usize) -> Result<Option<&'static str>, String> {
+        let Some(tab) = self.tabs.get(index) else {
+            return Ok(None);
+        };
+        // Trailing double spaces are line breaks in Markdown.
+        if tab.language == Language::Markdown {
+            return Err("Markdown is not formatted".to_string());
+        }
+        let text = tab.buffer.text();
+        let gdformat = (tab.language == Language::GDScript).then(format::gdformat_path).flatten();
+        let (formatted, tool) = match gdformat {
+            Some(exe) => (format::gdformat(&exe, &text)?, "gdformat"),
+            None => (format::tidy(&text), "the built-in tidy (install gdtoolkit for gdformat)"),
+        };
+        match format::minimal_edit(&text, &formatted) {
+            Some(edit) => {
+                self.edit_tab(index, Command::Replace(vec![edit]));
+                Ok(Some(tool))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Leaves the project for the welcome screen, keeping its session.
     fn close_folder(&mut self) {
         self.save_session();
@@ -2721,6 +2761,13 @@ impl App {
     }
 
     fn save_tab(&mut self, index: usize) -> bool {
+        let formats = self.tabs.get(index).is_some_and(|t| matches!(t.language, Language::GDScript | Language::Shader));
+        if self.settings.format_on_save && formats {
+            if let Err(error) = self.format_tab(index) {
+                // Saved as typed: a formatter error must not block saving.
+                self.status = Some(error);
+            }
+        }
         let Some(tab) = self.tabs.get_mut(index) else {
             return false;
         };

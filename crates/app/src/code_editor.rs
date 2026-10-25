@@ -45,6 +45,8 @@ pub enum EditorEvent {
     HoverEnd,
     /// Clicked while another panel had keyboard focus.
     Focused,
+    /// Shift+Alt+F.
+    FormatDocument,
     /// Ctrl+click: go to the definition (or open the path) under the click.
     GotoDefinition,
     /// Ctrl is held with the mouse over this char (`None`: released or moved
@@ -660,6 +662,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
                 _ => None,
             },
             // Alt+F folds / unfolds, as in the Godot editor.
+            Key::Character(c) if alt && !ctrl && shift && c.eq_ignore_ascii_case("f") => event(EditorEvent::FormatDocument),
             Key::Character(c) if alt && !ctrl && c.eq_ignore_ascii_case("f") => command(Command::ToggleFoldAtCursor),
             // Ctrl+Alt is AltGr on many layouts: treat it as typing.
             Key::Character(c) if ctrl && !alt => match c.to_lowercase().as_str() {

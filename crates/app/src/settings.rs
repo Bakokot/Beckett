@@ -13,6 +13,8 @@ pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 pub struct Settings {
     /// Scale of the whole interface (Ctrl+= / Ctrl+- / Ctrl+0).
     pub ui_scale: f32,
+    /// Format GDScript files (gdformat, else a light tidy) when saving.
+    pub format_on_save: bool,
     /// The sidebar shows the outline instead of the files.
     pub show_outline: bool,
     /// Name of the theme in use, restored at startup.
@@ -22,7 +24,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { ui_scale: 1.0, show_outline: false, theme: None }
+        Self { ui_scale: 1.0, format_on_save: false, show_outline: false, theme: None }
     }
 }
 
