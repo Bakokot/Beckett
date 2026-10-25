@@ -293,6 +293,10 @@ struct State {
     mouse: Option<Point>,
     /// Word range (char indices) last reported with `LinkHover`.
     link_sent: Option<(usize, usize)>,
+    /// Alt+drag: the (line, visual column) where the box started.
+    box_anchor: Option<(usize, usize)>,
+    /// The Alt+drag left its starting cell, so it is a box, not a click.
+    box_dragged: bool,
 }
 
 impl State {
@@ -312,6 +316,8 @@ impl State {
             hover: None,
             mouse: None,
             link_sent: None,
+            box_anchor: None,
+            box_dragged: false,
         }
     }
 
@@ -399,6 +405,14 @@ impl<'a, Message> CodeEditor<'a, Message> {
         let line = line.min(self.buffer.len_lines() - 1);
         let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).round().max(0.0);
         Pos { line, column: self.buffer.column_for_visual(line, visual as usize) }
+    }
+
+    /// (line, visual column) of the gap nearest to `point`, past line ends
+    /// too, for box selection.
+    fn grid_at(&self, geometry: &Geometry, scroll: Vector, point: Point) -> (usize, usize) {
+        let line = ((point.y - geometry.bounds.y + scroll.y) / geometry.line_height).max(0.0) as usize;
+        let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).round().max(0.0);
+        (line.min(self.buffer.len_lines() - 1), visual as usize)
     }
 
     /// Char index of the character under `point` (not rounded to the nearest gap).
@@ -750,7 +764,11 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 let pos = self.pos_at(&geometry, state.scroll, point);
                 let alt = state.modifiers.alt();
                 let command = match click.kind() {
-                    mouse::click::Kind::Single if alt => Command::AddCursorAt(pos),
+                    mouse::click::Kind::Single if alt => {
+                        // Alt+click adds a cursor; dragging on turns it into a box.
+                        state.box_anchor = Some(self.grid_at(&geometry, state.scroll, point));
+                        Command::AddCursorAt(pos)
+                    }
                     mouse::click::Kind::Single if state.modifiers.command() => {
                         self.emit(shell, EditorEvent::Command(Command::Click { pos, extend: false }));
                         self.emit(shell, EditorEvent::GotoDefinition);
@@ -768,7 +786,14 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if state.dragging {
+                if let Some(anchor) = state.box_anchor {
+                    let head = self.grid_at(&geometry, state.scroll, *position);
+                    if head != anchor || state.box_dragged {
+                        state.box_dragged = true;
+                        self.emit(shell, EditorEvent::Command(Command::BoxSelect { anchor, head }));
+                    }
+                    shell.capture_event();
+                } else if state.dragging {
                     let pos = self.pos_at(&geometry, state.scroll, *position);
                     self.emit(shell, EditorEvent::Command(Command::Drag(pos)));
                     shell.capture_event();
@@ -785,6 +810,8 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
+                state.box_anchor = None;
+                state.box_dragged = false;
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(geometry.bounds) => {
                 if let Some(popup) = &self.completion {

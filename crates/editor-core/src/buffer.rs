@@ -82,6 +82,10 @@ pub enum Command {
     Click { pos: Pos, extend: bool },
     AddCursorAt(Pos),
     Drag(Pos),
+    /// Column (box) selection between two (line, visual column) corners:
+    /// one selection per line. Lines too short to reach the box are skipped,
+    /// unless the box has no width (then they get a cursor at their end).
+    BoxSelect { anchor: (usize, usize), head: (usize, usize) },
     SelectWordAt(Pos),
     SelectLineAt(Pos),
     SelectAll,
@@ -395,6 +399,28 @@ impl Buffer {
                 let mut selections = self.selections.clone();
                 selections[self.primary].head = self.pos_to_char(pos);
                 self.set_selections(selections, self.primary);
+            }
+            Command::BoxSelect { anchor, head } => {
+                let last = self.len_lines() - 1;
+                let (first_line, last_line) = (anchor.0.min(head.0).min(last), anchor.0.max(head.0).min(last));
+                let left = anchor.1.min(head.1);
+                let at = |line: usize, visual: usize| self.pos_to_char(Pos { line, column: self.column_for_visual(line, visual) });
+                let mut selections = Vec::new();
+                let mut primary = 0;
+                for line in first_line..=last_line {
+                    let width = self.visual_col(line, self.line_len(line));
+                    if anchor.1 != head.1 && width < left {
+                        continue;
+                    }
+                    if line == head.0.min(last) {
+                        primary = selections.len();
+                    }
+                    selections.push(Selection::new(at(line, anchor.1), at(line, head.1)));
+                }
+                if selections.is_empty() {
+                    selections.push(Selection::cursor(at(head.0.min(last), head.1)));
+                }
+                self.set_selections(selections, primary);
             }
             Command::SelectWordAt(pos) => {
                 let (start, end) = self.word_at(self.pos_to_char(pos));
@@ -1390,5 +1416,23 @@ mod tests {
         assert_eq!(b.matching_bracket(2), Some((1, 6)));
         assert_eq!(b.matching_bracket(7), Some((1, 6)));
         assert_eq!(b.matching_bracket(4), Some((3, 5)));
+    }
+
+    #[test]
+    fn box_selection_uses_visual_columns_and_skips_short_lines() {
+        // Line 1 is indented with a tab (4 columns), line 2 is too short.
+        let mut b = buf("abcdef\n\tefgh\nab\nabcdefgh");
+        b.apply(Command::BoxSelect { anchor: (0, 4), head: (3, 6) });
+        let picked: Vec<String> = b.selections().iter().map(|s| b.slice(s.start(), s.end())).collect();
+        assert_eq!(picked, ["ef", "ef", "ef"]);
+        assert_eq!(b.char_to_pos(b.primary().head), Pos { line: 3, column: 6 });
+        type_str(&mut b, "X");
+        assert_eq!(b.text(), "abcdX\n\tXgh\nab\nabcdXgh");
+
+        // No width: a cursor on every line, short ones at their end.
+        let mut b = buf("abcdef\nab\nabcdef");
+        b.apply(Command::BoxSelect { anchor: (0, 4), head: (2, 4) });
+        let cursors: Vec<Pos> = b.selections().iter().map(|s| b.char_to_pos(s.head)).collect();
+        assert_eq!(cursors, [Pos { line: 0, column: 4 }, Pos { line: 1, column: 2 }, Pos { line: 2, column: 4 }]);
     }
 }

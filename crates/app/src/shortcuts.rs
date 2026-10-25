@@ -56,6 +56,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Shift+Click", "Extend the selection to the click"),
             ("Double-click / Triple-click", "Select word / line"),
             ("Alt+Click", "Add a cursor"),
+            ("Alt+Drag", "Column (box) selection, one cursor per line"),
             ("Ctrl+Alt+Up / Ctrl+Alt+Down", "Add a cursor above / below"),
             ("Ctrl+D", "Select the next occurrence of the selection"),
             ("Escape", "Back to a single cursor"),

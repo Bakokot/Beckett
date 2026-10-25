@@ -83,7 +83,7 @@ crates/
 - [x] Undo/redo grouped by typing runs; clipboard (multi-cursor paste distributes lines)
 - [x] AltGr typing on AZERTY etc. (Ctrl+Alt is treated as text, not a shortcut)
 - [x] Indentation guides (bridging blank lines inside a block)
-- [ ] Box (column) selection by Alt+drag
+- [x] Box (column) selection by Alt+drag (visual columns, so tabs line up; short lines skipped)
 - [ ] IME composition (CJK input)
 - [x] Find/replace in file: Ctrl+F / Ctrl+H bar, case / whole word / regex (with `$1` groups),
       match highlights, Enter / Shift+Enter / F3 to step, replace one / all (one undo step),
