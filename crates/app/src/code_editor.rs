@@ -115,6 +115,7 @@ pub struct Colors {
     pub popup_border: Color,
     pub find_match: Color,
     pub find_current: Color,
+    pub indent_guide: Color,
     pub syntax: theme::SyntaxColors,
 }
 
@@ -138,6 +139,7 @@ impl Colors {
             popup_border: to_color(ui.border),
             find_match: to_color(ui.warning).scale_alpha(0.22),
             find_current: to_color(ui.warning),
+            indent_guide: text.scale_alpha(0.12),
             syntax: theme.syntax,
         }
     }
@@ -824,6 +826,15 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 fill(r, Rectangle { y, height: lh, ..g.text_area }, colors.current_line);
             }
 
+            // Indentation guides.
+            for (line, levels) in (first..last).zip(indent_levels(buffer, first, last)) {
+                let y = g.line_y(line, scroll);
+                for level in 0..levels {
+                    let x = g.col_x(level * TAB_WIDTH, scroll).round();
+                    fill(r, Rectangle::new(Point::new(x, y), Size::new(1.0, lh)), colors.indent_guide);
+                }
+            }
+
             // Search matches (sorted), only those on visible lines.
             let visible_start = buffer.pos_to_char(Pos { line: first, column: 0 });
             let visible_end = buffer.pos_to_char(Pos { line: last, column: 0 });
@@ -1140,6 +1151,30 @@ fn draw_text(
     );
 }
 
+/// How far a blank line looks up and down for the indentation it sits in.
+const GUIDE_SCAN_LINES: usize = 200;
+
+/// Indent levels of `first..last` for indentation guides. A blank line
+/// takes the smaller level of the nearest non-blank lines around it, so
+/// guides run through blank lines inside a block but not between blocks.
+fn indent_levels(buffer: &Buffer, first: usize, last: usize) -> Vec<usize> {
+    let level = |line: usize| -> Option<usize> {
+        let text = buffer.line_text(line);
+        let indent = text.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+        (indent < text.trim_end().chars().count()).then(|| buffer.visual_col(line, indent) / TAB_WIDTH)
+    };
+    let len = buffer.len_lines();
+    (first..last)
+        .map(|line| {
+            level(line).unwrap_or_else(|| {
+                let above = (line.saturating_sub(GUIDE_SCAN_LINES)..line).rev().find_map(level);
+                let below = (line + 1..len.min(line + GUIDE_SCAN_LINES)).find_map(level);
+                above.unwrap_or(0).min(below.unwrap_or(0))
+            })
+        })
+        .collect()
+}
+
 /// Splits a line into same-color runs: (visual column, text with tabs
 /// expanded to spaces, token kind).
 fn segments(line: &str, tokens: &[Token]) -> Vec<(usize, String, Option<TokenKind>)> {
@@ -1193,5 +1228,14 @@ mod tests {
         assert_eq!(segs[1], (4, "var".to_string(), Some(TokenKind::Keyword)));
         let last = segs.last().unwrap();
         assert_eq!((last.0, last.1.as_str(), last.2), (12, "1", Some(TokenKind::Number)));
+    }
+
+    #[test]
+    fn indent_levels_bridge_blank_lines_inside_blocks() {
+        let text = "func a():\n\tif x:\n\t\tpass\n\n\t\tpass\n\n    return\n\nfunc b():\n";
+        let buffer = Buffer::new(text, editor_core::Language::GDScript);
+        let levels = indent_levels(&buffer, 0, buffer.len_lines());
+        // Blank line 3 sits inside the `if` body; line 7 between functions.
+        assert_eq!(levels, [0, 1, 2, 2, 2, 1, 1, 0, 0, 0]);
     }
 }

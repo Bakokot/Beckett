@@ -82,7 +82,7 @@ crates/
 - [x] Bracket matching, auto-close brackets/quotes, wrap selection, step over closers
 - [x] Undo/redo grouped by typing runs; clipboard (multi-cursor paste distributes lines)
 - [x] AltGr typing on AZERTY etc. (Ctrl+Alt is treated as text, not a shortcut)
-- [ ] Indentation guides
+- [x] Indentation guides (bridging blank lines inside a block)
 - [ ] Box (column) selection by Alt+drag
 - [ ] IME composition (CJK input)
 - [x] Find/replace in file: Ctrl+F / Ctrl+H bar, case / whole word / regex (with `$1` groups),
