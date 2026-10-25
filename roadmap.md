@@ -105,7 +105,7 @@ crates/
       the one matching the project version, spawn `godot --headless --editor --lsp-port N`
 - [x] Spawned Godot is killed with the IDE, even on crash (Windows Job Object)
 - [x] Attach to a running Godot editor on :6005 when it has the same project open
-      (checked via `gdscript_client/changeWorkspace`) — attach path not yet tested live
+      (checked via `gdscript_client/changeWorkspace`) — verified live via "Open in Godot"
 - [x] Document sync: didOpen / didChange (full text) / didSave / didClose
 - [x] Status bar LSP indicator (state, Godot version, port); click to restart
 - [x] Problems panel (click to jump) + error/warning counts in status bar
@@ -120,7 +120,7 @@ crates/
       ranking (prefix > substring > subsequence); kind tags; docs pane via `completionItem/resolve`;
       Enter/Tab/click to accept, functions get `()` with the cursor inside
 - [x] Signature help on `(` and `,`, active parameter highlighted
-- [x] Hover docs after the mouse rests 500 ms on a word — not yet tested live (needs a real mouse)
+- [x] Hover docs after the mouse rests 500 ms on a word — seen live (Ctrl+hover test)
 - [ ] Member completion after `.` not yet verified live (test harness can't type Shift chars on AZERTY)
 - [x] Find references (Shift+F12), listed in the SEARCH tab grouped by file
 - [x] Rename symbol (F2): `prepareRename` check, rename bar, open tabs edited in place (one undo
