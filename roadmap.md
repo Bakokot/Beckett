@@ -154,6 +154,8 @@ crates/
 - [x] Command palette (Ctrl+Shift+P, or `>` in the box): ~35 commands incl. editor actions and themes
 - [x] Quick open (Ctrl+P): fuzzy file search (`editor_core::fuzzy`), file-name matches first,
       open tabs listed first; go to line with `:` (Ctrl+G), `:line:column` supported
+- [x] Keyboard shortcuts page (F1, `?` in the status bar, or the palette): every binding by
+      section, with a filter; Escape closes
 - [ ] Recent projects / welcome screen
 
 ## Phase 2 — v1

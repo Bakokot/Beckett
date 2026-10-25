@@ -11,6 +11,7 @@ mod palette;
 mod problems;
 mod rename;
 mod runner;
+mod shortcuts;
 mod style;
 mod terminal_panel;
 mod terminal_view;
@@ -42,6 +43,7 @@ use palette::{CommandEntry, Palette, PaletteMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
 use rename::{Rename, RenameMessage};
+use shortcuts::{Shortcuts, ShortcutsMessage};
 use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
 use terminal_panel::TerminalEvent;
 use terminal_view::TerminalView;
@@ -110,6 +112,9 @@ pub enum Message {
     OpenPalette(String),
     Palette(PaletteMessage),
     OpenThemeEditor,
+    /// F1: the keyboard shortcuts page.
+    OpenShortcuts,
+    Shortcuts(ShortcutsMessage),
     ThemeEditor(ThemeMessage),
     ThemeImportPicked(Option<PathBuf>),
     ThemeExportPicked(Option<PathBuf>),
@@ -206,6 +211,8 @@ struct App {
     /// Where each theme was loaded from (`None` for built-in ones).
     theme_paths: Vec<Option<PathBuf>>,
     theme_editor: Option<ThemeEditor>,
+    /// The keyboard shortcuts page, shown in place of the editor.
+    shortcuts: Option<Shortcuts>,
     // Popups for the active tab.
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
@@ -281,6 +288,7 @@ impl App {
             palette: None,
             theme_paths,
             theme_editor: None,
+            shortcuts: None,
             completion: None,
             hover: None,
             signature: None,
@@ -405,7 +413,28 @@ impl App {
                 if index < self.tabs.len() {
                     self.dismiss_popups();
                     self.active = Some(index);
+                    self.shortcuts = None;
                 }
+            }
+            Message::OpenShortcuts => {
+                // Keep the filter when it is already open.
+                self.shortcuts.get_or_insert_with(Shortcuts::default);
+                self.palette = None;
+                self.focus = Focus::Input;
+                self.dismiss_popups();
+                return Task::batch([
+                    iced::widget::operation::focus(shortcuts::INPUT),
+                    iced::widget::operation::select_all(shortcuts::INPUT),
+                ]);
+            }
+            Message::Shortcuts(ShortcutsMessage::Filter(filter)) => {
+                if let Some(page) = &mut self.shortcuts {
+                    page.filter = filter;
+                }
+            }
+            Message::Shortcuts(ShortcutsMessage::Close) => {
+                self.shortcuts = None;
+                self.focus = Focus::Editor;
             }
             Message::CloseTab(index) => {
                 self.dismiss_popups();
@@ -934,6 +963,7 @@ impl App {
             ("Edit: Add Cursor Above", "Ctrl+Alt+Up", edit(Command::AddCursorAbove)),
             ("Edit: Add Cursor Below", "Ctrl+Alt+Down", edit(Command::AddCursorBelow)),
             ("Edit: Trigger Completion", "Ctrl+Space", Message::Edit(EditorEvent::TriggerCompletion)),
+            ("Help: Keyboard Shortcuts", "F1", Message::OpenShortcuts),
             ("Theme: Edit Colors", "", Message::OpenThemeEditor),
             ("Theme: Import File...", "", Message::ThemeEditor(ThemeMessage::Import)),
             ("Theme: Export File...", "", Message::ThemeEditor(ThemeMessage::Export)),
@@ -1778,6 +1808,8 @@ impl App {
 
     /// Opens (or focuses) a file tab. Returns whether it is now active.
     fn open_file(&mut self, path: PathBuf) -> bool {
+        // Opening a file shows it, even from the shortcuts page.
+        self.shortcuts = None;
         if let Some(index) = self.tabs.iter().position(|t| uri::same_path(&t.path, &path)) {
             self.active = Some(index);
             return true;
@@ -1896,6 +1928,7 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let body: Element<'_, Message> = match &self.project {
+            None if self.shortcuts.is_some() => self.shortcuts_page(),
             None => self.welcome(),
             Some(project) => {
                 let mut main = column![self.editor_area()];
@@ -1932,6 +1965,16 @@ impl App {
             }
         };
         column![container(body).height(Length::Fill), self.status_bar()].into()
+    }
+
+    fn shortcuts_page(&self) -> Element<'_, Message> {
+        let Some(page) = &self.shortcuts else {
+            return space().into();
+        };
+        let ui = &self.current_theme().ui;
+        let view = page.view(ui).map(Message::Shortcuts);
+        let view = on_escape::on_escape(view, Message::Shortcuts(ShortcutsMessage::Close));
+        container(view).width(Length::Fill).height(Length::Fill).style(style::surface(ui)).into()
     }
 
     fn welcome(&self) -> Element<'_, Message> {
@@ -1978,6 +2021,9 @@ impl App {
     fn editor_area(&self) -> Element<'_, Message> {
         if let Some(editor) = &self.theme_editor {
             return editor.view().map(Message::ThemeEditor);
+        }
+        if self.shortcuts.is_some() {
+            return self.shortcuts_page();
         }
         let Some(tab) = self.active_tab() else {
             let muted = style::to_color(self.current_theme().ui.text_muted);
@@ -2234,6 +2280,11 @@ impl App {
             .style(button::text)
             .padding([0, 4]);
         right.push(style::tip(edit, "Edit, import or share themes", tooltip::Position::Top, ui));
+        let help = button(text("?").size(12))
+            .on_press(Message::OpenShortcuts)
+            .style(button::text)
+            .padding([0, 4]);
+        right.push(style::tip(help, "Keyboard shortcuts (F1)", tooltip::Position::Top, ui));
 
         container(
             row![
@@ -2261,6 +2312,7 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Key::Named(keyboard::key::Named::F12) if modifiers.shift() => Some(Message::FindReferences),
         keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
         keyboard::Key::Named(keyboard::key::Named::F2) => Some(Message::StartRename),
+        keyboard::Key::Named(keyboard::key::Named::F1) => Some(Message::OpenShortcuts),
         keyboard::Key::Named(keyboard::key::Named::F3) if modifiers.shift() => {
             Some(Message::Find(FindMessage::Previous))
         }
