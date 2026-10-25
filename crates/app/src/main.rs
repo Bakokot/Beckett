@@ -1095,8 +1095,30 @@ impl App {
     }
 
     fn on_search(&mut self, message: SearchMessage) -> Task<Message> {
+        // Any change to what would be replaced cancels a pending confirmation.
+        if !matches!(message, SearchMessage::ConfirmReplace | SearchMessage::Done(..) | SearchMessage::Open(..)) {
+            self.search.confirm = None;
+        }
         let query = &mut self.search.query;
         match message {
+            SearchMessage::Replace(text) => self.search.replace = text,
+            SearchMessage::CancelReplace => {}
+            SearchMessage::ReplaceAll => match self.project_replacements() {
+                Ok(files) => {
+                    let count = files.iter().map(|f| f.edits.len()).sum();
+                    self.search.confirm = Some((count, files.len()));
+                }
+                Err(error) => self.search.error = Some(error),
+            },
+            SearchMessage::ConfirmReplace => {
+                self.search.confirm = None;
+                match self.project_replacements() {
+                    Ok(files) => self.apply_project_replace(files),
+                    Err(error) => self.search.error = Some(error),
+                }
+                // Show what the project looks like now.
+                return self.on_search(SearchMessage::Run);
+            }
             SearchMessage::Query(text) => query.text = text,
             SearchMessage::ToggleCase => query.case_sensitive = !query.case_sensitive,
             SearchMessage::ToggleWord => query.whole_word = !query.whole_word,
@@ -1144,6 +1166,45 @@ impl App {
             }
         }
         Task::none()
+    }
+
+    fn project_replacements(&self) -> Result<Vec<find::FileEdits>, String> {
+        let Some(project) = &self.project else {
+            return Ok(Vec::new());
+        };
+        let open: Vec<(&Path, &Buffer)> = self.tabs.iter().map(|t| (t.path.as_path(), &t.buffer)).collect();
+        find::project_replacements(&project.root, &self.search.query, &self.search.replace, &open)
+    }
+
+    /// Replace across the project: open tabs are edited in place (one undo
+    /// step each, left unsaved), other files are rewritten on disk.
+    fn apply_project_replace(&mut self, files: Vec<find::FileEdits>) {
+        let (mut count, mut file_count, mut errors) = (0, 0, Vec::new());
+        for file in files {
+            let n = file.edits.len();
+            match self.tabs.iter().position(|t| uri::same_path(&t.path, &file.path)) {
+                Some(index) => self.edit_tab(index, Command::Replace(file.edits)),
+                None => {
+                    let result = std::fs::read_to_string(&file.path).and_then(|text| {
+                        let mut buffer = Buffer::new(&text, Language::from_path(&file.path));
+                        buffer.apply(Command::Replace(file.edits));
+                        std::fs::write(&file.path, buffer.file_contents())
+                    });
+                    if let Err(error) = result {
+                        errors.push(format!("{}: {error}", self.display_path(&file.path)));
+                        continue;
+                    }
+                }
+            }
+            count += n;
+            file_count += 1;
+        }
+        self.refresh_marks();
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        self.status = Some(match errors.first() {
+            Some(error) => format!("Replace incomplete, cannot write {error}"),
+            None => format!("Replaced {} in {}", plural(count, "occurrence"), plural(file_count, "file")),
+        });
     }
 
     fn toggle_panel(&mut self, panel: Panel) {

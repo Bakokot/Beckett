@@ -189,6 +189,17 @@ pub enum SearchMessage {
     /// Results of search number `id`.
     Done(u64, Result<Vec<FileResult>, String>),
     Open(PathBuf, usize, usize),
+    Replace(String),
+    /// Counts the matches and asks to confirm.
+    ReplaceAll,
+    ConfirmReplace,
+    CancelReplace,
+}
+
+/// Replacement edits (char ranges in the file's text) for one file.
+pub struct FileEdits {
+    pub path: PathBuf,
+    pub edits: Vec<(usize, usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +219,9 @@ pub struct ProjectSearch {
     pub searched: Option<String>,
     /// The shown results are the references to this symbol (Shift+F12).
     pub references: Option<String>,
+    pub replace: String,
+    /// "Replace all" was pressed: (occurrences, files) waiting for confirmation.
+    pub confirm: Option<(usize, usize)>,
 }
 
 impl ProjectSearch {
@@ -248,6 +262,36 @@ impl ProjectSearch {
         .spacing(6)
         .align_y(Alignment::Center)
         .padding([2, 8]);
+
+        let action = |label: String, message: SearchMessage, description: &'static str| {
+            let button = button(text(label).size(12)).on_press(message).style(button::text).padding([2, 6]);
+            style::tip(button, description, Position::Bottom, ui)
+        };
+        let mut replace_row = row![text_input("Replace", &self.replace)
+            .on_input(SearchMessage::Replace)
+            .on_submit(SearchMessage::ReplaceAll)
+            .size(13)
+            .padding([3, 6])
+            .width(320)]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .padding([0, 8]);
+        replace_row = match self.confirm {
+            None => replace_row.push(action(
+                "replace all".to_string(),
+                SearchMessage::ReplaceAll,
+                "Replace every match in the project ($1 inserts a regex group). Asks to confirm first",
+            )),
+            Some((0, _)) => replace_row.push(text("Nothing to replace").size(12).color(muted)),
+            Some((count, files)) => replace_row
+                .push(action(
+                    format!("confirm: replace {} in {}", plural(count, "occurrence"), plural(files, "file")),
+                    SearchMessage::ConfirmReplace,
+                    "Open files are edited in their tab (undo with Ctrl+Z, then save); other files are written to disk",
+                ))
+                .push(action("cancel".to_string(), SearchMessage::CancelReplace, "Keep the files as they are")),
+        };
+        let bar = column![bar, replace_row].spacing(2);
 
         let mut rows: Vec<Element<'a, SearchMessage>> = Vec::new();
         for file in &self.results {
@@ -312,6 +356,40 @@ pub fn search_project(root: &Path, query: &Query, open: &[(PathBuf, String)]) ->
     Ok(results)
 }
 
+/// Replacement edits for every match of `query` in the searchable files
+/// under `root`. Open tabs (`open`) are matched in their buffer, so their
+/// edits apply to it; other files are read from disk.
+pub fn project_replacements(
+    root: &Path,
+    query: &Query,
+    template: &str,
+    open: &[(&Path, &Buffer)],
+) -> Result<Vec<FileEdits>, String> {
+    let Some(matcher) = Matcher::new(query)? else {
+        return Ok(Vec::new());
+    };
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    files.sort();
+    let mut result = Vec::new();
+    for path in files {
+        let edits = match open.iter().find(|(p, _)| lsp_client::uri::same_path(p, &path)) {
+            Some((_, buffer)) => buffer.replacements(&matcher, &buffer.find(&matcher), template),
+            None => {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let buffer = Buffer::new(&text, editor_core::Language::from_path(&path));
+                buffer.replacements(&matcher, &buffer.find(&matcher), template)
+            }
+        };
+        if !edits.is_empty() {
+            result.push(FileEdits { path, edits });
+        }
+    }
+    Ok(result)
+}
+
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -336,5 +414,38 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
                 out.push(path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacements_cover_disk_files_and_open_buffers() {
+        let root = std::env::temp_dir().join(format!("godot-ide-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".godot")).unwrap();
+        std::fs::write(root.join("a.gd"), "var hp = 1\nhp += max_hp\n").unwrap();
+        std::fs::write(root.join("b.gd"), "on disk: hp\n").unwrap();
+        std::fs::write(root.join("icon.png"), "hp").unwrap();
+        std::fs::write(root.join(".godot").join("cache.cfg"), "hp").unwrap();
+        // b.gd is open with unsaved edits: its buffer is used, not the file.
+        let open = Buffer::new("hp hp\n", editor_core::Language::GDScript);
+        let b = root.join("b.gd");
+        let query = Query { text: "hp".into(), whole_word: true, ..Query::default() };
+
+        let files = project_replacements(&root, &query, "health", &[(&b, &open)]).unwrap();
+        let summary: Vec<(String, usize)> = files
+            .iter()
+            .map(|f| (f.path.file_name().unwrap().to_string_lossy().into_owned(), f.edits.len()))
+            .collect();
+        assert_eq!(summary, [("a.gd".to_string(), 2), ("b.gd".to_string(), 2)]);
+        assert_eq!(files[0].edits[0], (4, 6, "health".to_string()));
+
+        let regex = Query { text: r"var (\w+)".into(), regex: true, ..Query::default() };
+        let files = project_replacements(&root, &regex, "const $1", &[]).unwrap();
+        assert_eq!(files[0].edits[0].2, "const hp");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

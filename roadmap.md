@@ -89,7 +89,8 @@ crates/
       match highlights, Enter / Shift+Enter / F3 to step, replace one / all (one undo step),
       "all" turns matches into cursors, Escape closes
 - [x] Project search: Ctrl+Shift+F, SEARCH tab, results grouped by file (unsaved edits included)
-- [ ] Replace across the project
+- [x] Replace across the project (SEARCH tab: "replace all" counts and asks to confirm; open tabs
+      edited in place as one undo step, other files rewritten on disk; regex `$1` groups)
 - [x] GDScript snippets in the completion list (`snip`, 30 built-ins: virtuals, `func`, `export`,
       `onready`, signals, control flow, `tween`, `#region`…), placeholders with Tab / Shift+Tab,
       also without the language server; they replace the bare `for`/`if`/… keywords
