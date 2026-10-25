@@ -44,6 +44,9 @@ pub enum EditorEvent {
     HoverEnd,
     /// Clicked while another panel had keyboard focus.
     Focused,
+    /// Tab / Shift+Tab while a snippet is being filled in.
+    NextTabStop,
+    PreviousTabStop,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +181,8 @@ pub struct CodeEditor<'a, Message> {
     current_highlight: Option<usize>,
     /// Whether this editor owns keyboard focus in the app.
     focused: bool,
+    /// A snippet is being filled in: Tab moves between its stops.
+    tab_stops: bool,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
@@ -198,7 +203,13 @@ impl<'a, Message> CodeEditor<'a, Message> {
             highlights: &[],
             current_highlight: None,
             focused: true,
+            tab_stops: false,
         }
+    }
+
+    pub fn tab_stops(mut self, active: bool) -> Self {
+        self.tab_stops = active;
+        self
     }
 
     pub fn highlights(mut self, ranges: &'a [(usize, usize)], current: Option<usize>) -> Self {
@@ -497,8 +508,11 @@ impl<'a, Message> CodeEditor<'a, Message> {
                     return event(EditorEvent::Completion(action));
                 }
             }
-            if named == Named::Escape && (self.signature.is_some() || self.hover.is_some()) {
+            if named == Named::Escape && (self.signature.is_some() || self.hover.is_some() || self.tab_stops) {
                 return event(EditorEvent::Completion(CompletionAction::Dismiss));
+            }
+            if named == Named::Tab && self.tab_stops {
+                return event(if modifiers.shift() { EditorEvent::PreviousTabStop } else { EditorEvent::NextTabStop });
             }
         }
 

@@ -90,7 +90,9 @@ crates/
       "all" turns matches into cursors, Escape closes
 - [x] Project search: Ctrl+Shift+F, SEARCH tab, results grouped by file (unsaved edits included)
 - [ ] Replace across the project
-- [ ] GDScript snippets (`_ready`, `_process`, `@export`, `@onready`, signals…)
+- [x] GDScript snippets in the completion list (`snip`, 30 built-ins: virtuals, `func`, `export`,
+      `onready`, signals, control flow, `tween`, `#region`…), placeholders with Tab / Shift+Tab,
+      also without the language server; they replace the bare `for`/`if`/… keywords
 - [x] External file change detection (`notify`): unchanged tabs reload silently; tabs with unsaved
       edits are flagged "(changed on disk)" with a Reload button; explorer folders refresh
 - [x] UTF-8 byte order mark kept out of the editor and the language server, restored on save

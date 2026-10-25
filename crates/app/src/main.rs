@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use editor_core::{Buffer, Command, Language, Pos};
+use editor_core::{snippet, Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
 use iced::widget::{
     button, center, column, container, mouse_area, pick_list, row, scrollable, space, text, tooltip, Row,
@@ -186,6 +186,14 @@ enum Pending {
     Rename { from: String, to: String },
 }
 
+/// A snippet being filled in: Tab / Shift+Tab move between its stops.
+struct SnippetSession {
+    /// Char ranges in the active buffer, in visiting order; the last one
+    /// is the final cursor.
+    stops: Vec<(usize, usize)>,
+    current: usize,
+}
+
 struct Signature {
     label: String,
     active: Option<Range<usize>>,
@@ -229,6 +237,7 @@ struct App {
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
     signature: Option<Signature>,
+    snippet: Option<SnippetSession>,
     terminal: TerminalState,
     focus: Focus,
 }
@@ -306,6 +315,7 @@ impl App {
             completion: None,
             hover: None,
             signature: None,
+            snippet: None,
             terminal: TerminalState::default(),
             focus: Focus::Editor,
         };
@@ -1289,9 +1299,29 @@ impl App {
                 }
                 CompletionAction::Accept => self.accept_completion(None),
                 CompletionAction::AcceptIndex(index) => self.accept_completion(Some(index)),
-                CompletionAction::Dismiss => self.dismiss_popups(),
+                // Escape closes the popups first, then ends the snippet.
+                CompletionAction::Dismiss => {
+                    if self.completion.is_some() || self.hover.is_some() || self.signature.is_some() {
+                        self.completion = None;
+                        self.hover = None;
+                        self.signature = None;
+                    } else {
+                        self.snippet = None;
+                    }
+                }
             },
             EditorEvent::TriggerCompletion => self.request_completion(None),
+            EditorEvent::NextTabStop | EditorEvent::PreviousTabStop => {
+                self.completion = None;
+                self.signature = None;
+                if let Some(session) = &self.snippet {
+                    let index = match event {
+                        EditorEvent::NextTabStop => session.current + 1,
+                        _ => session.current.saturating_sub(1),
+                    };
+                    self.goto_tab_stop(index);
+                }
+            }
             EditorEvent::Hover(pos) => self.request_hover(pos),
             EditorEvent::HoverEnd => self.hover = None,
             EditorEvent::Focused => {
@@ -1304,7 +1334,9 @@ impl App {
     /// Applies an edit to the active tab and syncs it to the language server.
     fn apply_command(&mut self, command: Command) {
         if let Some(index) = self.active {
+            let len_before = self.tabs[index].buffer.len_chars();
             self.edit_tab(index, command);
+            self.track_snippet(len_before);
         }
     }
 
@@ -1526,6 +1558,7 @@ impl App {
         self.completion = None;
         self.hover = None;
         self.signature = None;
+        self.snippet = None;
     }
 
     /// The active GDScript tab with a connected language server.
@@ -1536,14 +1569,25 @@ impl App {
         Some((client, tab, pos))
     }
 
+    /// Asks the server for completions; snippets are offered too, and alone
+    /// when the server is not connected.
     fn request_completion(&mut self, trigger: Option<char>) {
-        let Some((client, tab, pos)) = self.lsp_target() else {
+        let Some(tab) = self.active_tab().filter(|t| t.language == Language::GDScript) else {
             return;
         };
         let anchor = tab.buffer.word_start(tab.buffer.primary().head);
-        if let Ok(id) = client.completion(&tab.path, to_lsp(pos), trigger) {
+        let with_snippets = trigger.is_none() && snippets_allowed(&tab.buffer, anchor);
+        let request = self.lsp_target().and_then(|(client, tab, pos)| {
+            client.completion(&tab.path, to_lsp(pos), trigger).ok()
+        });
+        if let Some(id) = request {
             self.pending.insert(id, Pending::Completion);
-            self.completion = Some(Completion::new(id, anchor));
+        } else if !with_snippets {
+            return;
+        }
+        self.completion = Some(Completion::new(request, anchor, with_snippets));
+        if request.is_none() {
+            self.refilter_completion();
         }
     }
 
@@ -1565,13 +1609,20 @@ impl App {
         if c.request.is_some() {
             return; // Narrowed when the answer arrives.
         }
-        c.filtered = completion::rank(&c.items, &prefix);
+        // Snippets only on a prefix match: fuzzy matches would pop them up
+        // for almost any word.
+        let lower = prefix.to_lowercase();
+        let filtered = completion::rank(&c.items, &prefix)
+            .into_iter()
+            .filter(|&i| !c.is_snippet(i) || c.items[i].label.to_lowercase().starts_with(&lower))
+            .collect();
+        c.filtered = filtered;
         if c.filtered.is_empty() {
             self.completion = None;
             return;
         }
         let colors = code_editor::Colors::from_theme(&self.themes[self.theme_index]);
-        c.rows = c.filtered.iter().map(|&i| completion_row(&c.items[i], &colors)).collect();
+        c.rows = c.filtered.iter().map(|&i| completion_row(&c.items[i], c.is_snippet(i), &colors)).collect();
         c.selected = 0;
         c.doc = None;
         self.resolve_selected();
@@ -1600,9 +1651,10 @@ impl App {
         let Some(c) = self.completion.take() else {
             return;
         };
-        let Some(item) = c.filtered.get(row.unwrap_or(c.selected)).map(|&i| &c.items[i]) else {
+        let Some(&index) = c.filtered.get(row.unwrap_or(c.selected)) else {
             return;
         };
+        let item = &c.items[index];
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -1610,6 +1662,10 @@ impl App {
         let Some(delete) = head.checked_sub(c.anchor) else {
             return;
         };
+        if c.is_snippet(index) {
+            self.insert_snippet(&item.insert_text, c.anchor, delete);
+            return;
+        }
         let mut text = item.insert_text.clone();
         // Functions without arguments come with "()"; add parens for the rest
         // and put the cursor inside.
@@ -1621,6 +1677,77 @@ impl App {
         self.apply_command(Command::ReplaceBefore { delete, text, cursor_back });
         if callable {
             self.request_signature();
+        }
+    }
+
+    /// Replaces the `delete` chars typed before the cursor (starting at
+    /// `start`) with an expanded snippet, then selects its first tab stop.
+    /// With several cursors it is inserted at each, without tab stops.
+    fn insert_snippet(&mut self, body: &str, start: usize, delete: usize) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let line = tab.buffer.line_text(tab.buffer.char_to_pos(start).line);
+        let indent: String = line.chars().take_while(|c| matches!(c, ' ' | '\t')).collect();
+        let single = tab.buffer.selections().len() == 1;
+        let expansion = snippet::expand(body, &indent);
+        self.apply_command(Command::ReplaceBefore { delete, text: expansion.text, cursor_back: 0 });
+        if single {
+            let stops = expansion.stops.iter().map(|&(s, e)| (start + s, start + e)).collect();
+            self.snippet = Some(SnippetSession { stops, current: 0 });
+            self.goto_tab_stop(0);
+        }
+    }
+
+    /// Selects tab stop `index` of the snippet being filled in; reaching the
+    /// last one (the final cursor) ends it.
+    fn goto_tab_stop(&mut self, index: usize) {
+        let Some(session) = &mut self.snippet else {
+            return;
+        };
+        let Some(&stop) = session.stops.get(index) else {
+            return;
+        };
+        session.current = index;
+        let last = index + 1 == session.stops.len();
+        self.apply_command(Command::Select { ranges: vec![stop], primary: 0 });
+        if last {
+            self.snippet = None;
+        }
+    }
+
+    /// Keeps tab stops in place as the user types in the current one; an
+    /// edit elsewhere, or moving out of the snippet, ends it.
+    fn track_snippet(&mut self, len_before: usize) {
+        let (Some(session), Some(tab)) = (&mut self.snippet, self.active.and_then(|i| self.tabs.get(i))) else {
+            return;
+        };
+        let buffer = &tab.buffer;
+        let head = buffer.primary().head;
+        let delta = buffer.len_chars() as isize - len_before as isize;
+        let (start, end) = session.stops[session.current];
+        let inside = if delta == 0 {
+            let first = session.stops.iter().map(|s| s.0).min().unwrap_or(start);
+            let last = session.stops.iter().map(|s| s.1).max().unwrap_or(end);
+            (first..=last).contains(&head)
+        } else {
+            let new_end = end as isize + delta;
+            let ok = new_end >= start as isize && (start as isize..=new_end).contains(&(head as isize));
+            if ok {
+                let current = session.current;
+                for (index, stop) in session.stops.iter_mut().enumerate() {
+                    if index == current {
+                        stop.1 = new_end as usize;
+                    } else if stop.0 >= end {
+                        stop.0 = (stop.0 as isize + delta) as usize;
+                        stop.1 = (stop.1 as isize + delta) as usize;
+                    }
+                }
+            }
+            ok
+        };
+        if !inside || buffer.selections().len() > 1 {
+            self.snippet = None;
         }
     }
 
@@ -1667,7 +1794,7 @@ impl App {
             Pending::Completion => {
                 if let Some(c) = &mut self.completion {
                     if c.request == Some(id) {
-                        c.items = lsp_client::completion_items(&value);
+                        c.set_items(lsp_client::completion_items(&value));
                         c.request = None;
                         self.refilter_completion();
                     }
@@ -2147,7 +2274,8 @@ impl App {
             .completion(completion)
             .hover(hover)
             .signature(signature)
-            .focused(self.focus == Focus::Editor);
+            .focused(self.focus == Focus::Editor)
+            .tab_stops(self.snippet.is_some());
 
         let mut area = column![self.tab_bar()];
         if let Some(rename) = &self.rename {
@@ -2474,8 +2602,28 @@ fn to_lsp(pos: Pos) -> Position {
     }
 }
 
-fn completion_row(item: &lsp_client::CompletionItem, colors: &code_editor::Colors) -> CompletionRow {
+/// Whether snippets fit where a word starts at `anchor`: not after `.`,
+/// `$`, `@` and the like, and not inside a string or comment.
+fn snippets_allowed(buffer: &Buffer, anchor: usize) -> bool {
+    use editor_core::gdscript::TokenKind;
+    let before = anchor.checked_sub(1).map(|i| buffer.slice(i, anchor));
+    if before.is_some_and(|c| matches!(c.as_str(), "." | "$" | "%" | "@" | "&" | "^" | "\"" | "'")) {
+        return false;
+    }
+    let pos = buffer.char_to_pos(anchor);
+    let line = buffer.line_text(pos.line);
+    let byte = line.char_indices().nth(pos.column).map_or(line.len(), |(b, _)| b);
+    !buffer.tokens(pos.line).iter().any(|t| {
+        let quoted = matches!(t.kind, TokenKind::String | TokenKind::StringName | TokenKind::NodePath | TokenKind::Comment);
+        quoted && t.range.start < byte && byte <= t.range.end
+    })
+}
+
+fn completion_row(item: &lsp_client::CompletionItem, snippet: bool, colors: &code_editor::Colors) -> CompletionRow {
     let syntax = &colors.syntax;
+    if snippet {
+        return CompletionRow { label: item.label.clone(), tag: "snip", color: style::to_color(syntax.annotation) };
+    }
     let (tag, color) = match item.kind {
         CompletionKind::Function => ("fn", style::to_color(syntax.function)),
         CompletionKind::Variable => ("var", colors.text),

@@ -68,6 +68,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Up / Down / PageUp / PageDown", "Move in the completion list"),
             ("Enter / Tab", "Accept the completion"),
             ("Escape", "Close the completion, hover or signature popup"),
+            ("Tab / Shift+Tab", "Next / previous placeholder of a snippet (tagged snip in completions)"),
             ("F12", "Go to definition"),
             ("Shift+F12", "Find all references"),
             ("F2", "Rename symbol in every file"),

@@ -1,7 +1,8 @@
 //! Completion session state and client-side ranking. Godot returns the full
 //! candidate list once; narrowing it as the user types happens here.
 
-use lsp_client::CompletionItem;
+use editor_core::snippet::{self, Snippet};
+use lsp_client::{CompletionItem, CompletionKind};
 
 use crate::code_editor::CompletionRow;
 use crate::docs::Doc;
@@ -12,6 +13,10 @@ pub struct Completion {
     /// Char index where the word being completed starts.
     pub anchor: usize,
     pub items: Vec<CompletionItem>,
+    /// `items[snippets_from..]` are snippets, listed after the server's items.
+    pub snippets_from: usize,
+    /// Whether snippets are offered here (not after `.`, in strings, …).
+    pub with_snippets: bool,
     /// Indices into `items`, best first.
     pub filtered: Vec<usize>,
     pub rows: Vec<CompletionRow>,
@@ -21,21 +26,58 @@ pub struct Completion {
 }
 
 impl Completion {
-    pub fn new(request: u64, anchor: usize) -> Self {
-        Self {
-            request: Some(request),
+    /// `request` is the pending server request, if any; without one the
+    /// list holds only snippets.
+    pub fn new(request: Option<u64>, anchor: usize, with_snippets: bool) -> Self {
+        let mut completion = Self {
+            request,
             anchor,
             items: Vec::new(),
+            snippets_from: 0,
+            with_snippets,
             filtered: Vec::new(),
             rows: Vec::new(),
             selected: 0,
             doc: None,
+        };
+        completion.set_items(Vec::new());
+        completion
+    }
+
+    /// Sets the server's items, followed by the snippets.
+    pub fn set_items(&mut self, mut items: Vec<CompletionItem>) {
+        if self.with_snippets {
+            // The `for`, `if`, `match`… snippets replace the bare keywords.
+            items.retain(|i| i.kind != CompletionKind::Keyword || !snippet::GDSCRIPT.iter().any(|s| s.prefix == i.label));
         }
+        self.snippets_from = items.len();
+        if self.with_snippets {
+            items.extend(snippet::GDSCRIPT.iter().map(snippet_item));
+        }
+        self.items = items;
+    }
+
+    pub fn is_snippet(&self, index: usize) -> bool {
+        index >= self.snippets_from
     }
 
     pub fn selected_item(&self) -> Option<(usize, &CompletionItem)> {
         let index = *self.filtered.get(self.selected)?;
         Some((index, &self.items[index]))
+    }
+}
+
+/// A snippet as a completion item: its body is the insert text, and its
+/// docs show the first expanded line (as the signature) and description.
+fn snippet_item(snippet: &Snippet) -> CompletionItem {
+    let expanded = snippet::expand(snippet.body, "");
+    let first_line = expanded.text.lines().next().unwrap_or_default();
+    CompletionItem {
+        label: snippet.prefix.to_string(),
+        insert_text: snippet.body.to_string(),
+        kind: CompletionKind::Other,
+        documentation: Some(format!("\t{first_line}\n\n{}", snippet.description)),
+        raw: serde_json::Value::Null,
     }
 }
 
@@ -80,7 +122,6 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lsp_client::CompletionKind;
     use serde_json::Value;
 
     fn item(label: &str) -> CompletionItem {
@@ -106,6 +147,20 @@ mod tests {
         assert_eq!(labels("sq"), ["length_squared()"]);
         assert_eq!(labels("mvt"), ["move_toward(…)"]);
         assert_eq!(labels("").len(), 5);
+    }
+
+    #[test]
+    fn snippets_follow_server_items_and_replace_their_keywords() {
+        let keyword = CompletionItem { kind: CompletionKind::Keyword, ..item("for") };
+        let mut c = Completion::new(Some(1), 0, true);
+        c.set_items(vec![item("format"), keyword]);
+        assert_eq!(c.snippets_from, 1);
+        assert_eq!(c.items[0].label, "format");
+        assert!(c.is_snippet(1) && c.items.iter().filter(|i| i.label == "for").count() == 1);
+
+        let mut plain = Completion::new(Some(1), 0, false);
+        plain.set_items(vec![item("format")]);
+        assert_eq!(plain.items.len(), 1);
     }
 
     #[test]

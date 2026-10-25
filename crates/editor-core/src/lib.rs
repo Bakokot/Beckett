@@ -4,6 +4,7 @@ pub mod buffer;
 pub mod fuzzy;
 pub mod gdscript;
 pub mod search;
+pub mod snippet;
 
 pub use buffer::{Buffer, Command, Motion, Pos, Selection};
 
