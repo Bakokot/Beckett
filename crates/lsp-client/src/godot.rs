@@ -100,6 +100,17 @@ pub fn matches(install: &GodotInstall, wanted: Option<&str>) -> bool {
     }
 }
 
+/// Whether `install` is an older major.minor than `wanted`: opening the
+/// project in its editor would convert it down to that version.
+pub fn older_than(install: &GodotInstall, wanted: Option<&str>) -> bool {
+    match (install.version, wanted.and_then(version_from_str)) {
+        (Some((major, minor, _)), Some((wanted_major, wanted_minor, _))) => {
+            (major, minor) < (wanted_major, wanted_minor)
+        }
+        _ => false,
+    }
+}
+
 const PATH_NAMES: &[&str] = if cfg!(windows) {
     &["godot.exe", "godot4.exe"]
 } else {
@@ -205,6 +216,11 @@ mod tests {
         assert!(!matches(&install(Some((4, 7, 1))), Some("4.5")));
         assert!(matches(&install(None), Some("4.5")));
         assert!(matches(&install(Some((4, 7, 1))), None));
+
+        assert!(older_than(&install(Some((4, 5, 1))), Some("4.7")));
+        assert!(!older_than(&install(Some((4, 7, 0))), Some("4.7")));
+        assert!(!older_than(&install(Some((4, 8, 0))), Some("4.7")));
+        assert!(!older_than(&install(None), Some("4.7")));
     }
 
     #[test]

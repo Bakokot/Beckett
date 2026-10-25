@@ -45,6 +45,10 @@ pub struct StartOptions {
     pub attach_port: Option<u16>,
     /// Executable used to spawn a headless server when attaching fails.
     pub godot: Option<PathBuf>,
+    /// Keep trying to attach for this long (a Godot editor that was just
+    /// started), and never spawn: a second Godot on the same project
+    /// fights it over files such as GDExtension libraries.
+    pub wait_for_editor: Option<Duration>,
 }
 
 impl Default for StartOptions {
@@ -52,6 +56,7 @@ impl Default for StartOptions {
         Self {
             attach_port: Some(DEFAULT_PORT),
             godot: None,
+            wait_for_editor: None,
         }
     }
 }
@@ -319,15 +324,18 @@ impl Reader {
 /// handshake, and up to a minute when a headless Godot has to start.
 pub fn start(root: &Path, options: &StartOptions) -> Result<(Client, Reader), String> {
     if let Some(port) = options.attach_port {
-        if let Ok(stream) = TcpStream::connect_timeout(&local(port), Duration::from_millis(300)) {
-            if let Ok((client, reader, workspace)) =
-                handshake(stream, root, Server::Attached { port }, None)
-            {
-                // The editor reports its own project; only reuse it for ours.
-                if workspace.is_none_or(|w| same_path(&w, root)) {
-                    return Ok((client, reader));
-                }
+        let deadline = Instant::now() + options.wait_for_editor.unwrap_or_default();
+        loop {
+            if let Some(attached) = attach(root, port) {
+                return Ok(attached);
             }
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        if options.wait_for_editor.is_some() {
+            return Err(format!("The Godot editor's language server did not answer on port {port}"));
         }
     }
 
@@ -338,6 +346,15 @@ pub fn start(root: &Path, options: &StartOptions) -> Result<(Client, Reader), St
     let (stream, server, process) = spawn_server(godot, root)?;
     let (client, reader, _) = handshake(stream, root, server, Some(process))?;
     Ok((client, reader))
+}
+
+/// Connects to a Godot editor's language server on `port`, if one is
+/// listening and has the project at `root` open.
+fn attach(root: &Path, port: u16) -> Option<(Client, Reader)> {
+    let stream = TcpStream::connect_timeout(&local(port), Duration::from_millis(300)).ok()?;
+    let (client, reader, workspace) = handshake(stream, root, Server::Attached { port }, None).ok()?;
+    // The editor reports its own project; only reuse it for ours.
+    workspace.is_none_or(|w| same_path(&w, root)).then_some((client, reader))
 }
 
 fn local(port: u16) -> SocketAddr {

@@ -76,7 +76,8 @@ pub enum Message {
     Edit(EditorEvent),
     Save,
     ThemeSelected(String),
-    Lsp(LspEvent),
+    /// An event of the language server connection of this generation.
+    Lsp(u64, LspEvent),
     RestartLsp,
     /// Automatic reconnect attempt for the connection of this generation.
     ReconnectLsp(u64),
@@ -224,6 +225,10 @@ struct App {
     lsp_generation: u64,
     /// Automatic reconnects since the server was last connected.
     lsp_retries: u32,
+    /// This connection waits for a Godot editor the IDE just started and
+    /// never spawns a server. Part of the connection's identity, so it is
+    /// only reset together with `lsp_generation`.
+    lsp_wait_editor: bool,
     pending: HashMap<u64, Pending>,
     problems: Problems,
     /// Open tab of the bottom panel, if it is shown.
@@ -313,6 +318,7 @@ impl App {
             lsp: Lsp::Off,
             lsp_generation: 0,
             lsp_retries: 0,
+            lsp_wait_editor: false,
             pending: HashMap::new(),
             problems: Problems::default(),
             panel: None,
@@ -379,9 +385,13 @@ impl App {
             .as_ref()
             .and_then(|project| {
                 let godot = project.godot.as_ref()?;
-                let connection =
-                    lsp::connect(project.root.clone(), godot.godot_version(), self.lsp_generation);
-                Some(connection.map(Message::Lsp))
+                let connection = lsp::connect(
+                    project.root.clone(),
+                    godot.godot_version(),
+                    self.lsp_generation,
+                    self.lsp_wait_editor,
+                );
+                Some(connection.map(|(generation, event)| Message::Lsp(generation, event)))
             })
             .unwrap_or_else(Subscription::none);
 
@@ -539,7 +549,11 @@ impl App {
                     self.open_file(path);
                 }
             }
-            Message::Lsp(event) => return self.on_lsp(event),
+            Message::Lsp(generation, event) => {
+                if generation == self.lsp_generation {
+                    return self.on_lsp(event);
+                }
+            }
             Message::ReconnectLsp(generation) => {
                 // Skipped if the user restarted it or opened another project meanwhile.
                 let waiting = matches!(self.lsp, Lsp::Disconnected { retry_in: Some(_) });
@@ -1164,23 +1178,42 @@ impl App {
             self.status = Some("The Godot editor is already open on this project".to_string());
             return;
         }
+        let version = godot.godot_version();
+        let root = project.root.clone();
         let installs = lsp_client::godot::discover();
-        let Some(install) = lsp_client::godot::pick(&installs, godot.godot_version().as_deref()) else {
+        let Some(install) = lsp_client::godot::pick(&installs, version.as_deref()).cloned() else {
             self.status = Some("No Godot executable found (set GODOT_BIN)".to_string());
             return;
         };
+        if lsp_client::godot::older_than(&install, version.as_deref()) {
+            self.status = Some(format!(
+                "This project is for Godot {}, the newest installed is {}: opening it there would convert it",
+                version.unwrap_or_default(),
+                install.version_string().unwrap_or_default()
+            ));
+            return;
+        }
         let scene = self.current_scene().ok();
         let mut command = std::process::Command::new(&install.path);
-        command.arg("--editor").arg("--path").arg(&project.root);
+        command.arg("--editor").arg("--path").arg(&root);
         if let Some(scene) = &scene {
             command.arg(scene);
         }
+
+        // Only one Godot may have the project open (they would fight over
+        // GDExtension libraries and the import cache): stop the IDE's
+        // headless server first, then use the editor's language server.
+        self.reset_lsp(Lsp::Starting);
+        self.lsp_wait_editor = true;
         self.status = Some(match command.spawn() {
             Ok(_) => match scene {
                 Some(scene) => format!("Opening {scene} in the Godot editor"),
                 None => "Opening the project in the Godot editor".to_string(),
             },
-            Err(error) => format!("Cannot start Godot: {error}"),
+            Err(error) => {
+                self.reset_lsp(Lsp::Starting);
+                format!("Cannot start Godot: {error}")
+            }
         });
     }
 
@@ -2033,6 +2066,7 @@ impl App {
     fn reset_lsp(&mut self, state: Lsp) {
         self.lsp = state;
         self.lsp_generation += 1;
+        self.lsp_wait_editor = false;
         self.pending.clear();
         self.problems.clear();
         self.refresh_marks();

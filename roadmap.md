@@ -130,7 +130,9 @@ crates/
       completion in strings and `load(`/`preload(` (fuzzy on the path; Godot's own file items dropped);
       holding Ctrl underlines clickable targets (paths that exist, words with a definition)
 - [x] "Open in Godot editor" (status bar "Godot" / palette): starts the editor at the current scene
-      (or the scene using the current script); refused when an attached editor is already open
+      (or the scene using the current script); first stops the IDE's headless server and attaches to
+      the editor's (one Godot per project: two fight over GDExtension DLLs); refuses to open a
+      project in an older Godot than it was saved with
 
 **Run** — `app/src/runner.rs`
 - [x] F5 run project, F6 run current scene (a `.tscn`, or the scene a `.gd` is attached to),

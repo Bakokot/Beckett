@@ -4,6 +4,7 @@
 //! dedicated thread that then becomes the message reader.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use iced::futures::channel::mpsc;
 use iced::futures::{SinkExt, StreamExt};
@@ -64,12 +65,23 @@ struct Connection {
     root: PathBuf,
     wanted_version: Option<String>,
     generation: u64,
+    /// Attach to a Godot editor that is starting up, never spawn one.
+    wait_for_editor: bool,
 }
 
-pub fn connect(root: PathBuf, wanted_version: Option<String>, generation: u64) -> Subscription<LspEvent> {
-    let connection = Connection { root, wanted_version, generation };
+/// How long a Godot editor started from the IDE gets to open its language
+/// server (the first start of a project imports every asset).
+const EDITOR_STARTUP: Duration = Duration::from_secs(180);
+
+pub fn connect(
+    root: PathBuf,
+    wanted_version: Option<String>,
+    generation: u64,
+    wait_for_editor: bool,
+) -> Subscription<(u64, LspEvent)> {
+    let connection = Connection { root, wanted_version, generation, wait_for_editor };
     Subscription::run_with(connection, |connection| {
-        let Connection { root, wanted_version, .. } = connection.clone();
+        let Connection { root, wanted_version, generation, wait_for_editor } = connection.clone();
         iced::stream::channel(64, async move |mut output| {
             let (tx, mut rx) = mpsc::unbounded();
             std::thread::spawn(move || {
@@ -77,6 +89,7 @@ pub fn connect(root: PathBuf, wanted_version: Option<String>, generation: u64) -
                 let install = godot::pick(&installs, wanted_version.as_deref()).cloned();
                 let options = StartOptions {
                     godot: install.as_ref().map(|i| i.path.clone()),
+                    wait_for_editor: wait_for_editor.then_some(EDITOR_STARTUP),
                     ..StartOptions::default()
                 };
                 match lsp_client::start(&root, &options) {
@@ -94,8 +107,10 @@ pub fn connect(root: PathBuf, wanted_version: Option<String>, generation: u64) -
                     }
                 }
             });
+            // Tagged with the generation: a replaced connection can still
+            // deliver events (e.g. its disconnect) that must be ignored.
             while let Some(event) = rx.next().await {
-                if output.send(event).await.is_err() {
+                if output.send((generation, event)).await.is_err() {
                     break;
                 }
             }
