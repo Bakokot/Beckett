@@ -1152,8 +1152,29 @@ fn char_width(c: char, col: usize) -> usize {
     if c == '\t' {
         TAB_WIDTH - col % TAB_WIDTH
     } else {
-        1
+        display_width(c)
     }
+}
+
+/// Grid cells a (non-tab) character takes: two for wide East Asian
+/// characters (CJK ideographs, kana, hangul, full-width forms), else one.
+pub fn display_width(c: char) -> usize {
+    let wide = matches!(
+        u32::from(c),
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x20000..=0x3FFFD
+    );
+    if wide { 2 } else { 1 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1416,6 +1437,16 @@ mod tests {
         assert_eq!(b.matching_bracket(2), Some((1, 6)));
         assert_eq!(b.matching_bracket(7), Some((1, 6)));
         assert_eq!(b.matching_bracket(4), Some((3, 5)));
+    }
+
+    #[test]
+    fn wide_characters_take_two_columns() {
+        let b = buf("a日本b\n한x");
+        assert_eq!(b.visual_col(0, 3), 5);
+        assert_eq!(b.column_for_visual(0, 3), 2);
+        assert_eq!(b.visual_col(1, 1), 2);
+        assert_eq!(display_width('é'), 1);
+        assert_eq!(display_width('Ａ'), 2);
     }
 
     #[test]

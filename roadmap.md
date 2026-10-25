@@ -84,7 +84,9 @@ crates/
 - [x] AltGr typing on AZERTY etc. (Ctrl+Alt is treated as text, not a shortcut)
 - [x] Indentation guides (bridging blank lines inside a block)
 - [x] Box (column) selection by Alt+drag (visual columns, so tabs line up; short lines skipped)
-- [ ] IME composition (CJK input)
+- [x] IME composition (CJK input): candidate window placed at the cursor, composition drawn
+      underlined at the cursor, commit inserted as typing — not yet tried with a real IME
+- [x] Wide (CJK, full-width) characters take two columns, drawn on the grid — verified on screen
 - [x] Find/replace in file: Ctrl+F / Ctrl+H bar, case / whole word / regex (with `$1` groups),
       match highlights, Enter / Shift+Enter / F3 to step, replace one / all (one undo step),
       "all" turns matches into cursors, Escape closes
@@ -166,7 +168,7 @@ crates/
 - [x] Theme export/import: .toml file dialogs, drag & drop a .toml on the window
 - [x] Custom font family, size, line height and ligatures (theme `[font]` section, theme editor row)
 - [x] UI zoom (Ctrl+= / Ctrl+- / Ctrl+0, saved in settings.json); selected theme remembered;
-      `GODOT_IDE_CONFIG_DIR` overrides the config folder — fonts/zoom not yet checked on screen
+      `GODOT_IDE_CONFIG_DIR` overrides the config folder (verified: Cascadia Code, `>=` ligature, 125%)
 
 **Workspace**
 - [x] Command palette (Ctrl+Shift+P, or `>` in the box): ~35 commands incl. editor actions and themes

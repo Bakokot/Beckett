@@ -5,13 +5,14 @@
 
 use std::ops::Range;
 
-use editor_core::buffer::TAB_WIDTH;
+use editor_core::buffer::{display_width, TAB_WIDTH};
 use editor_core::gdscript::{Token, TokenKind};
 use editor_core::{Buffer, Command, Motion, Pos};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::text::{self, Paragraph as _, Renderer as _};
 use iced::advanced::widget::{tree, Tree, Widget};
+use iced::advanced::input_method::{self, InputMethod};
 use iced::advanced::{clipboard, mouse, Clipboard, Renderer as _, Shell};
 use iced::keyboard::{self, key::Named, Key, Modifiers};
 use iced::time::{Duration, Instant};
@@ -346,6 +347,8 @@ struct State {
     mouse: Option<Point>,
     /// Word range (char indices) last reported with `LinkHover`.
     link_sent: Option<(usize, usize)>,
+    /// Input method composition in progress: text and its highlighted range.
+    preedit: Option<(String, Option<std::ops::Range<usize>>)>,
     /// Alt+drag: the (line, visual column) where the box started.
     box_anchor: Option<(usize, usize)>,
     /// The Alt+drag left its starting cell, so it is a box, not a click.
@@ -371,6 +374,7 @@ impl State {
             mouse: None,
             link_sent: None,
             box_anchor: None,
+            preedit: None,
             box_dragged: false,
         }
     }
@@ -773,6 +777,19 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     let wait = BLINK_MILLIS - elapsed % BLINK_MILLIS;
                     shell.request_redraw_at(*now + Duration::from_millis(wait as u64));
                 }
+                // Input methods (CJK…): tell the system where the cursor is so
+                // its candidate window sits next to it. The composition itself
+                // is drawn by the editor, at the cursor.
+                if state.focused && self.focused {
+                    let pos = self.buffer.char_to_pos(self.buffer.primary().head);
+                    let point = self.screen_point(&geometry, state.scroll, pos);
+                    let cursor = Rectangle::new(point, Size::new(1.0, geometry.line_height));
+                    shell.request_input_method(&InputMethod::<&str>::Enabled {
+                        cursor,
+                        purpose: input_method::Purpose::Normal,
+                        preedit: None,
+                    });
+                }
                 if let Some(track) = &mut state.hover {
                     if track.sent.is_none() && now.saturating_duration_since(track.since) >= HOVER_DELAY {
                         let index = self.char_under(&geometry, state.scroll, track.point);
@@ -896,6 +913,28 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 self.update_hover(state, &geometry, shell, None);
                 self.update_link(state, &geometry, shell);
                 shell.request_redraw();
+                shell.capture_event();
+            }
+            Event::InputMethod(event) if state.focused && self.focused => {
+                match event {
+                    input_method::Event::Preedit(content, selection) if !content.is_empty() => {
+                        state.preedit = Some((content.clone(), selection.clone()));
+                    }
+                    input_method::Event::Commit(content) => {
+                        state.preedit = None;
+                        if !content.is_empty() {
+                            self.emit(shell, EditorEvent::Command(Command::Insert(content.clone())));
+                        }
+                    }
+                    input_method::Event::Preedit(..) | input_method::Event::Opened | input_method::Event::Closed => {
+                        state.preedit = None;
+                    }
+                }
+                shell.request_redraw();
+                shell.capture_event();
+            }
+            // Keys pressed while composing belong to the input method.
+            Event::Keyboard(keyboard::Event::KeyPressed { .. }) if state.preedit.is_some() => {
                 shell.capture_event();
             }
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })
@@ -1073,8 +1112,23 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 draw_text(r, message.clone(), point, color, metrics, g.text_area);
             }
 
+            // Input method composition, drawn over the text at the cursor:
+            // underlined, with the part the IME highlights selected.
+            if let (Some((content, selection)), true) = (&state.preedit, self.focused) {
+                let point = self.screen_point(&g, scroll, buffer.char_to_pos(primary.head));
+                let width = |s: &str| s.chars().map(display_width).sum::<usize>() as f32 * cw;
+                let rect = Rectangle::new(point, Size::new(width(content), lh));
+                fill(r, rect, colors.background);
+                if let Some(range) = selection.clone().filter(|r| content.is_char_boundary(r.start) && content.is_char_boundary(r.end)) {
+                    let x = point.x + width(&content[..range.start]);
+                    fill(r, Rectangle::new(Point::new(x, point.y), Size::new(width(&content[range]), lh)), colors.selection);
+                }
+                draw_text(r, content.clone(), point, colors.text, metrics, g.text_area);
+                fill(r, Rectangle::new(Point::new(point.x, point.y + lh - 2.0), Size::new(rect.width, 1.0)), colors.accent);
+            }
+
             // Cursors.
-            if self.focused && state.cursor_visible() {
+            if self.focused && state.cursor_visible() && state.preedit.is_none() {
                 for sel in buffer.selections() {
                     let pos = buffer.char_to_pos(sel.head);
                     if !(first..last).contains(&pos.line) {
@@ -1372,6 +1426,14 @@ fn segments(line: &str, tokens: &[Token]) -> Vec<(usize, String, Option<TokenKin
             let width = TAB_WIDTH - visual % TAB_WIDTH;
             current.extend(std::iter::repeat_n(' ', width));
             visual += width;
+        } else if display_width(c) > 1 {
+            // A wide glyph is drawn alone at its own cells: fonts don't size
+            // it to exactly two cells, which would push the rest off the grid.
+            if !current.is_empty() {
+                out.push((current_start, std::mem::take(&mut current), current_kind));
+            }
+            out.push((visual, c.to_string(), kind));
+            visual += display_width(c);
         } else {
             current.push(c);
             visual += 1;
@@ -1397,6 +1459,14 @@ mod tests {
         assert_eq!(segs[1], (4, "var".to_string(), Some(TokenKind::Keyword)));
         let last = segs.last().unwrap();
         assert_eq!((last.0, last.1.as_str(), last.2), (12, "1", Some(TokenKind::Number)));
+    }
+
+    #[test]
+    fn wide_characters_are_their_own_two_cell_segments() {
+        let line = "a日本b";
+        let segs = segments(line, &[]);
+        let cells: Vec<(usize, &str)> = segs.iter().map(|(v, s, _)| (*v, s.as_str())).collect();
+        assert_eq!(cells, [(0, "a"), (1, "日"), (3, "本"), (5, "b")]);
     }
 
     #[test]
