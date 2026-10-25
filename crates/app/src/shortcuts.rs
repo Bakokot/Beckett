@@ -20,6 +20,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+P", "Go to file (fuzzy search)"),
             ("Ctrl+Shift+P", "Command palette"),
             ("Ctrl+G", "Go to line (type :line or :line:column)"),
+            ("Ctrl+Shift+O", "Go to a function, variable or signal of this file"),
             ("F1", "Keyboard shortcuts (this page)"),
             ("Ctrl+= / Ctrl+- / Ctrl+0", "Zoom the interface in / out / back to 100%"),
         ],
@@ -115,6 +116,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Escape / Click outside", "Close"),
             ("> prefix", "Search commands instead of files"),
             (": prefix", "Go to line"),
+            ("@ prefix", "Go to a symbol of this file"),
         ],
     ),
 ];

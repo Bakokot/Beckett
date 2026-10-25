@@ -189,7 +189,9 @@ crates/
 - [ ] Highlighting for `.gdshader`, `.tscn`, `.tres`, `project.godot`, `.cfg`, JSON, Markdown
 
 **LSP / Godot**
-- [ ] Outline panel, document & workspace symbols
+- [x] Outline panel (sidebar OUTLINE tab, nested, current symbol highlighted, remembered) and go to
+      symbol in file (Ctrl+Shift+O / `@` in the palette) — seen on screen
+- [ ] Workspace symbols (go to any symbol in the project)
 - [ ] Offline class reference browser (generated via `godot --doctool`)
 - [ ] Autoloads / Input Map / project settings panel + completion for action names
 - [ ] Drag file into code → `preload("res://…")`

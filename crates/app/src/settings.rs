@@ -13,6 +13,8 @@ pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 pub struct Settings {
     /// Scale of the whole interface (Ctrl+= / Ctrl+- / Ctrl+0).
     pub ui_scale: f32,
+    /// The sidebar shows the outline instead of the files.
+    pub show_outline: bool,
     /// Name of the theme in use, restored at startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
@@ -20,7 +22,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { ui_scale: 1.0, theme: None }
+        Self { ui_scale: 1.0, show_outline: false, theme: None }
     }
 }
 

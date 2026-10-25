@@ -7,6 +7,7 @@ mod explorer;
 mod find;
 mod lsp;
 mod on_escape;
+mod outline;
 mod palette;
 mod paths;
 mod problems;
@@ -98,6 +99,7 @@ pub enum Message {
     FocusTerminal,
     Terminal(TerminalEvent),
     ShowPanel(Panel),
+    ShowSidebar(SidebarView),
     ClosePanel,
     /// The splitter above the bottom panel moved by this many pixels.
     ResizePanel(f32),
@@ -144,6 +146,13 @@ pub enum Message {
     ThemeCodePasted(Option<String>),
     /// A file dropped on the window: a theme to import, or a file to open.
     FileDropped(PathBuf),
+}
+
+/// What the sidebar shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarView {
+    Files,
+    Outline,
 }
 
 /// Which panel receives keyboard input.
@@ -208,6 +217,8 @@ enum Pending {
     /// Whether the symbol `word` at `pos` can be renamed.
     PrepareRename { path: PathBuf, pos: Pos, word: String },
     Rename { from: String, to: String },
+    /// The outline of this file at this tab version.
+    Outline(PathBuf, i32),
     /// Whether the word at this char range has a definition (Ctrl+hover).
     LinkProbe((usize, usize)),
 }
@@ -272,6 +283,10 @@ struct App {
     hover: Option<(Pos, Doc)>,
     signature: Option<Signature>,
     snippet: Option<SnippetSession>,
+    sidebar_view: SidebarView,
+    /// Outline of the active GDScript file, from the language server.
+    outline: Option<outline::Outline>,
+    outline_request: Option<u64>,
     /// Ctrl+click target under the mouse, underlined while Ctrl is held.
     link: Option<(usize, usize)>,
     /// Definition request checking whether the hovered word is a target.
@@ -330,6 +345,7 @@ impl App {
         let settings = settings::Settings::load();
         let theme_index = settings.theme.as_ref().and_then(|name| themes.iter().position(|t| &t.name == name)).unwrap_or(0);
         let iced_theme = style::iced_theme(&themes[theme_index]);
+        let sidebar_view = if settings.show_outline { SidebarView::Outline } else { SidebarView::Files };
 
         let mut app = Self {
             project: None,
@@ -364,6 +380,9 @@ impl App {
             hover: None,
             signature: None,
             snippet: None,
+            sidebar_view,
+            outline: None,
+            outline_request: None,
             link: None,
             link_probe: None,
             uid_cache: HashMap::new(),
@@ -486,7 +505,53 @@ impl App {
         if self.find.is_some() && self.find_key() != before {
             self.recompute_find();
         }
+        self.refresh_outline();
         task
+    }
+
+    /// Asks for the active file's outline while it is shown (sidebar or the
+    /// palette's `@` mode) and out of date; one request at a time, so fast
+    /// typing doesn't queue one per keystroke.
+    fn refresh_outline(&mut self) {
+        let in_palette = self.palette.as_ref().is_some_and(|p| p.input.starts_with('@'));
+        if self.sidebar_view != SidebarView::Outline && !in_palette {
+            return;
+        }
+        if self.outline_request.is_some_and(|id| self.pending.contains_key(&id)) {
+            return;
+        }
+        let Some((client, tab, _)) = self.lsp_target() else {
+            return;
+        };
+        let fresh = self.outline.as_ref().is_some_and(|o| uri::same_path(&o.path, &tab.path) && o.version == tab.version);
+        if fresh {
+            return;
+        }
+        let (path, version) = (tab.path.clone(), tab.version);
+        if let Ok(id) = client.document_symbols(&path) {
+            self.pending.insert(id, Pending::Outline(path, version));
+            self.outline_request = Some(id);
+        }
+    }
+
+    /// The outline as palette choices (`@`), when it is the active file's.
+    fn symbol_choices(&self) -> Vec<palette::Choice<Message>> {
+        let (Some(outline), Some(tab)) = (&self.outline, self.active_tab()) else {
+            return Vec::new();
+        };
+        if !uri::same_path(&outline.path, &tab.path) {
+            return Vec::new();
+        }
+        let syntax = &self.current_theme().syntax;
+        outline
+            .entries
+            .iter()
+            .map(|e| palette::Choice {
+                label: format!("{}{}", "  ".repeat(e.depth), e.name),
+                detail: format!("{}  {}", outline::tag(e.kind, syntax).0, e.line + 1),
+                message: Message::JumpTo(outline.path.clone(), e.line, e.character),
+            })
+            .collect()
     }
 
     /// Identifies the active buffer's contents.
@@ -634,6 +699,11 @@ impl App {
                 }
             }
             Message::ShowPanel(panel) => self.show_panel(panel),
+            Message::ShowSidebar(view) => {
+                self.sidebar_view = view;
+                self.settings.show_outline = view == SidebarView::Outline;
+                let _ = self.settings.save();
+            }
             // Dragging the splitter up makes the panel taller.
             Message::ResizePanel(delta) => self.panel_height = (self.panel_height() - delta).max(MIN_PANEL_HEIGHT),
             Message::WindowResized(height) => self.window_height = height,
@@ -1005,6 +1075,7 @@ impl App {
         };
         let open: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
         let mut palette = Palette::new(&project.root, &open, input);
+        palette.set_symbols(self.symbol_choices());
         palette.refresh(&self.commands());
         self.palette = Some(palette);
         self.focus = Focus::Input;
@@ -1066,6 +1137,9 @@ impl App {
             ("File: Reload from Disk", "", Message::ReloadActive),
             ("Go to File", "Ctrl+P", Message::OpenPalette(String::new())),
             ("Go to Line", "Ctrl+G", Message::OpenPalette(":".to_string())),
+            ("Go to Symbol in File", "Ctrl+Shift+O", Message::OpenPalette("@".to_string())),
+            ("View: Outline", "", Message::ShowSidebar(SidebarView::Outline)),
+            ("View: Files", "", Message::ShowSidebar(SidebarView::Files)),
             ("Go to Definition", "F12", Message::GotoDefinition),
             ("Find All References", "Shift+F12", Message::FindReferences),
             ("Rename Symbol", "F2", Message::StartRename),
@@ -2095,6 +2169,18 @@ impl App {
 
     fn on_response(&mut self, pending: Pending, id: u64, value: serde_json::Value) -> Task<Message> {
         match pending {
+            Pending::Outline(path, version) => {
+                if self.outline_request == Some(id) {
+                    self.outline_request = None;
+                }
+                let entries = outline::flatten(&lsp_client::document_symbols(&value));
+                self.outline = Some(outline::Outline { path, version, entries });
+                let symbols = self.symbol_choices();
+                if let Some(palette) = &mut self.palette {
+                    palette.set_symbols(symbols);
+                    palette.refresh(&[]);
+                }
+            }
             Pending::LinkProbe(range) => {
                 if self.link_probe == Some(id) {
                     self.link_probe = None;
@@ -2657,10 +2743,34 @@ impl App {
         .align_y(Alignment::Center)
         .padding([6, 8]);
 
-        let active = self.active_tab().map(|t| t.path.as_path());
-        let tree = scrollable(project.explorer.view(active)).height(Length::Fill);
+        let ui = &self.current_theme().ui;
+        let view_tab = |label: &'static str, view: SidebarView, description: &'static str| {
+            let style: fn(&iced::Theme, button::Status) -> button::Style =
+                if self.sidebar_view == view { button::secondary } else { button::text };
+            let tab = button(text(label).size(11)).on_press(Message::ShowSidebar(view)).style(style).padding([2, 8]);
+            style::tip(tab, description, tooltip::Position::Bottom, ui)
+        };
+        let tabs = row![
+            view_tab("FILES", SidebarView::Files, "Project files"),
+            view_tab("OUTLINE", SidebarView::Outline, "Functions, variables and signals of the current file (Ctrl+Shift+O to search them)"),
+        ]
+        .spacing(4)
+        .padding([0, 8]);
 
-        container(column![header, tree])
+        let body: Element<'a, Message> = match self.sidebar_view {
+            SidebarView::Files => {
+                let active = self.active_tab().map(|t| t.path.as_path());
+                scrollable(project.explorer.view(active)).height(Length::Fill).into()
+            }
+            SidebarView::Outline => {
+                let tab = self.active_tab();
+                let outline = self.outline.as_ref().filter(|o| tab.is_some_and(|t| uri::same_path(&t.path, &o.path)));
+                let line = tab.map(|t| t.buffer.char_to_pos(t.buffer.primary().head).line as u32);
+                outline::view(outline, line, self.current_theme())
+            }
+        };
+
+        container(column![header, tabs, body].spacing(4))
             .width(260)
             .height(Length::Fill)
             .style(style::surface(&self.current_theme().ui))
@@ -2993,6 +3103,9 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         }
         keyboard::Key::Character("p") if modifiers.command() => Some(Message::OpenPalette(String::new())),
         keyboard::Key::Character("g") if modifiers.command() => Some(Message::OpenPalette(":".to_string())),
+        keyboard::Key::Character("o" | "O") if modifiers.command() && modifiers.shift() => {
+            Some(Message::OpenPalette("@".to_string()))
+        }
         keyboard::Key::Character("f" | "F") if modifiers.command() && modifiers.shift() => Some(Message::OpenSearch),
         keyboard::Key::Character("f") if modifiers.command() => Some(Message::OpenFind { replace: false }),
         keyboard::Key::Character("h") if modifiers.command() => Some(Message::OpenFind { replace: true }),

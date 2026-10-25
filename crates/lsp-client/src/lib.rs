@@ -12,7 +12,8 @@ mod types;
 pub mod uri;
 
 pub use types::{
-    completion_item, completion_items, hover_text, locations, range, signature_help, workspace_edit,
+    completion_item, completion_items, document_symbols, hover_text, locations, range, signature_help,
+    workspace_edit, Symbol, SymbolKind,
     CompletionItem, CompletionKind, Diagnostic, Location, Position, Range, Severity, SignatureHelp,
     TextEdit,
 };
@@ -219,6 +220,12 @@ impl Client {
             "textDocument/signatureHelp",
             json!({ "textDocument": { "uri": path_to_uri(path) }, "position": position.to_json() }),
         )
+    }
+
+    /// The file's symbols (functions, variables, signals…). Decode the
+    /// answer with [`document_symbols`].
+    pub fn document_symbols(&self, path: &Path) -> io::Result<u64> {
+        self.request("textDocument/documentSymbol", json!({ "textDocument": { "uri": path_to_uri(path) } }))
     }
 
     /// Every use of the symbol at `position`, declaration included. Decode
@@ -445,6 +452,7 @@ fn handshake(
                     "definition": { "linkSupport": false },
                     "references": {},
                     "rename": { "prepareSupport": true },
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                     "completion": { "completionItem": { "documentationFormat": ["markdown", "plaintext"] } },
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "signatureHelp": { "signatureInformation": { "documentationFormat": ["markdown"] } },

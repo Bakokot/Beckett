@@ -40,6 +40,33 @@ pub struct Location {
     pub range: Range,
 }
 
+/// LSP `SymbolKind` values the outline distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymbolKind {
+    Class,
+    Function,
+    Variable,
+    Constant,
+    Enum,
+    EnumMember,
+    Signal,
+    Other,
+}
+
+/// A symbol of a document, with the symbols nested in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Symbol {
+    pub name: String,
+    /// E.g. the signature (`func jump(height: float) -> void`).
+    pub detail: String,
+    pub kind: SymbolKind,
+    /// The whole declaration (a function's body included).
+    pub range: Range,
+    /// The name, where "go to symbol" puts the cursor.
+    pub selection: Range,
+    pub children: Vec<Symbol>,
+}
+
 /// Replace `range` with `new_text`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextEdit {
@@ -249,6 +276,39 @@ pub fn workspace_edit(result: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
     files
 }
 
+/// Decodes a `textDocument/documentSymbol` answer: nested
+/// `DocumentSymbol[]`, or flat `SymbolInformation[]` (no nesting).
+pub fn document_symbols(result: &Value) -> Vec<Symbol> {
+    fn symbol(v: &Value) -> Option<Symbol> {
+        let kind = match v.get("kind").and_then(Value::as_f64).map(|k| k as u64) {
+            Some(5 | 11 | 23) => SymbolKind::Class,
+            Some(6 | 9 | 12) => SymbolKind::Function,
+            Some(7 | 8 | 13) => SymbolKind::Variable,
+            Some(14) => SymbolKind::Constant,
+            Some(10) => SymbolKind::Enum,
+            Some(22) => SymbolKind::EnumMember,
+            Some(24) => SymbolKind::Signal,
+            _ => SymbolKind::Other,
+        };
+        // SymbolInformation keeps its range in `location`.
+        let whole = v.get("range").or_else(|| v.get("location")?.get("range")).and_then(range)?;
+        let selection = v.get("selectionRange").and_then(range).unwrap_or(whole);
+        Some(Symbol {
+            name: v.get("name")?.as_str()?.to_string(),
+            detail: v.get("detail").and_then(Value::as_str).unwrap_or_default().to_string(),
+            kind,
+            range: whole,
+            selection,
+            children: v
+                .get("children")
+                .and_then(Value::as_array)
+                .map(|c| c.iter().filter_map(symbol).collect())
+                .unwrap_or_default(),
+        })
+    }
+    result.as_array().map(|items| items.iter().filter_map(symbol).collect()).unwrap_or_default()
+}
+
 pub fn range(v: &Value) -> Option<Range> {
     Some(Range {
         start: position(v.get("start")?)?,
@@ -300,6 +360,31 @@ mod tests {
             "targetSelectionRange": {"start": {"line": 3, "character": 5}, "end": {"line": 3, "character": 9}}}]);
         assert_eq!(locations(&link)[0].range.start, Position { line: 3, character: 5 });
         assert!(locations(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn decodes_document_symbols() {
+        // Shape captured from Godot 4.7.1 (trimmed).
+        let r = |l1, c1, l2, c2| json!({"start": {"line": l1, "character": c1}, "end": {"line": l2, "character": c2}});
+        let result = json!([{
+            "name": "a.gd", "kind": 5, "detail": "class a.gd", "range": r(0, 0, 12, 0), "selectionRange": r(0, 0, 0, 0),
+            "children": [
+                {"name": "speed", "kind": 13, "detail": "var speed: int = 10", "range": r(2, 0, 2, 15), "selectionRange": r(2, 4, 2, 9)},
+                {"name": "_ready", "kind": 6, "detail": "func _ready() -> void", "range": r(4, 0, 7, 15), "selectionRange": r(4, 5, 4, 11), "children": []}
+            ]
+        }]);
+        let symbols = document_symbols(&result);
+        assert_eq!(symbols.len(), 1);
+        let root = &symbols[0];
+        assert_eq!((root.name.as_str(), root.kind), ("a.gd", SymbolKind::Class));
+        assert_eq!(root.children[0].kind, SymbolKind::Variable);
+        assert_eq!(root.children[1].selection.start, Position { line: 4, character: 5 });
+        assert_eq!(root.children[1].detail, "func _ready() -> void");
+
+        let flat = json!([{"name": "died", "kind": 24, "location": {"uri": "file:///C%3A/a.gd", "range": r(3, 0, 3, 11)}}]);
+        let flat = document_symbols(&flat);
+        assert_eq!((flat[0].kind, flat[0].selection.start.line), (SymbolKind::Signal, 3));
+        assert!(document_symbols(&Value::Null).is_empty());
     }
 
     #[test]

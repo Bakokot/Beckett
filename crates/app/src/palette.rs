@@ -66,6 +66,8 @@ pub struct Palette<M> {
     /// Asking to pick one of these (with this prompt) instead of the
     /// files / commands / line modes.
     choices: Option<(&'static str, Vec<Choice<M>>)>,
+    /// Symbols of the current file, for the `@` mode.
+    symbols: Vec<Choice<M>>,
     pub items: Vec<Item<M>>,
     pub selected: usize,
     /// First visible row; the wheel moves it independently of `selected`.
@@ -83,7 +85,7 @@ impl<M: Clone> Palette<M> {
         collect(root, root, &mut files);
         files.sort();
         let recent = open.iter().filter_map(|p| relative(root, p)).collect();
-        Self { input, choices: None, items: Vec::new(), selected: 0, scroll: 0, files, root: root.to_path_buf(), recent }
+        Self { input, choices: None, symbols: Vec::new(), items: Vec::new(), selected: 0, scroll: 0, files, root: root.to_path_buf(), recent }
     }
 
     /// Asks to pick one of `choices`; typing filters them.
@@ -91,6 +93,7 @@ impl<M: Clone> Palette<M> {
         Self {
             input: String::new(),
             choices: Some((prompt, choices)),
+            symbols: Vec::new(),
             items: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -100,12 +103,19 @@ impl<M: Clone> Palette<M> {
         }
     }
 
+    /// The current file's symbols, listed in the `@` mode.
+    pub fn set_symbols(&mut self, symbols: Vec<Choice<M>>) {
+        self.symbols = symbols;
+    }
+
     /// Rebuilds the list for the current input.
     pub fn refresh(&mut self, commands: &[CommandEntry<M>]) {
         self.selected = 0;
         self.scroll = 0;
         self.items = if let Some((_, choices)) = &self.choices {
             choice_items(self.input.trim(), choices)
+        } else if let Some(query) = self.input.strip_prefix('@') {
+            choice_items(query.trim(), &self.symbols)
         } else if let Some(query) = self.input.strip_prefix('>') {
             command_items(query.trim(), commands)
         } else if let Some(target) = self.input.strip_prefix(':') {
@@ -144,7 +154,8 @@ impl<M: Clone> Palette<M> {
         match self.input.chars().next() {
             Some('>') => "Type a command",
             Some(':') => "Line number, optionally :column",
-            _ => "Search files by name  (> commands, : go to line)",
+            Some('@') => "Go to a function, variable or signal of this file",
+            _ => "Search files by name  (> commands, @ symbols, : go to line)",
         }
     }
 
@@ -385,6 +396,7 @@ mod tests {
         Palette {
             input: String::new(),
             choices: None,
+            symbols: Vec::new(),
             items: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -407,6 +419,19 @@ mod tests {
         p.refresh(&[]);
         assert_eq!(p.items[0].label, "main.gd");
         assert_eq!(p.items.len(), 3);
+    }
+
+    #[test]
+    fn at_lists_the_file_symbols() {
+        let mut p = palette(&["a.gd"]);
+        let choice = |label: &str, message| Choice { label: label.into(), detail: String::new(), message };
+        p.set_symbols(vec![choice("speed", 1), choice("_physics_process", 2), choice("jump", 3)]);
+        p.input = "@".into();
+        p.refresh(&[]);
+        assert_eq!(p.items.len(), 3);
+        p.input = "@phys".into();
+        p.refresh(&[]);
+        assert!(matches!(p.items[0].action, Action::Run(2)));
     }
 
     #[test]
