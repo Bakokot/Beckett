@@ -105,8 +105,10 @@ crates/
 - [x] Status bar LSP indicator (state, Godot version, port); click to restart
 - [x] Problems panel (click to jump) + error/warning counts in status bar
 - [x] Go to definition (F12)
-- [ ] Auto-reconnect (currently manual: click the indicator)
-- [ ] Warn when no installed Godot matches the project version
+- [x] Auto-reconnect after a drop (1, 2, 5, 10, 20 s, then manual), also when Godot is closed
+      or the headless server crashes — verified by killing the spawned server
+- [x] Warn when no installed Godot matches the project version (status message, yellow LSP
+      label, tooltip)
 - [x] Inline diagnostics: colored underlines plus the message, faded, at the end of the line
       (most severe one per line), updated live as you type
 - [x] Completion: opens while typing identifiers, on `.` `$` quotes, and Ctrl+Space; client-side

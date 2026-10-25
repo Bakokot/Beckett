@@ -77,6 +77,8 @@ pub enum Message {
     ThemeSelected(String),
     Lsp(LspEvent),
     RestartLsp,
+    /// Automatic reconnect attempt for the connection of this generation.
+    ReconnectLsp(u64),
     GotoDefinition,
     /// Shift+F12: list every use of the symbol under the cursor.
     FindReferences,
@@ -154,6 +156,8 @@ struct TerminalState {
 }
 
 const MAX_OUTPUT_LINES: usize = 5000;
+/// Waits before each automatic language server reconnect, in seconds.
+const RECONNECT_DELAYS: [u64; 5] = [1, 2, 5, 10, 20];
 
 #[derive(Default)]
 struct RunState {
@@ -203,6 +207,8 @@ struct App {
     lsp: Lsp,
     /// Bumped to restart the language server subscription.
     lsp_generation: u64,
+    /// Automatic reconnects since the server was last connected.
+    lsp_retries: u32,
     pending: HashMap<u64, Pending>,
     problems: Problems,
     /// Open tab of the bottom panel, if it is shown.
@@ -284,6 +290,7 @@ impl App {
             status,
             lsp: Lsp::Off,
             lsp_generation: 0,
+            lsp_retries: 0,
             pending: HashMap::new(),
             problems: Problems::default(),
             panel: None,
@@ -507,7 +514,16 @@ impl App {
                 }
             }
             Message::Lsp(event) => return self.on_lsp(event),
+            Message::ReconnectLsp(generation) => {
+                // Skipped if the user restarted it or opened another project meanwhile.
+                let waiting = matches!(self.lsp, Lsp::Disconnected { retry_in: Some(_) });
+                if waiting && generation == self.lsp_generation {
+                    self.lsp_retries += 1;
+                    self.reset_lsp(Lsp::Starting);
+                }
+            }
             Message::RestartLsp => {
+                self.lsp_retries = 0;
                 if self.project.as_ref().is_some_and(|p| p.godot.is_some()) {
                     self.reset_lsp(Lsp::Starting);
                 }
@@ -1689,14 +1705,24 @@ impl App {
 
     fn on_lsp(&mut self, event: LspEvent) -> Task<Message> {
         match event {
-            LspEvent::Connected { client, label } => {
+            LspEvent::Connected { client, label, warning } => {
                 for tab in self.tabs.iter().filter(|t| t.language == Language::GDScript) {
                     let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
                 }
-                self.lsp = Lsp::Ready { client, label };
+                if warning.is_some() {
+                    self.status = warning.clone();
+                } else if self.lsp_retries > 0 {
+                    self.status = Some("Language server reconnected".to_string());
+                }
+                self.lsp_retries = 0;
+                self.lsp = Lsp::Ready { client, label, warning };
             }
             LspEvent::Failed(error) => {
                 self.status = Some(error);
+                // A failed reconnect (e.g. Godot still restarting) tries again.
+                if self.lsp_retries > 0 {
+                    return self.schedule_reconnect();
+                }
                 self.lsp = Lsp::Failed;
             }
             LspEvent::Event(Event::Diagnostics { path, diagnostics }) => {
@@ -1721,14 +1747,28 @@ impl App {
                 if let Some(reason) = reason {
                     self.status = Some(format!("Language server disconnected: {reason}"));
                 }
-                self.lsp = Lsp::Disconnected;
                 self.pending.clear();
                 self.problems.clear();
                 self.refresh_marks();
+                return self.schedule_reconnect();
             }
             LspEvent::Event(Event::Notification { .. }) => {}
         }
         Task::none()
+    }
+
+    /// Restarts the language server after a growing delay, or gives up
+    /// (leaving the manual retry) once every delay has been tried.
+    fn schedule_reconnect(&mut self) -> Task<Message> {
+        let Some(&seconds) = RECONNECT_DELAYS.get(self.lsp_retries as usize) else {
+            self.lsp = Lsp::Disconnected { retry_in: None };
+            return Task::none();
+        };
+        self.lsp = Lsp::Disconnected { retry_in: Some(seconds) };
+        let generation = self.lsp_generation;
+        Task::perform(sleep(std::time::Duration::from_secs(seconds)), move |()| {
+            Message::ReconnectLsp(generation)
+        })
     }
 
     /// Drops the current connection (stopping a spawned Godot) and lets the
@@ -1814,6 +1854,7 @@ impl App {
         self.status = godot
             .is_none()
             .then(|| "No project.godot found in this folder".to_string());
+        self.lsp_retries = 0;
         self.reset_lsp(if godot.is_some() { Lsp::Starting } else { Lsp::Off });
         self.recent = recent::add(&root);
         self.project = Some(Project {
@@ -2274,11 +2315,16 @@ impl App {
                 .padding([0, 4]);
                 let description = format!("{errors} errors, {warnings} warnings found by Godot. Click to list them");
                 left.push(style::tip(counts, description, tooltip::Position::Top, ui));
-                let lsp = button(text(self.lsp.label()).size(12))
-                    .on_press(Message::RestartLsp)
-                    .style(button::text)
-                    .padding([0, 4]);
-                let description = "Godot's language server (completion, errors, go to definition). Click to restart it";
+                let mut label = text(self.lsp.label()).size(12);
+                if self.lsp.warning().is_some() {
+                    label = label.color(style::to_color(ui.warning));
+                }
+                let lsp = button(label).on_press(Message::RestartLsp).style(button::text).padding([0, 4]);
+                let mut description =
+                    "Godot's language server (completion, errors, go to definition). Click to restart it".to_string();
+                if let Some(warning) = self.lsp.warning() {
+                    description = format!("{warning}.\n{description}");
+                }
                 left.push(style::tip(lsp, description, tooltip::Position::Top, ui));
             }
         }
@@ -2401,6 +2447,16 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Key::Character("j" | "`" | "²") if modifiers.command() => Some(Message::ToggleTerminal),
         _ => None,
     }
+}
+
+/// Completes after `duration`, without an async runtime timer.
+async fn sleep(duration: std::time::Duration) {
+    let (done, wait) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(duration);
+        let _ = done.send(());
+    });
+    let _ = wait.await;
 }
 
 async fn pick_folder() -> Option<PathBuf> {

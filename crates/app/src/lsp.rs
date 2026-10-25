@@ -12,7 +12,8 @@ use lsp_client::{godot, Client, Event, Server, StartOptions};
 
 #[derive(Debug, Clone)]
 pub enum LspEvent {
-    Connected { client: Client, label: String },
+    /// `warning` says when the spawned Godot doesn't match the project's version.
+    Connected { client: Client, label: String, warning: Option<String> },
     Failed(String),
     Event(Event),
 }
@@ -21,10 +22,11 @@ pub enum LspEvent {
 pub enum Lsp {
     Off,
     Starting,
-    Ready { client: Client, label: String },
+    Ready { client: Client, label: String, warning: Option<String> },
     /// The error itself is shown in the status message.
     Failed,
-    Disconnected,
+    /// Seconds until the next automatic reconnect, if one is scheduled.
+    Disconnected { retry_in: Option<u64> },
 }
 
 impl Lsp {
@@ -39,9 +41,18 @@ impl Lsp {
         match self {
             Lsp::Off => "LSP off".to_string(),
             Lsp::Starting => "LSP starting...".to_string(),
-            Lsp::Ready { label, .. } => format!("LSP: {label}"),
+            Lsp::Ready { label, warning: None, .. } => format!("LSP: {label}"),
+            Lsp::Ready { label, warning: Some(_), .. } => format!("LSP: {label} (version mismatch)"),
             Lsp::Failed => "LSP failed (click to retry)".to_string(),
-            Lsp::Disconnected => "LSP disconnected (click to retry)".to_string(),
+            Lsp::Disconnected { retry_in: Some(seconds) } => format!("LSP disconnected, retrying in {seconds}s"),
+            Lsp::Disconnected { retry_in: None } => "LSP disconnected (click to retry)".to_string(),
+        }
+    }
+
+    pub fn warning(&self) -> Option<&str> {
+        match self {
+            Lsp::Ready { warning, .. } => warning.as_deref(),
+            _ => None,
         }
     }
 }
@@ -71,7 +82,8 @@ pub fn connect(root: PathBuf, wanted_version: Option<String>, generation: u64) -
                 match lsp_client::start(&root, &options) {
                     Ok((client, reader)) => {
                         let label = describe(client.server(), install.as_ref());
-                        if tx.unbounded_send(LspEvent::Connected { client, label }).is_ok() {
+                        let warning = version_warning(client.server(), install.as_ref(), wanted_version.as_deref());
+                        if tx.unbounded_send(LspEvent::Connected { client, label, warning }).is_ok() {
                             reader.run(|event| {
                                 let _ = tx.unbounded_send(LspEvent::Event(event));
                             });
@@ -90,6 +102,19 @@ pub fn connect(root: PathBuf, wanted_version: Option<String>, generation: u64) -
             std::future::pending::<()>().await;
         })
     })
+}
+
+/// An attached editor already has the project open, so only a spawned
+/// server can be the wrong version.
+fn version_warning(server: &Server, install: Option<&godot::GodotInstall>, wanted: Option<&str>) -> Option<String> {
+    let (Server::Spawned { .. }, Some(install), Some(wanted)) = (server, install, wanted) else {
+        return None;
+    };
+    if godot::matches(install, Some(wanted)) {
+        return None;
+    }
+    let used = install.version_string().unwrap_or_else(|| "?".to_string());
+    Some(format!("No Godot {wanted} found, using {used} (set GODOT_BIN to choose)"))
 }
 
 fn describe(server: &Server, install: Option<&godot::GodotInstall>) -> String {

@@ -89,6 +89,17 @@ pub fn pick<'a>(installs: &'a [GodotInstall], wanted: Option<&str>) -> Option<&'
         .or_else(|| newest(&|_| true))
 }
 
+/// Whether `install` has the major.minor of `wanted` (e.g. "4.5"). Unknown
+/// versions on either side count as a match: there is nothing to warn about.
+pub fn matches(install: &GodotInstall, wanted: Option<&str>) -> bool {
+    match (install.version, wanted.and_then(version_from_str)) {
+        (Some((major, minor, _)), Some((wanted_major, wanted_minor, _))) => {
+            (major, minor) == (wanted_major, wanted_minor)
+        }
+        _ => true,
+    }
+}
+
 const PATH_NAMES: &[&str] = if cfg!(windows) {
     &["godot.exe", "godot4.exe"]
 } else {
@@ -185,6 +196,15 @@ mod tests {
         assert_eq!(version_from_name("Godot_v4.5-stable_linux.x86_64"), Some((4, 5, 0)));
         assert_eq!(version_from_name("godot.exe"), None);
         assert_eq!(version_from_str("4.3"), Some((4, 3, 0)));
+    }
+
+    #[test]
+    fn matches_on_major_minor() {
+        let install = |version| GodotInstall { path: PathBuf::from("godot"), version };
+        assert!(matches(&install(Some((4, 5, 1))), Some("4.5")));
+        assert!(!matches(&install(Some((4, 7, 1))), Some("4.5")));
+        assert!(matches(&install(None), Some("4.5")));
+        assert!(matches(&install(Some((4, 7, 1))), None));
     }
 
     #[test]
