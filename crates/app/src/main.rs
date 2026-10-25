@@ -7,6 +7,7 @@ mod explorer;
 mod find;
 mod format;
 mod lsp;
+mod numpad;
 mod on_escape;
 mod outline;
 mod palette;
@@ -2852,7 +2853,7 @@ impl App {
                 }
             }
         };
-        column![container(body).height(Length::Fill), self.status_bar()].into()
+        numpad::numpad_fix(column![container(body).height(Length::Fill), self.status_bar()]).into()
     }
 
     fn shortcuts_page(&self) -> Element<'_, Message> {
@@ -3257,7 +3258,8 @@ impl App {
 
 /// Global shortcuts, for key presses no widget handled.
 fn shortcut(event: keyboard::Event) -> Option<Message> {
-    let (key, modifiers) = match event {
+    // Numpad keys arrive as navigation keys even with NumLock on.
+    let (key, modifiers) = match numpad::fix_key_event(event) {
         keyboard::Event::KeyPressed { key, modifiers, .. } => (key, modifiers),
         keyboard::Event::ModifiersChanged(modifiers) => return Some(Message::ModifiersChanged(modifiers)),
         keyboard::Event::KeyReleased { .. } => return None,
