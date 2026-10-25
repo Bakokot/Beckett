@@ -9,6 +9,7 @@ mod lsp;
 mod on_escape;
 mod palette;
 mod problems;
+mod recent;
 mod rename;
 mod runner;
 mod shortcuts;
@@ -63,6 +64,9 @@ fn main() -> iced::Result {
 pub enum Message {
     OpenFolderDialog,
     FolderPicked(Option<PathBuf>),
+    OpenRecent(PathBuf),
+    /// Forget a project in the recent list.
+    RemoveRecent(PathBuf),
     ToggleDir(PathBuf),
     OpenFile(PathBuf),
     SelectTab(usize),
@@ -186,6 +190,8 @@ struct Signature {
 
 struct App {
     project: Option<Project>,
+    /// Recently opened projects, most recent first.
+    recent: Vec<recent::RecentProject>,
     tabs: Vec<Tab>,
     active: Option<usize>,
     themes: Vec<theme::Theme>,
@@ -268,6 +274,7 @@ impl App {
 
         let mut app = Self {
             project: None,
+            recent: recent::load(),
             tabs: Vec::new(),
             active: None,
             themes,
@@ -400,6 +407,14 @@ impl App {
             }
             Message::FolderPicked(Some(path)) => self.open_path(path),
             Message::FolderPicked(None) => {}
+            Message::OpenRecent(root) => {
+                if root.is_dir() {
+                    self.open_path(root);
+                } else {
+                    self.status = Some(format!("{} no longer exists", root.display()));
+                }
+            }
+            Message::RemoveRecent(root) => self.recent = recent::remove(&root),
             Message::ToggleDir(path) => {
                 if let Some(project) = &mut self.project {
                     project.explorer.toggle(&path);
@@ -980,6 +995,17 @@ impl App {
             .map(|(name, shortcut, message)| CommandEntry { name: name.to_string(), shortcut, message })
             .collect();
         entries.extend(themes.into_iter().map(|(name, message)| CommandEntry { name, shortcut: "", message }));
+        let current = self.project.as_ref().map(|p| p.root.as_path());
+        entries.extend(
+            self.recent
+                .iter()
+                .filter(|r| !r.missing && current.is_none_or(|c| !uri::same_path(c, &r.root)))
+                .map(|r| CommandEntry {
+                    name: format!("Open Recent: {} ({})", r.name, r.root.display()),
+                    shortcut: "",
+                    message: Message::OpenRecent(r.root.clone()),
+                }),
+        );
         entries
     }
 
@@ -1789,6 +1815,7 @@ impl App {
             .is_none()
             .then(|| "No project.godot found in this folder".to_string());
         self.reset_lsp(if godot.is_some() { Lsp::Starting } else { Lsp::Off });
+        self.recent = recent::add(&root);
         self.project = Some(Project {
             explorer: Explorer::new(root.clone()),
             root,
@@ -1979,17 +2006,47 @@ impl App {
     }
 
     fn welcome(&self) -> Element<'_, Message> {
-        let muted = style::to_color(self.current_theme().ui.text_muted);
-        center(
-            column![
-                text("Godot IDE").size(28),
-                text("Open a folder containing project.godot").color(muted),
-                button(text("Open Folder…")).on_press(Message::OpenFolderDialog),
-            ]
-            .spacing(12)
-            .align_x(Alignment::Center),
-        )
-        .into()
+        let ui = &self.current_theme().ui;
+        let muted = style::to_color(ui.text_muted);
+        let mut content = column![
+            text("Godot IDE").size(28),
+            text("Open a folder containing project.godot").color(muted),
+            button(text("Open Folder…")).on_press(Message::OpenFolderDialog),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center);
+
+        if !self.recent.is_empty() {
+            let rows = self.recent.iter().map(|project| {
+                let mut title = row![text(&project.name).size(14)].spacing(8).align_y(Alignment::Center);
+                if let Some(version) = &project.godot_version {
+                    title = title.push(text(format!("Godot {version}")).size(11).color(muted));
+                }
+                if project.missing {
+                    title = title.push(text("not found").size(11).color(style::to_color(ui.danger)));
+                }
+                let path = text(project.root.display().to_string()).size(11).color(muted);
+                let open = button(column![title, path].spacing(2))
+                    .on_press_maybe((!project.missing).then(|| Message::OpenRecent(project.root.clone())))
+                    .style(button::text)
+                    .width(Length::Fill)
+                    .padding([4, 8]);
+                let forget = button(text("×").size(13))
+                    .on_press(Message::RemoveRecent(project.root.clone()))
+                    .style(button::text)
+                    .padding([4, 8]);
+                row![open, style::tip(forget, "Remove from this list", tooltip::Position::Left, ui)]
+                    .align_y(Alignment::Center)
+                    .into()
+            });
+            let list = scrollable(iced::widget::Column::with_children(rows).width(Length::Fill)).height(Length::Shrink);
+            content = content.push(space().height(12)).push(
+                column![text("RECENT PROJECTS").size(12).color(muted), container(list).max_height(420)]
+                    .spacing(6)
+                    .width(520),
+            );
+        }
+        center(content).into()
     }
 
     fn sidebar<'a>(&'a self, project: &'a Project) -> Element<'a, Message> {

@@ -156,7 +156,8 @@ crates/
       open tabs listed first; go to line with `:` (Ctrl+G), `:line:column` supported
 - [x] Keyboard shortcuts page (F1, `?` in the status bar, or the palette): every binding by
       section, with a filter; Escape closes
-- [ ] Recent projects / welcome screen
+- [x] Recent projects on the welcome screen (name, Godot version, path; missing folders flagged;
+      × forgets one) and as "Open Recent" palette commands
 
 ## Phase 2 — v1
 
