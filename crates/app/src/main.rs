@@ -19,6 +19,7 @@ mod runner;
 mod session;
 mod settings;
 mod shortcuts;
+mod split;
 mod splitter;
 mod style;
 mod terminal_panel;
@@ -88,6 +89,11 @@ pub enum Message {
     CloseTab(usize),
     CloseActiveTab,
     Edit(EditorEvent),
+    /// An event of the editor on one side of the split.
+    EditIn(usize, EditorEvent),
+    /// Ctrl+\: move the current tab to the other side (splitting the view).
+    SplitMove,
+    FocusOtherSide,
     Save,
     ThemeSelected(String),
     /// An event of the language server connection of this generation.
@@ -255,6 +261,11 @@ struct App {
     saved_session: Option<session::Session>,
     settings: settings::Settings,
     tabs: Vec<Tab>,
+    /// The side of the split with keyboard focus (0 left, 1 right); `active`
+    /// is the tab it shows.
+    focused_group: usize,
+    /// The tab shown on each side.
+    group_active: [Option<usize>; 2],
     active: Option<usize>,
     themes: Vec<theme::Theme>,
     theme_index: usize,
@@ -328,6 +339,8 @@ struct Tab {
     marks: Vec<Mark>,
     /// The file changed on disk while this tab had unsaved edits.
     disk_changed: bool,
+    /// Side of the split it is on: 0 left, 1 right.
+    group: usize,
 }
 
 impl Tab {
@@ -365,6 +378,8 @@ impl App {
             saved_session: None,
             settings,
             tabs: Vec::new(),
+            focused_group: 0,
+            group_active: [None, None],
             active: None,
             themes,
             theme_index,
@@ -522,8 +537,62 @@ impl App {
         if self.find.is_some() && self.find_key() != before {
             self.recompute_find();
         }
+        self.sync_groups();
         self.refresh_outline();
         task
+    }
+
+    /// Keeps the split consistent after any change: the active tab decides
+    /// which side has focus, each side shows one of its own tabs, and a side
+    /// left without tabs closes the split.
+    fn sync_groups(&mut self) {
+        let mut groups: Vec<usize> = self.tabs.iter().map(|t| t.group).collect();
+        let mut split = split::Split { active: self.active, shown: self.group_active, focused: self.focused_group };
+        split.sync(&mut groups);
+        for (tab, group) in self.tabs.iter_mut().zip(groups) {
+            tab.group = group;
+        }
+        self.active = split.active;
+        self.group_active = split.shown;
+        self.focused_group = split.focused;
+    }
+
+    /// An event from the editor on one side: clicking or typing there moves
+    /// the focus to that side; hovering the other side does nothing.
+    fn on_editor_in(&mut self, group: usize, event: EditorEvent) {
+        if group != self.focused_group {
+            if matches!(event, EditorEvent::Hover(_) | EditorEvent::HoverEnd | EditorEvent::LinkHover(_)) {
+                return;
+            }
+            let Some(index) = self.group_active[group] else {
+                return;
+            };
+            self.dismiss_popups();
+            self.find = None;
+            self.rename = None;
+            self.active = Some(index);
+            self.sync_groups();
+        }
+        self.on_editor(event);
+    }
+
+    /// Moves the current tab to the other side, splitting the view (or
+    /// closing the split when its side is left empty).
+    fn split_move(&mut self) {
+        let Some(active) = self.active else {
+            return;
+        };
+        let from = self.tabs[active].group;
+        let to = 1 - from;
+        let alone = self.tabs.iter().filter(|t| t.group == from).count() == 1;
+        if alone && !self.tabs.iter().any(|t| t.group == to) {
+            self.status = Some("Split moves the current tab to the other side: open a second file first".to_string());
+            return;
+        }
+        self.dismiss_popups();
+        self.find = None;
+        self.rename = None;
+        self.tabs[active].group = to;
     }
 
     /// Asks for the active file's outline while it is shown (sidebar or the
@@ -648,6 +717,15 @@ impl App {
                 }
             }
             Message::Edit(event) => self.on_editor(event),
+            Message::EditIn(group, event) => self.on_editor_in(group, event),
+            Message::SplitMove => self.split_move(),
+            Message::FocusOtherSide => {
+                let other = 1 - self.focused_group;
+                if let Some(index) = self.group_active[other] {
+                    self.dismiss_popups();
+                    self.active = Some(index);
+                }
+            }
             Message::Save => self.save_active(),
             Message::ThemeSelected(name) => {
                 if let Some(index) = self.themes.iter().position(|t| t.name == name) {
@@ -1181,6 +1259,8 @@ impl App {
             ("Run: Stop", "F8", Message::StopRun),
             ("Godot: Open in Editor", "", Message::OpenInGodot),
             ("View: Toggle Terminal", "Ctrl+J", Message::ToggleTerminal),
+            ("View: Split Editor (Move Tab to the Other Side)", "Ctrl+\\", Message::SplitMove),
+            ("View: Focus the Other Side", "", Message::FocusOtherSide),
             ("View: Zoom In", "Ctrl+=", Message::Zoom(1)),
             ("View: Zoom Out", "Ctrl+-", Message::Zoom(-1)),
             ("View: Reset Zoom", "Ctrl+0", Message::ZoomReset),
@@ -2633,6 +2713,7 @@ impl App {
             version: 1,
             marks: Vec::new(),
             disk_changed: false,
+            group: self.focused_group,
         };
         if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
             let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
@@ -2654,6 +2735,7 @@ impl App {
                     path: tab.path.clone(),
                     line: pos.line,
                     column: pos.column,
+                    group: tab.group,
                     folds: tab.buffer.folded().iter().map(|&(header, _)| header).collect(),
                     unsaved: tab.dirty.then(|| tab.buffer.file_contents()),
                     disk_hash: if tab.dirty { disk() } else { None },
@@ -2707,6 +2789,7 @@ impl App {
                 None => continue,
             }
             if let Some(tab) = self.tabs.last_mut() {
+                tab.group = state.group.min(1);
                 for &header in &state.folds {
                     tab.buffer.apply(Command::ToggleFold(header));
                 }
@@ -2716,6 +2799,8 @@ impl App {
         if let Some(active) = saved.active.filter(|&i| i < self.tabs.len()) {
             self.active = Some(active);
         }
+        // Restored before the first update: put the split in order now.
+        self.sync_groups();
         self.saved_session = Some(saved);
     }
 
@@ -2736,6 +2821,14 @@ impl App {
         }
         self.pending_close = None;
         self.tabs.remove(index);
+        // Indices after the removed tab shift down; sync_groups refills gaps.
+        for shown in &mut self.group_active {
+            *shown = match *shown {
+                Some(i) if i == index => None,
+                Some(i) if i > index => Some(i - 1),
+                other => other,
+            };
+        }
         self.active = match self.active {
             _ if self.tabs.is_empty() => None,
             Some(active) if active > index => Some(active - 1),
@@ -2968,12 +3061,46 @@ impl App {
         if self.shortcuts.is_some() {
             return self.shortcuts_page();
         }
-        let Some(tab) = self.active_tab() else {
+        if !self.is_split() {
+            return self.pane(0);
+        }
+        let border = style::to_color(self.current_theme().ui.border);
+        let divider = container(space()).width(1).height(Length::Fill).style(move |_| container::Style {
+            background: Some(border.into()),
+            ..container::Style::default()
+        });
+        row![
+            container(self.pane(0)).width(Length::FillPortion(1)),
+            divider,
+            container(self.pane(1)).width(Length::FillPortion(1)),
+        ]
+        .into()
+    }
+
+    /// Whether the editor area is split in two sides.
+    fn is_split(&self) -> bool {
+        self.tabs.iter().any(|t| t.group == 1)
+    }
+
+    /// One side of the editor area: its tabs and the file it shows. Only
+    /// the focused side has the find / rename bars and the popups.
+    fn pane(&self, group: usize) -> Element<'_, Message> {
+        let focused = group == self.focused_group;
+        let Some(tab) = self.group_active[group].and_then(|i| self.tabs.get(i)) else {
             let muted = style::to_color(self.current_theme().ui.text_muted);
             return center(text("Open a file from the explorer").color(muted)).into();
         };
 
         let colors = code_editor::Colors::from_theme(self.current_theme());
+        let mut editor = CodeEditor::new(&tab.buffer, colors, move |event| Message::EditIn(group, event))
+            .font(code_editor::CodeFont::from_settings(&self.current_theme().font))
+            .marks(&tab.marks)
+            .focused(focused && self.focus == Focus::Editor);
+        let mut area = column![self.tab_bar(group)];
+        if !focused {
+            return area.push(editor).into();
+        }
+
         let completion = self.completion.as_ref().map(|c| CompletionPopup {
             rows: &c.rows,
             selected: c.selected,
@@ -2986,17 +3113,12 @@ impl App {
             active: s.active.clone(),
             anchor: s.anchor,
         });
-        let editor = CodeEditor::new(&tab.buffer, colors, Message::Edit)
-            .font(code_editor::CodeFont::from_settings(&self.current_theme().font))
-            .marks(&tab.marks)
+        editor = editor
             .completion(completion)
             .hover(hover)
             .signature(signature)
-            .focused(self.focus == Focus::Editor)
             .tab_stops(self.snippet.is_some())
             .link(self.link);
-
-        let mut area = column![self.tab_bar()];
         if let Some(rename) = &self.rename {
             let bar = rename.view(&self.current_theme().ui).map(Message::Rename);
             area = area.push(on_escape::on_escape(bar, Message::Rename(RenameMessage::Close)));
@@ -3103,8 +3225,10 @@ impl App {
         body
     }
 
-    fn tab_bar(&self) -> Element<'_, Message> {
-        let tabs = self.tabs.iter().enumerate().map(|(index, tab)| {
+    /// The tabs of one side of the split.
+    fn tab_bar(&self, group: usize) -> Element<'_, Message> {
+        let shown = self.group_active[group];
+        let tabs = self.tabs.iter().enumerate().filter(|(_, tab)| tab.group == group).map(|(index, tab)| {
             let marker = match (tab.dirty, tab.disk_changed) {
                 (_, true) => " (changed on disk)",
                 (true, false) => " *",
@@ -3112,7 +3236,7 @@ impl App {
             };
             let label = format!("{}{marker}", tab.title());
             let style: fn(&iced::Theme, button::Status) -> button::Style =
-                if self.active == Some(index) {
+                if shown == Some(index) {
                     button::secondary
                 } else {
                     button::text
@@ -3269,6 +3393,7 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
         keyboard::Key::Named(keyboard::key::Named::F2) => Some(Message::StartRename),
         keyboard::Key::Named(keyboard::key::Named::F1) => Some(Message::OpenShortcuts),
+        keyboard::Key::Character("\\") if modifiers.command() => Some(Message::SplitMove),
         // Zoom: Ctrl+= (or Ctrl++), Ctrl+-, Ctrl+0, also on the numeric keypad.
         keyboard::Key::Character("=" | "+") if modifiers.command() => Some(Message::Zoom(1)),
         keyboard::Key::Character("-") if modifiers.command() => Some(Message::Zoom(-1)),

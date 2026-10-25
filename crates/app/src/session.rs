@@ -20,6 +20,9 @@ pub struct TabState {
     pub line: usize,
     #[serde(default)]
     pub column: usize,
+    /// Side of the split view (0 left, 1 right).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub group: usize,
     /// Header lines of folded blocks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folds: Vec<usize>,
@@ -30,6 +33,10 @@ pub struct TabState {
     /// changed since, the restored tab is flagged "changed on disk".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_hash: Option<u64>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// A stable hash of file contents (the same across runs).
@@ -94,11 +101,12 @@ mod tests {
     fn sessions_round_trip_and_tolerate_missing_fields() {
         let session = Session {
             tabs: vec![
-                TabState { path: "C:/game/a.gd".into(), line: 3, column: 1, folds: vec![5], unsaved: None, disk_hash: None },
+                TabState { path: "C:/game/a.gd".into(), line: 3, column: 1, group: 1, folds: vec![5], unsaved: None, disk_hash: None },
                 TabState {
                     path: "C:/game/b.gd".into(),
                     line: 0,
                     column: 0,
+                    group: 0,
                     folds: Vec::new(),
                     unsaved: Some("extends Node\n".into()),
                     disk_hash: Some(content_hash("extends Node2D\n")),

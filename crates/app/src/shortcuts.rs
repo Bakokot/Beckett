@@ -19,6 +19,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+W", "Close the current tab (twice to discard unsaved edits)"),
             ("Ctrl+P", "Go to file (fuzzy search)"),
             ("Ctrl+Shift+P", "Command palette"),
+            ("Ctrl+\\", "Split the editor: move the current tab to the other side"),
             ("Ctrl+G", "Go to line (type :line or :line:column)"),
             ("Ctrl+Shift+O", "Go to a function, variable or signal of this file"),
             ("F1", "Keyboard shortcuts (this page)"),

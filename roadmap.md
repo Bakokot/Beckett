@@ -185,7 +185,9 @@ crates/
 - [x] Code folding: indentation blocks and `#region` / `#endregion`; Alt+F (as in Godot), gutter
       click, "..." marker, Fold / Unfold / Fold All / Unfold All; folds follow edits and undo, Up/Down
       step over them, a cursor landing inside opens them — seen on screen (restored session)
-- [ ] Split views
+- [x] Split view: two sides with their own tabs; Ctrl+ (or the palette) moves the current tab to
+      the other side, a side left empty closes the split; click a side to focus it; sides kept in
+      the session — seen on screen. (One file can't show on both sides: one buffer, one cursor)
 - [x] Hot exit: unsaved edits kept in the session on close (and every 30 s), restored as unsaved;
       flagged "(changed on disk)" when the file changed meanwhile — seen on screen
 - [ ] Persistent undo
