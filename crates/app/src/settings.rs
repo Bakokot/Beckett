@@ -30,7 +30,9 @@ impl Settings {
     /// The saved settings; defaults when there are none or they can't be read.
     pub fn load() -> Self {
         let text = file().and_then(|path| std::fs::read_to_string(path).ok());
-        let settings: Self = text.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        // Hand-edited files may start with a byte order mark.
+        let settings: Self =
+            text.and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok()).unwrap_or_default();
         settings.sanitized()
     }
 

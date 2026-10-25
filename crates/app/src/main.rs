@@ -14,6 +14,7 @@ mod problems;
 mod recent;
 mod rename;
 mod runner;
+mod session;
 mod settings;
 mod shortcuts;
 mod splitter;
@@ -60,6 +61,7 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .scale_factor(App::scale_factor)
+        .exit_on_close_request(false)
         .subscription(App::subscription)
         .window_size(WINDOW_SIZE)
         .run()
@@ -68,6 +70,12 @@ fn main() -> iced::Result {
 #[derive(Debug, Clone)]
 pub enum Message {
     OpenFolderDialog,
+    /// Back to the welcome screen (the session is kept).
+    CloseFolder,
+    /// Periodic session save, so a crash loses little.
+    AutosaveSession,
+    /// The window is closing: save the session, then close.
+    CloseRequested(iced::window::Id),
     FolderPicked(Option<PathBuf>),
     OpenRecent(PathBuf),
     /// Forget a project in the recent list.
@@ -241,6 +249,8 @@ struct App {
     project: Option<Project>,
     /// Recently opened projects, most recent first.
     recent: Vec<recent::RecentProject>,
+    /// The session as last written, to skip rewriting an unchanged one.
+    saved_session: Option<session::Session>,
     settings: settings::Settings,
     tabs: Vec<Tab>,
     active: Option<usize>,
@@ -350,6 +360,7 @@ impl App {
         let mut app = Self {
             project: None,
             recent: recent::load(),
+            saved_session: None,
             settings,
             tabs: Vec::new(),
             active: None,
@@ -390,10 +401,12 @@ impl App {
             terminal: TerminalState::default(),
             focus: Focus::Editor,
         };
-        if let Some(path) = initial {
+        // Without a folder to open, pick up where the last session left off.
+        let last = app.recent.first().filter(|r| !r.missing).map(|r| r.root.clone());
+        if let Some(path) = initial.or(last) {
             app.open_path(path);
         }
-        (app, Task::none())
+        (app, autosave_later())
     }
 
     fn title(&self) -> String {
@@ -495,7 +508,9 @@ impl App {
             _ => None,
         });
 
-        Subscription::batch([keys, lsp, terminal, run, files, dropped])
+        let close = iced::window::close_requests().map(Message::CloseRequested);
+
+        Subscription::batch([keys, lsp, terminal, run, files, dropped, close])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -566,6 +581,16 @@ impl App {
             }
             Message::FolderPicked(Some(path)) => self.open_path(path),
             Message::FolderPicked(None) => {}
+            Message::CloseFolder => self.close_folder(),
+            Message::AutosaveSession => {
+                self.save_session();
+                return autosave_later();
+            }
+            Message::CloseRequested(window) => {
+                // Hot exit: unsaved edits are kept in the session, not lost.
+                self.save_session();
+                return iced::window::close(window);
+            }
             Message::OpenRecent(root) => {
                 if root.is_dir() {
                     self.open_path(root);
@@ -1133,6 +1158,7 @@ impl App {
         let mut commands: Vec<(&str, &'static str, Message)> = vec![
             ("File: Save", "Ctrl+S", Message::Save),
             ("File: Open Folder", "Ctrl+O", Message::OpenFolderDialog),
+            ("File: Close Folder", "", Message::CloseFolder),
             ("File: Close Tab", "Ctrl+W", Message::CloseActiveTab),
             ("File: Reload from Disk", "", Message::ReloadActive),
             ("Go to File", "Ctrl+P", Message::OpenPalette(String::new())),
@@ -2481,6 +2507,9 @@ impl App {
 
     /// Opens a project folder, or a file together with its project.
     fn open_path(&mut self, path: PathBuf) {
+        // Keep the session (and unsaved edits) of the project being left.
+        self.save_session();
+        self.saved_session = None;
         let (dir, file) = if path.is_file() {
             (path.parent().map(Path::to_path_buf).unwrap_or_default(), Some(path))
         } else {
@@ -2506,9 +2535,28 @@ impl App {
         self.reset_terminal();
         self.run = RunState::default();
         self.panel = None;
+        self.restore_session();
         if let Some(file) = file {
             self.open_file(file);
         }
+    }
+
+    /// Leaves the project for the welcome screen, keeping its session.
+    fn close_folder(&mut self) {
+        self.save_session();
+        self.saved_session = None;
+        self.project = None;
+        self.tabs.clear();
+        self.active = None;
+        self.dismiss_popups();
+        self.find = None;
+        self.rename = None;
+        self.outline = None;
+        self.reset_lsp(Lsp::Off);
+        self.reset_terminal();
+        self.run = RunState::default();
+        self.panel = None;
+        self.recent = recent::load();
     }
 
     /// Opens (or focuses) a file tab. Returns whether it is now active.
@@ -2522,22 +2570,7 @@ impl App {
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
-                let language = Language::from_path(&path);
-                let tab = Tab {
-                    language,
-                    buffer: Buffer::new(&text, language),
-                    path,
-                    dirty: false,
-                    version: 1,
-                    marks: Vec::new(),
-                    disk_changed: false,
-                };
-                if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
-                    let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
-                }
-                self.tabs.push(tab);
-                self.active = Some(self.tabs.len() - 1);
-                self.refresh_marks();
+                self.add_tab(path, &text, false);
                 true
             }
             Err(error) => {
@@ -2545,6 +2578,104 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Adds and activates a tab showing `text` (the file's contents, or
+    /// unsaved edits restored from the session).
+    fn add_tab(&mut self, path: PathBuf, text: &str, dirty: bool) {
+        let language = Language::from_path(&path);
+        let tab = Tab {
+            language,
+            buffer: Buffer::new(text, language),
+            path,
+            dirty,
+            version: 1,
+            marks: Vec::new(),
+            disk_changed: false,
+        };
+        if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
+            let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
+        }
+        self.tabs.push(tab);
+        self.active = Some(self.tabs.len() - 1);
+        self.refresh_marks();
+    }
+
+    /// What to restore next time this project opens.
+    fn session_snapshot(&self) -> session::Session {
+        let tabs = self
+            .tabs
+            .iter()
+            .map(|tab| {
+                let pos = tab.buffer.char_to_pos(tab.buffer.primary().head);
+                let disk = || std::fs::read_to_string(&tab.path).ok().map(|text| session::content_hash(&text));
+                session::TabState {
+                    path: tab.path.clone(),
+                    line: pos.line,
+                    column: pos.column,
+                    folds: tab.buffer.folded().iter().map(|&(header, _)| header).collect(),
+                    unsaved: tab.dirty.then(|| tab.buffer.file_contents()),
+                    disk_hash: if tab.dirty { disk() } else { None },
+                }
+            })
+            .collect();
+        session::Session { tabs, active: self.active }
+    }
+
+    /// Saves the project's session if it changed since the last save.
+    fn save_session(&mut self) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let snapshot = self.session_snapshot();
+        if self.saved_session.as_ref() == Some(&snapshot) {
+            return;
+        }
+        match session::save(&project.root, &snapshot) {
+            Ok(()) => self.saved_session = Some(snapshot),
+            Err(error) => self.status = Some(format!("Cannot save the session: {error}")),
+        }
+    }
+
+    /// Reopens the tabs of the project's last session, unsaved edits included.
+    fn restore_session(&mut self) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let saved = session::load(&project.root);
+        for state in &saved.tabs {
+            if self.tabs.iter().any(|t| uri::same_path(&t.path, &state.path)) {
+                continue;
+            }
+            match &state.unsaved {
+                Some(text) => {
+                    self.add_tab(state.path.clone(), text, true);
+                    // The file changed (or vanished) since the edits were kept.
+                    let disk = std::fs::read_to_string(&state.path).ok().map(|d| session::content_hash(&d));
+                    if disk != state.disk_hash {
+                        if let Some(tab) = self.tabs.last_mut() {
+                            tab.disk_changed = true;
+                        }
+                    }
+                }
+                None if state.path.is_file() => {
+                    if !self.open_file(state.path.clone()) {
+                        continue;
+                    }
+                }
+                None => continue,
+            }
+            if let Some(tab) = self.tabs.last_mut() {
+                for &header in &state.folds {
+                    tab.buffer.apply(Command::ToggleFold(header));
+                }
+                tab.buffer.set_cursor(Pos { line: state.line, column: state.column });
+            }
+        }
+        if let Some(active) = saved.active.filter(|&i| i < self.tabs.len()) {
+            self.active = Some(active);
+        }
+        self.saved_session = Some(saved);
     }
 
     fn close_tab(&mut self, index: usize) {
@@ -3126,6 +3257,13 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Key::Character("j" | "`" | "²") if modifiers.command() => Some(Message::ToggleTerminal),
         _ => None,
     }
+}
+
+/// How often the session is saved while working (when it changed).
+const AUTOSAVE_SECONDS: u64 = 30;
+
+fn autosave_later() -> Task<Message> {
+    Task::perform(sleep(std::time::Duration::from_secs(AUTOSAVE_SECONDS)), |()| Message::AutosaveSession)
 }
 
 /// Completes after `duration`, without an async runtime timer.

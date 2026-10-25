@@ -184,9 +184,11 @@ crates/
 **Editor**
 - [x] Code folding: indentation blocks and `#region` / `#endregion`; Alt+F (as in Godot), gutter
       click, "..." marker, Fold / Unfold / Fold All / Unfold All; folds follow edits and undo, Up/Down
-      step over them, a cursor landing inside opens them — unit-tested, not yet seen on screen
+      step over them, a cursor landing inside opens them — seen on screen (restored session)
 - [ ] Split views
-- [ ] Hot exit / persistent undo
+- [x] Hot exit: unsaved edits kept in the session on close (and every 30 s), restored as unsaved;
+      flagged "(changed on disk)" when the file changed meanwhile — seen on screen
+- [ ] Persistent undo
 - [ ] Format on save (gdformat or LSP)
 - [ ] Highlighting for `.gdshader`, `.tscn`, `.tres`, `project.godot`, `.cfg`, JSON, Markdown
 
@@ -216,7 +218,8 @@ crates/
 - [ ] Dockable / resizable panels
 - [ ] Remappable keybindings with VS Code and Godot presets
 - [ ] Settings UI + user/project JSON
-- [ ] Session restore
+- [x] Session restore: per-project tabs, active tab, cursors, folds; the last project reopens at
+      launch; "File: Close Folder" goes back to the welcome screen
 
 **Git**
 - [ ] Explorer status + gutter change markers
