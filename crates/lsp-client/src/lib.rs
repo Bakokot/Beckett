@@ -12,8 +12,9 @@ mod types;
 pub mod uri;
 
 pub use types::{
-    completion_item, completion_items, hover_text, locations, signature_help, CompletionItem,
-    CompletionKind, Diagnostic, Location, Position, Range, Severity, SignatureHelp,
+    completion_item, completion_items, hover_text, locations, range, signature_help, workspace_edit,
+    CompletionItem, CompletionKind, Diagnostic, Location, Position, Range, Severity, SignatureHelp,
+    TextEdit,
 };
 
 use std::fmt;
@@ -215,6 +216,40 @@ impl Client {
         )
     }
 
+    /// Every use of the symbol at `position`, declaration included. Decode
+    /// the answer with [`locations`].
+    pub fn references(&self, path: &Path, position: Position) -> io::Result<u64> {
+        self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": path_to_uri(path) },
+                "position": position.to_json(),
+                "context": { "includeDeclaration": true },
+            }),
+        )
+    }
+
+    /// Whether the symbol at `position` can be renamed: the answer is its
+    /// range (decode with [`range`]), or null.
+    pub fn prepare_rename(&self, path: &Path, position: Position) -> io::Result<u64> {
+        self.request(
+            "textDocument/prepareRename",
+            json!({ "textDocument": { "uri": path_to_uri(path) }, "position": position.to_json() }),
+        )
+    }
+
+    /// Decode the answer with [`workspace_edit`].
+    pub fn rename(&self, path: &Path, position: Position, new_name: &str) -> io::Result<u64> {
+        self.request(
+            "textDocument/rename",
+            json!({
+                "textDocument": { "uri": path_to_uri(path) },
+                "position": position.to_json(),
+                "newName": new_name,
+            }),
+        )
+    }
+
     fn send(&self, message: &Value) -> io::Result<()> {
         let mut writer = self.inner.writer.lock().unwrap_or_else(PoisonError::into_inner);
         protocol::write_message(&mut *writer, message)
@@ -391,6 +426,8 @@ fn handshake(
                     "synchronization": { "didSave": true },
                     "publishDiagnostics": {},
                     "definition": { "linkSupport": false },
+                    "references": {},
+                    "rename": { "prepareSupport": true },
                     "completion": { "completionItem": { "documentationFormat": ["markdown", "plaintext"] } },
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "signatureHelp": { "signatureInformation": { "documentationFormat": ["markdown"] } },

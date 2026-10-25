@@ -115,7 +115,10 @@ crates/
 - [x] Signature help on `(` and `,`, active parameter highlighted
 - [x] Hover docs after the mouse rests 500 ms on a word — not yet tested live (needs a real mouse)
 - [ ] Member completion after `.` not yet verified live (test harness can't type Shift chars on AZERTY)
-- [ ] Find references, rename
+- [x] Find references (Shift+F12), listed in the SEARCH tab grouped by file
+- [x] Rename symbol (F2): `prepareRename` check, rename bar, open tabs edited in place (one undo
+      step, left unsaved), other files rewritten on disk — protocol verified against 4.7.1, UI not
+      yet clicked through by hand
 
 **Godot awareness**
 - [ ] `res://` / `uid://` resolution: click to open, path completion in strings

@@ -40,6 +40,13 @@ pub struct Location {
     pub range: Range,
 }
 
+/// Replace `range` with `new_text`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextEdit {
+    pub range: Range,
+    pub new_text: String,
+}
+
 impl Position {
     pub fn to_json(self) -> Value {
         serde_json::json!({ "line": self.line, "character": self.character })
@@ -207,7 +214,42 @@ pub fn locations(result: &Value) -> Vec<Location> {
         .collect()
 }
 
-fn range(v: &Value) -> Option<Range> {
+/// Decodes a `WorkspaceEdit` (`changes` or `documentChanges`) into edits
+/// per file, each file's edits sorted by position.
+pub fn workspace_edit(result: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
+    let text_edits = |edits: &Value| -> Vec<TextEdit> {
+        let mut edits: Vec<TextEdit> = edits
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let new_text = e.get("newText")?.as_str()?.to_string();
+                Some(TextEdit { range: range(e.get("range")?)?, new_text })
+            })
+            .collect();
+        edits.sort_by_key(|e| e.range.start);
+        edits
+    };
+    let mut files = Vec::new();
+    if let Some(changes) = result.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in changes {
+            if let Some(path) = uri_to_path(uri) {
+                files.push((path, text_edits(edits)));
+            }
+        }
+    }
+    // Text edits only; file create/rename/delete operations are skipped.
+    for change in result.get("documentChanges").and_then(Value::as_array).into_iter().flatten() {
+        let uri = change.get("textDocument").and_then(|d| d.get("uri")).and_then(Value::as_str);
+        if let (Some(path), Some(edits)) = (uri.and_then(uri_to_path), change.get("edits")) {
+            files.push((path, text_edits(edits)));
+        }
+    }
+    files.retain(|(_, edits)| !edits.is_empty());
+    files
+}
+
+pub fn range(v: &Value) -> Option<Range> {
     Some(Range {
         start: position(v.get("start")?)?,
         end: position(v.get("end")?)?,
@@ -258,6 +300,29 @@ mod tests {
             "targetSelectionRange": {"start": {"line": 3, "character": 5}, "end": {"line": 3, "character": 9}}}]);
         assert_eq!(locations(&link)[0].range.start, Position { line: 3, character: 5 });
         assert!(locations(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn decodes_workspace_edits() {
+        let edit = |line, start, end| json!({"newText": "hp",
+            "range": {"start": {"line": line, "character": start}, "end": {"line": line, "character": end}}});
+        let result = json!({"changes": {
+            "file:///C%3A/game/a.gd": [edit(5, 1, 6), edit(2, 4, 9)],
+            "file:///C%3A/game/b.gd": [edit(3, 1, 6)],
+        }});
+        let files = workspace_edit(&result);
+        assert_eq!(files.len(), 2);
+        let (path, edits) = &files[0];
+        assert!(path.to_string_lossy().ends_with("a.gd"));
+        assert_eq!(edits[0].range.start, Position { line: 2, character: 4 });
+        assert_eq!(edits[1].new_text, "hp");
+
+        let documents = json!({"documentChanges": [
+            {"textDocument": {"uri": "file:///C%3A/game/c.gd", "version": 3}, "edits": [edit(0, 0, 1)]},
+            {"kind": "create", "uri": "file:///C%3A/game/d.gd"},
+        ]});
+        assert_eq!(workspace_edit(&documents).len(), 1);
+        assert!(workspace_edit(&Value::Null).is_empty());
     }
 
     #[test]

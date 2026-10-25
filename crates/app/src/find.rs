@@ -206,6 +206,8 @@ pub struct ProjectSearch {
     pub error: Option<String>,
     /// Query of the shown results, for the summary line.
     pub searched: Option<String>,
+    /// The shown results are the references to this symbol (Shift+F12).
+    pub references: Option<String>,
 }
 
 impl ProjectSearch {
@@ -215,11 +217,16 @@ impl ProjectSearch {
             style::tip(toggle_button(label, on, message), description, Position::Bottom, ui)
         };
         let total: usize = self.results.iter().map(|f| f.lines.len()).sum();
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
         let summary = match (&self.error, self.running, &self.searched) {
             (Some(error), _, _) => text(error.clone()).size(12).color(style::to_color(ui.danger)),
             (None, Some(_), _) => text("Searching...").size(12).color(muted),
+            (None, None, _) if self.references.is_some() => {
+                let name = self.references.as_deref().unwrap_or_default();
+                let summary = format!("{} to {name} in {}", plural(total, "reference"), plural(self.results.len(), "file"));
+                text(summary).size(12).color(muted)
+            }
             (None, None, Some(q)) => {
-                let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
                 let summary = format!("{} in {} for \"{q}\"", plural(total, "result"), plural(self.results.len(), "file"));
                 text(summary).size(12).color(muted)
             }

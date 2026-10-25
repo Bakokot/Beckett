@@ -9,6 +9,7 @@ mod lsp;
 mod on_escape;
 mod palette;
 mod problems;
+mod rename;
 mod runner;
 mod style;
 mod terminal_panel;
@@ -35,10 +36,12 @@ use code_editor::{
 use completion::Completion;
 use docs::Doc;
 use explorer::Explorer;
-use find::{Find, FindMessage, ProjectSearch, SearchMessage};
+use editor_core::search::LineMatch;
+use find::{FileResult, Find, FindMessage, ProjectSearch, SearchMessage};
 use palette::{CommandEntry, Palette, PaletteMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
+use rename::{Rename, RenameMessage};
 use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
 use terminal_panel::TerminalEvent;
 use terminal_view::TerminalView;
@@ -69,6 +72,11 @@ pub enum Message {
     Lsp(LspEvent),
     RestartLsp,
     GotoDefinition,
+    /// Shift+F12: list every use of the symbol under the cursor.
+    FindReferences,
+    /// F2: open the rename bar for the symbol under the cursor.
+    StartRename,
+    Rename(RenameMessage),
     ToggleProblems,
     /// Open a file and put the cursor at a zero-based line/character.
     JumpTo(PathBuf, u32, u32),
@@ -158,6 +166,11 @@ enum Pending {
     Resolve(usize),
     Hover(Pos),
     Signature(Pos),
+    /// References to the named symbol.
+    References(String),
+    /// Whether the symbol `word` at `pos` can be renamed.
+    PrepareRename { path: PathBuf, pos: Pos, word: String },
+    Rename { from: String, to: String },
 }
 
 struct Signature {
@@ -186,6 +199,7 @@ struct App {
     run: RunState,
     /// Find bar of the active tab.
     find: Option<Find>,
+    rename: Option<Rename>,
     search: ProjectSearch,
     modifiers: keyboard::Modifiers,
     palette: Option<Palette<Message>>,
@@ -261,6 +275,7 @@ impl App {
             panel: None,
             run: RunState::default(),
             find: None,
+            rename: None,
             search: ProjectSearch::default(),
             modifiers: keyboard::Modifiers::default(),
             palette: None,
@@ -447,13 +462,16 @@ impl App {
                     self.open_file(path);
                 }
             }
-            Message::Lsp(event) => self.on_lsp(event),
+            Message::Lsp(event) => return self.on_lsp(event),
             Message::RestartLsp => {
                 if self.project.as_ref().is_some_and(|p| p.godot.is_some()) {
                     self.reset_lsp(Lsp::Starting);
                 }
             }
             Message::GotoDefinition => self.goto_definition(),
+            Message::FindReferences => self.find_references(),
+            Message::StartRename => self.start_rename(),
+            Message::Rename(message) => return self.on_rename(message),
             Message::ToggleProblems => self.toggle_panel(Panel::Problems),
             Message::JumpTo(path, line, character) => {
                 self.dismiss_popups();
@@ -887,6 +905,8 @@ impl App {
             ("Go to File", "Ctrl+P", Message::OpenPalette(String::new())),
             ("Go to Line", "Ctrl+G", Message::OpenPalette(":".to_string())),
             ("Go to Definition", "F12", Message::GotoDefinition),
+            ("Find All References", "Shift+F12", Message::FindReferences),
+            ("Rename Symbol", "F2", Message::StartRename),
             ("Find", "Ctrl+F", Message::OpenFind { replace: false }),
             ("Replace", "Ctrl+H", Message::OpenFind { replace: true }),
             ("Search in Project", "Ctrl+Shift+F", Message::OpenSearch),
@@ -962,6 +982,7 @@ impl App {
                 let id = self.search.next_id;
                 self.search.running = Some(id);
                 self.search.error = None;
+                self.search.references = None;
                 let root = project.root.clone();
                 let query = self.search.query.clone();
                 // Unsaved edits are searched instead of the files on disk.
@@ -1210,7 +1231,14 @@ impl App {
 
     /// Applies an edit to the active tab and syncs it to the language server.
     fn apply_command(&mut self, command: Command) {
-        let Some(tab) = self.active.and_then(|i| self.tabs.get_mut(i)) else {
+        if let Some(index) = self.active {
+            self.edit_tab(index, command);
+        }
+    }
+
+    /// Applies an edit to any tab and syncs it to the language server.
+    fn edit_tab(&mut self, index: usize, command: Command) {
+        let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
         let before = tab.buffer.version();
@@ -1221,10 +1249,186 @@ impl App {
             if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
                 let _ = client.did_change(&tab.path, tab.version, &tab.buffer.text());
             }
-            if self.find.is_some() {
+            if self.find.is_some() && Some(index) == self.active {
                 self.recompute_find();
             }
         }
+    }
+
+    /// The identifier under the active tab's cursor, with the tab's path
+    /// and the cursor position.
+    fn symbol_at_cursor(&self) -> Option<(PathBuf, Pos, String)> {
+        let tab = self.active_tab()?;
+        let head = tab.buffer.primary().head;
+        let (start, end) = tab.buffer.word_range(head);
+        let word = tab.buffer.slice(start, end);
+        let is_word = word.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
+        is_word.then(|| (tab.path.clone(), tab.buffer.char_to_pos(head), word))
+    }
+
+    fn find_references(&mut self) {
+        let Some((client, _, _)) = self.lsp_target() else {
+            self.status = Some("Find references needs the language server and a GDScript file".to_string());
+            return;
+        };
+        let Some((path, pos, word)) = self.symbol_at_cursor() else {
+            self.status = Some("No symbol under the cursor".to_string());
+            return;
+        };
+        match client.references(&path, to_lsp(pos)) {
+            Ok(id) => {
+                self.pending.insert(id, Pending::References(word));
+            }
+            Err(error) => self.status = Some(format!("Find references failed: {error}")),
+        }
+    }
+
+    /// Lists reference locations in the search panel, grouped by file.
+    fn show_references(&mut self, name: String, locations: Vec<lsp_client::Location>) {
+        if locations.is_empty() {
+            self.status = Some(format!("No references to {name}"));
+            return;
+        }
+        let mut results: Vec<FileResult> = Vec::new();
+        for location in locations {
+            let index = match results.iter().position(|f| uri::same_path(&f.path, &location.path)) {
+                Some(index) => index,
+                None => {
+                    results.push(FileResult { path: location.path.clone(), lines: Vec::new() });
+                    results.len() - 1
+                }
+            };
+            let start = location.range.start;
+            results[index].lines.push(LineMatch {
+                line: start.line as usize,
+                column: start.character as usize,
+                text: String::new(),
+            });
+        }
+        // Line text from the open buffer, else from disk.
+        for file in &mut results {
+            file.lines.sort_by_key(|l| (l.line, l.column));
+            let text = match self.tabs.iter().find(|t| uri::same_path(&t.path, &file.path)) {
+                Some(tab) => tab.buffer.text(),
+                None => std::fs::read_to_string(&file.path).unwrap_or_default(),
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for line in &mut file.lines {
+                line.text = lines.get(line.line).map(|l| l.trim_end().to_string()).unwrap_or_default();
+            }
+        }
+        self.search.results = results;
+        self.search.references = Some(name);
+        self.search.running = None;
+        self.search.error = None;
+        self.show_panel(Panel::Search);
+        self.focus = Focus::Editor;
+    }
+
+    fn start_rename(&mut self) {
+        let Some((client, _, _)) = self.lsp_target() else {
+            self.status = Some("Rename needs the language server and a GDScript file".to_string());
+            return;
+        };
+        let Some((path, pos, word)) = self.symbol_at_cursor() else {
+            self.status = Some("No symbol under the cursor".to_string());
+            return;
+        };
+        match client.prepare_rename(&path, to_lsp(pos)) {
+            Ok(id) => {
+                self.pending.insert(id, Pending::PrepareRename { path, pos, word });
+            }
+            Err(error) => self.status = Some(format!("Rename failed: {error}")),
+        }
+    }
+
+    fn open_rename(&mut self, path: PathBuf, pos: Pos, word: String) -> Task<Message> {
+        self.rename = Some(Rename::new(path, pos, word));
+        self.find = None;
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        Task::batch([
+            iced::widget::operation::focus(rename::INPUT),
+            iced::widget::operation::select_all(rename::INPUT),
+        ])
+    }
+
+    fn on_rename(&mut self, message: RenameMessage) -> Task<Message> {
+        let Some(rename) = &mut self.rename else {
+            return Task::none();
+        };
+        match message {
+            RenameMessage::Input(name) => rename.name = name,
+            RenameMessage::Submit => {
+                let Some(to) = rename.valid_name().map(str::to_string) else {
+                    if rename.name.trim() == rename.original {
+                        self.close_rename();
+                    }
+                    return Task::none();
+                };
+                let Some(client) = self.lsp.client() else {
+                    self.status = Some("Language server is not connected".to_string());
+                    return Task::none();
+                };
+                match client.rename(&rename.path, to_lsp(rename.pos), &to) {
+                    Ok(id) => {
+                        let from = rename.original.clone();
+                        self.pending.insert(id, Pending::Rename { from, to });
+                    }
+                    Err(error) => self.status = Some(format!("Rename failed: {error}")),
+                }
+                self.close_rename();
+            }
+            RenameMessage::Close => self.close_rename(),
+        }
+        Task::none()
+    }
+
+    fn close_rename(&mut self) {
+        self.rename = None;
+        self.focus = Focus::Editor;
+    }
+
+    /// Applies a language server edit: open tabs are edited in place (one
+    /// undo step each, left unsaved), other files are rewritten on disk.
+    fn apply_workspace_edit(&mut self, from: &str, to: &str, files: Vec<(PathBuf, Vec<lsp_client::TextEdit>)>) {
+        let char_edits = |buffer: &Buffer, edits: &[lsp_client::TextEdit]| -> Vec<(usize, usize, String)> {
+            let at = |p: Position| buffer.pos_to_char(Pos { line: p.line as usize, column: p.character as usize });
+            edits.iter().map(|e| (at(e.range.start), at(e.range.end), e.new_text.clone())).collect()
+        };
+        let (mut count, mut file_count, mut errors) = (0, 0, Vec::new());
+        for (path, edits) in files {
+            match self.tabs.iter().position(|t| uri::same_path(&t.path, &path)) {
+                Some(index) => {
+                    let changes = char_edits(&self.tabs[index].buffer, &edits);
+                    self.edit_tab(index, Command::Replace(changes));
+                }
+                None => {
+                    let result = std::fs::read_to_string(&path).and_then(|text| {
+                        let mut buffer = Buffer::new(&text, Language::from_path(&path));
+                        buffer.apply(Command::Replace(char_edits(&buffer, &edits)));
+                        std::fs::write(&path, buffer.file_contents())
+                    });
+                    if let Err(error) = result {
+                        errors.push(format!("{}: {error}", self.display_path(&path)));
+                        continue;
+                    }
+                }
+            }
+            count += edits.len();
+            file_count += 1;
+        }
+        self.refresh_marks();
+        let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+        self.status = Some(match errors.first() {
+            Some(error) => format!("Rename incomplete, cannot write {error}"),
+            None if count == 0 => format!("Nothing to rename for {from}"),
+            None => format!(
+                "Renamed {from} to {to}: {} in {}",
+                plural(count, "occurrence"),
+                plural(file_count, "file")
+            ),
+        });
     }
 
     fn after_typing(&mut self, c: char) {
@@ -1366,8 +1570,20 @@ impl App {
         }
     }
 
-    fn on_response(&mut self, pending: Pending, id: u64, value: serde_json::Value) {
+    fn on_response(&mut self, pending: Pending, id: u64, value: serde_json::Value) -> Task<Message> {
         match pending {
+            Pending::References(name) => self.show_references(name, lsp_client::locations(&value)),
+            Pending::PrepareRename { path, pos, word } => {
+                // A range means the symbol can be renamed; null means it can't
+                // (e.g. a built-in class or method).
+                if lsp_client::range(&value).is_some() {
+                    return self.open_rename(path, pos, word);
+                }
+                self.status = Some(format!("{word} cannot be renamed"));
+            }
+            Pending::Rename { from, to } => {
+                self.apply_workspace_edit(&from, &to, lsp_client::workspace_edit(&value));
+            }
             Pending::Definition => match lsp_client::locations(&value).into_iter().next() {
                 Some(location) => {
                     let start = location.range.start;
@@ -1387,13 +1603,13 @@ impl App {
             }
             Pending::Resolve(index) => {
                 let Some(resolved) = lsp_client::completion_item(&value) else {
-                    return;
+                    return Task::none();
                 };
                 let Some(c) = &mut self.completion else {
-                    return;
+                    return Task::none();
                 };
                 let Some(item) = c.items.get_mut(index).filter(|i| i.label == resolved.label) else {
-                    return;
+                    return Task::none();
                 };
                 // Remember "no docs" too, so it isn't requested again.
                 item.documentation = Some(resolved.documentation.unwrap_or_default());
@@ -1412,9 +1628,10 @@ impl App {
                 });
             }
         }
+        Task::none()
     }
 
-    fn on_lsp(&mut self, event: LspEvent) {
+    fn on_lsp(&mut self, event: LspEvent) -> Task<Message> {
         match event {
             LspEvent::Connected { client, label } => {
                 for tab in self.tabs.iter().filter(|t| t.language == Language::GDScript) {
@@ -1432,15 +1649,16 @@ impl App {
             }
             LspEvent::Event(Event::Response { id, result }) => {
                 let Some(pending) = self.pending.remove(&id) else {
-                    return;
+                    return Task::none();
                 };
-                match result {
-                    Ok(value) => self.on_response(pending, id, value),
-                    Err(error) => {
-                        if matches!(pending, Pending::Definition) {
-                            self.status = Some(format!("Go to definition failed: {error}"));
-                        }
-                    }
+                match (result, pending) {
+                    (Ok(value), pending) => return self.on_response(pending, id, value),
+                    // A server without prepareRename: let it judge the rename itself.
+                    (Err(_), Pending::PrepareRename { path, pos, word }) => return self.open_rename(path, pos, word),
+                    (Err(error), Pending::Definition) => self.status = Some(format!("Go to definition failed: {error}")),
+                    (Err(error), Pending::References(_)) => self.status = Some(format!("Find references failed: {error}")),
+                    (Err(error), Pending::Rename { .. }) => self.status = Some(format!("Rename failed: {error}")),
+                    (Err(_), _) => {}
                 }
             }
             LspEvent::Event(Event::Disconnected(reason)) => {
@@ -1454,6 +1672,7 @@ impl App {
             }
             LspEvent::Event(Event::Notification { .. }) => {}
         }
+        Task::none()
     }
 
     /// Drops the current connection (stopping a spawned Godot) and lets the
@@ -1547,6 +1766,7 @@ impl App {
         });
         self.tabs.clear();
         self.active = None;
+        self.rename = None;
         // A shell or game started for the previous project is stale.
         self.reset_terminal();
         self.run = RunState::default();
@@ -1785,6 +2005,10 @@ impl App {
             .focused(self.focus == Focus::Editor);
 
         let mut area = column![self.tab_bar()];
+        if let Some(rename) = &self.rename {
+            let bar = rename.view(&self.current_theme().ui).map(Message::Rename);
+            area = area.push(on_escape::on_escape(bar, Message::Rename(RenameMessage::Close)));
+        }
         let editor = match &self.find {
             Some(find) => {
                 let bar = find.view(&self.current_theme().ui).map(Message::Find);
@@ -2034,7 +2258,9 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Event::KeyReleased { .. } => return None,
     };
     match key.as_ref() {
+        keyboard::Key::Named(keyboard::key::Named::F12) if modifiers.shift() => Some(Message::FindReferences),
         keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
+        keyboard::Key::Named(keyboard::key::Named::F2) => Some(Message::StartRename),
         keyboard::Key::Named(keyboard::key::Named::F3) if modifiers.shift() => {
             Some(Message::Find(FindMessage::Previous))
         }

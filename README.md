@@ -17,6 +17,7 @@ cargo test                                # run unit tests
 ```
 
 Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to definition,
+`Shift+F12` find references, `F2` rename symbol,
 `Ctrl+Space` completion, `Ctrl+J` (or `Ctrl+²`) toggle terminal, `F5` run project,
 `F6` run current scene, `F8` stop, `Ctrl+F` find, `Ctrl+H` replace, `Ctrl+Shift+F` search in project,
 `Ctrl+P` go to file, `Ctrl+Shift+P` command palette, `Ctrl+G` go to line.
