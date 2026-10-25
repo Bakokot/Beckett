@@ -25,7 +25,6 @@ use crate::style::to_color;
 
 const BLINK_MILLIS: u128 = 500;
 const HOVER_DELAY: Duration = Duration::from_millis(500);
-const LINE_HEIGHT_FACTOR: f32 = 1.4;
 const COMPLETION_ROWS: usize = 10;
 const DOC_FONT_SIZE: f32 = 13.0;
 const POPUP_PADDING: f32 = 8.0;
@@ -177,7 +176,7 @@ pub struct CodeEditor<'a, Message> {
     on_event: Box<dyn Fn(EditorEvent) -> Message + 'a>,
     marks: &'a [Mark],
     colors: Colors,
-    font_size: f32,
+    font: CodeFont,
     completion: Option<CompletionPopup<'a>>,
     hover: Option<HoverPopup<'a>>,
     signature: Option<SignaturePopup<'a>>,
@@ -203,7 +202,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
             on_event: Box::new(on_event),
             marks: &[],
             colors,
-            font_size: 14.0,
+            font: CodeFont::default(),
             completion: None,
             hover: None,
             signature: None,
@@ -228,6 +227,11 @@ impl<'a, Message> CodeEditor<'a, Message> {
     pub fn highlights(mut self, ranges: &'a [(usize, usize)], current: Option<usize>) -> Self {
         self.highlights = ranges;
         self.current_highlight = current;
+        self
+    }
+
+    pub fn font(mut self, font: CodeFont) -> Self {
+        self.font = font;
         self
     }
 
@@ -263,9 +267,56 @@ impl<'a, Message> CodeEditor<'a, Message> {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Metrics {
+    pub(crate) font: Font,
     pub(crate) font_size: f32,
     pub(crate) char_width: f32,
     pub(crate) line_height: f32,
+    /// Shape all text, so the font's ligatures apply.
+    pub(crate) ligatures: bool,
+}
+
+/// The code font as the editor and the terminal draw it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CodeFont {
+    pub font: Font,
+    pub size: f32,
+    /// Line height as a multiple of `size`.
+    pub line_height: f32,
+    pub ligatures: bool,
+}
+
+impl CodeFont {
+    pub fn from_settings(settings: &theme::FontSettings) -> Self {
+        let settings = settings.sanitized();
+        Self {
+            font: settings.family.as_deref().map_or(Font::MONOSPACE, font_family),
+            size: settings.size,
+            line_height: settings.line_height,
+            ligatures: settings.ligatures,
+        }
+    }
+}
+
+impl Default for CodeFont {
+    fn default() -> Self {
+        Self::from_settings(&theme::FontSettings::default())
+    }
+}
+
+/// A font by family name. iced wants `&'static str` names, so each distinct
+/// name is leaked once and reused.
+fn font_family(name: &str) -> Font {
+    static NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut names = NAMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let name = match names.iter().find(|n| **n == name) {
+        Some(known) => *known,
+        None => {
+            let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+            names.push(leaked);
+            leaked
+        }
+    };
+    Font { family: iced::font::Family::Name(name), ..Font::MONOSPACE }
 }
 
 /// Tracks the mouse resting over text, for hover requests.
@@ -289,6 +340,8 @@ struct State {
     seen_reveal: u64,
     metrics: Option<Metrics>,
     hover: Option<HoverTrack>,
+    /// Font the metrics were measured for.
+    font: Option<CodeFont>,
     /// Mouse position over the editor, for Ctrl+hover links.
     mouse: Option<Point>,
     /// Word range (char indices) last reported with `LinkHover`.
@@ -314,6 +367,7 @@ impl State {
             seen_reveal: u64::MAX,
             metrics: None,
             hover: None,
+            font: None,
             mouse: None,
             link_sent: None,
             box_anchor: None,
@@ -675,8 +729,9 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
-        if state.metrics.is_none_or(|m| m.font_size != self.font_size) {
-            state.metrics = Some(measure(self.font_size));
+        if state.font != Some(self.font) {
+            state.font = Some(self.font);
+            state.metrics = Some(measure(self.font));
         }
         layout::Node::new(limits.resolve(Length::Fill, Length::Fill, Size::ZERO))
     }
@@ -1123,14 +1178,16 @@ impl<'a, Message: 'a> From<CodeEditor<'a, Message>> for Element<'a, Message> {
     }
 }
 
-pub(crate) fn measure(font_size: f32) -> Metrics {
+pub(crate) fn measure(code: CodeFont) -> Metrics {
     const SAMPLE: &str = "MMMMMMMMMMMMMMMMMMMM";
-    let line_height = (font_size * LINE_HEIGHT_FACTOR).round();
-    let paragraph = paragraph(SAMPLE, Font::MONOSPACE, font_size, line_height, f32::INFINITY);
+    let line_height = (code.size * code.line_height).round();
+    let paragraph = paragraph(SAMPLE, code.font, code.size, line_height, f32::INFINITY);
     Metrics {
-        font_size,
+        font: code.font,
+        font_size: code.size,
         char_width: paragraph.min_width() / SAMPLE.len() as f32,
         line_height,
+        ligatures: code.ligatures,
     }
 }
 
@@ -1159,7 +1216,7 @@ fn doc_height(doc: &Doc, width: f32, metrics: Metrics) -> f32 {
     let inner = width - POPUP_PADDING * 2.0;
     let mut height = POPUP_PADDING * 2.0;
     if let Some(signature) = &doc.signature {
-        height += paragraph(signature, Font::MONOSPACE, metrics.font_size, metrics.line_height, inner).min_height();
+        height += paragraph(signature, metrics.font, metrics.font_size, metrics.line_height, inner).min_height();
     }
     if !doc.body.is_empty() {
         if doc.signature.is_some() {
@@ -1200,8 +1257,8 @@ fn draw_doc(renderer: &mut iced::Renderer, doc: &Doc, rect: Rectangle, colors: &
     };
     if let Some(signature) = &doc.signature {
         let function = to_color(colors.syntax.function);
-        wrapped(renderer, signature, Font::MONOSPACE, metrics.font_size, metrics.line_height, function, y);
-        y += paragraph(signature, Font::MONOSPACE, metrics.font_size, metrics.line_height, inner).min_height() + 6.0;
+        wrapped(renderer, signature, metrics.font, metrics.font_size, metrics.line_height, function, y);
+        y += paragraph(signature, metrics.font, metrics.font_size, metrics.line_height, inner).min_height() + 6.0;
     }
     if !doc.body.is_empty() {
         wrapped(renderer, &doc.body, Font::DEFAULT, DOC_FONT_SIZE, doc_line_height(), colors.text, y);
@@ -1242,14 +1299,16 @@ fn draw_text(
     metrics: Metrics,
     clip: Rectangle,
 ) {
-    let shaping = if content.is_ascii() { text::Shaping::Basic } else { text::Shaping::Advanced };
+    // Basic shaping is faster but skips ligatures.
+    let basic = content.is_ascii() && !metrics.ligatures;
+    let shaping = if basic { text::Shaping::Basic } else { text::Shaping::Advanced };
     renderer.fill_text(
         text::Text {
             content,
             bounds: Size::new(f32::INFINITY, metrics.line_height),
             size: Pixels(metrics.font_size),
             line_height: text::LineHeight::Absolute(Pixels(metrics.line_height)),
-            font: Font::MONOSPACE,
+            font: metrics.font,
             align_x: text::Alignment::Left,
             align_y: alignment::Vertical::Top,
             shaping,

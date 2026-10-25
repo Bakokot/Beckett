@@ -18,7 +18,7 @@ use terminal::{
     SelectionKind, Terminal,
 };
 
-use crate::code_editor::{measure, Metrics};
+use crate::code_editor::{measure, CodeFont, Metrics};
 
 const PADDING: f32 = 6.0;
 
@@ -28,7 +28,7 @@ pub struct TerminalView<'a, Message> {
     selection: Color,
     focused: bool,
     on_focus: Message,
-    font_size: f32,
+    font: CodeFont,
 }
 
 impl<'a, Message: Clone> TerminalView<'a, Message> {
@@ -39,8 +39,13 @@ impl<'a, Message: Clone> TerminalView<'a, Message> {
             selection: Color::from_rgba8(0x47, 0x8c, 0xbf, 0.4),
             focused: false,
             on_focus,
-            font_size: 14.0,
+            font: CodeFont::default(),
         }
+    }
+
+    pub fn font(mut self, font: CodeFont) -> Self {
+        self.font = font;
+        self
     }
 
     pub fn focused(mut self, focused: bool) -> Self {
@@ -57,6 +62,8 @@ impl<'a, Message: Clone> TerminalView<'a, Message> {
 #[derive(Default)]
 struct State {
     metrics: Option<Metrics>,
+    /// Font the metrics were measured for.
+    font: Option<CodeFont>,
     modifiers: Modifiers,
     dragging: bool,
     moved: bool,
@@ -160,7 +167,13 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
         limits: &layout::Limits,
     ) -> layout::Node {
         let state = tree.state.downcast_mut::<State>();
-        let metrics = *state.metrics.get_or_insert_with(|| measure(self.font_size));
+        if state.font != Some(self.font) {
+            state.font = Some(self.font);
+            state.metrics = Some(measure(self.font));
+        }
+        let Some(metrics) = state.metrics else {
+            return layout::Node::new(Size::ZERO);
+        };
         let size = limits.resolve(Length::Fill, Length::Fill, Size::ZERO);
         let columns = ((size.width - PADDING * 2.0) / metrics.char_width).floor().max(2.0) as usize;
         let lines = ((size.height - PADDING * 2.0) / metrics.line_height).floor().max(1.0) as usize;
@@ -503,9 +516,10 @@ fn draw_text(
     let font = Font {
         weight: if bold { font::Weight::Bold } else { font::Weight::Normal },
         style: if italic { font::Style::Italic } else { font::Style::Normal },
-        ..Font::MONOSPACE
+        ..metrics.font
     };
-    let shaping = if content.is_ascii() { text::Shaping::Basic } else { text::Shaping::Advanced };
+    let basic = content.is_ascii() && !metrics.ligatures;
+    let shaping = if basic { text::Shaping::Basic } else { text::Shaping::Advanced };
     renderer.fill_text(
         text::Text {
             content,

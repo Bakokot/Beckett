@@ -25,6 +25,49 @@ pub struct Theme {
     /// ANSI colors for the integrated terminal.
     #[serde(default)]
     pub terminal: TerminalColors,
+    /// Editor and terminal font.
+    #[serde(default)]
+    pub font: FontSettings,
+}
+
+/// The code font, used by the editor and the terminal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FontSettings {
+    /// A font installed on the system; the default monospace font when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    pub size: f32,
+    /// Line height as a multiple of the font size.
+    pub line_height: f32,
+    /// Programming ligatures (`->`, `!=`, `>=`…) for fonts that have them.
+    pub ligatures: bool,
+}
+
+impl FontSettings {
+    pub const SIZES: std::ops::RangeInclusive<f32> = 8.0..=32.0;
+    pub const LINE_HEIGHTS: std::ops::RangeInclusive<f32> = 1.0..=2.5;
+
+    /// The same settings with sizes kept to usable values (theme files
+    /// are hand-edited and shared).
+    pub fn sanitized(&self) -> Self {
+        let clamp = |value: f32, range: &std::ops::RangeInclusive<f32>, default: f32| {
+            if value.is_finite() { value.clamp(*range.start(), *range.end()) } else { default }
+        };
+        let defaults = Self::default();
+        Self {
+            family: self.family.as_ref().map(|f| f.trim().to_string()).filter(|f| !f.is_empty()),
+            size: clamp(self.size, &Self::SIZES, defaults.size),
+            line_height: clamp(self.line_height, &Self::LINE_HEIGHTS, defaults.line_height),
+            ligatures: self.ligatures,
+        }
+    }
+}
+
+impl Default for FontSettings {
+    fn default() -> Self {
+        Self { family: None, size: 14.0, line_height: 1.4, ligatures: false }
+    }
 }
 
 /// The 16 ANSI colors; foreground/background come from `ui`.
@@ -159,9 +202,19 @@ pub fn builtin() -> Vec<Theme> {
         .collect()
 }
 
+/// The IDE's config folder: `GODOT_IDE_CONFIG_DIR` when set (a portable
+/// install, or tests that must not touch the user's settings), else
+/// `godot-ide` in the platform config folder.
+pub fn config_dir() -> Option<PathBuf> {
+    match std::env::var_os("GODOT_IDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => Some(dirs::config_dir()?.join("godot-ide")),
+    }
+}
+
 /// Directory users drop shared `.toml` themes into.
 pub fn user_themes_dir() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("godot-ide").join("themes"))
+    Some(config_dir()?.join("themes"))
 }
 
 #[derive(Debug)]
@@ -219,6 +272,22 @@ pub fn load_dir(dir: &Path) -> (Vec<(PathBuf, Theme)>, Vec<LoadError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_section_is_optional_and_sanitized() {
+        // Themes written before fonts existed get the defaults.
+        let old = builtin().remove(0).to_toml().unwrap().replace("[font]", "[unused]");
+        assert_eq!(Theme::from_toml(&old).unwrap().font, FontSettings::default());
+
+        let mut theme = builtin().remove(0);
+        theme.font = FontSettings { family: Some("Fira Code".into()), size: 15.0, line_height: 1.6, ligatures: true };
+        let back = Theme::from_toml(&theme.to_toml().unwrap()).unwrap();
+        assert_eq!(back.font, theme.font);
+
+        let wild = FontSettings { family: Some("  ".into()), size: 200.0, line_height: f32::NAN, ligatures: false };
+        let sane = wild.sanitized();
+        assert_eq!((sane.family, sane.size, sane.line_height), (None, 32.0, 1.4));
+    }
 
     #[test]
     fn builtins_parse_and_round_trip() {

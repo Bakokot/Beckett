@@ -37,6 +37,10 @@ pub enum ThemeMessage {
     Brightness(f32),
     Opacity(f32),
     Name(String),
+    FontFamily(String),
+    FontSize(f32),
+    LineHeight(f32),
+    ToggleLigatures,
     Save,
     Revert,
     Close,
@@ -166,6 +170,13 @@ impl ThemeEditor {
             ThemeMessage::Brightness(v) => self.set_hsv(Hsv { v: *v, ..self.hsv }),
             ThemeMessage::Opacity(a) => self.set_hsv(Hsv { a: *a, ..self.hsv }),
             ThemeMessage::Name(name) => self.draft.name = name.clone(),
+            // Kept as typed (the editor sanitizes when it applies the font).
+            ThemeMessage::FontFamily(family) => {
+                self.draft.font.family = (!family.is_empty()).then(|| family.clone());
+            }
+            ThemeMessage::FontSize(size) => self.draft.font.size = *size,
+            ThemeMessage::LineHeight(height) => self.draft.font.line_height = (height * 20.0).round() / 20.0,
+            ThemeMessage::ToggleLigatures => self.draft.font.ligatures = !self.draft.font.ligatures,
             _ => return false,
         }
         self.dirty = true;
@@ -221,13 +232,35 @@ impl ThemeEditor {
         .spacing(10)
         .align_y(Alignment::Center);
 
+        let font = &self.draft.font;
+        let ligatures = if font.ligatures { "Ligatures: on" } else { "Ligatures: off" };
+        let font_row = row![
+            text("FONT").size(12),
+            text_input("Default monospace", font.family.as_deref().unwrap_or(""))
+                .on_input(ThemeMessage::FontFamily)
+                .size(13)
+                .padding([3, 6])
+                .width(220),
+            text("Size").size(12),
+            slider(theme::FontSettings::SIZES, font.size, ThemeMessage::FontSize).step(1.0_f32).width(140),
+            text(format!("{:.0}", font.size)).size(12).font(Font::MONOSPACE).width(24),
+            text("Line height").size(12),
+            slider(theme::FontSettings::LINE_HEIGHTS, font.line_height, ThemeMessage::LineHeight)
+                .step(0.05_f32)
+                .width(140),
+            text(format!("{:.2}", font.line_height)).size(12).font(Font::MONOSPACE).width(34),
+            action(ligatures, ThemeMessage::ToggleLigatures, "Join character pairs like -> and != into one glyph, for fonts that have them (Fira Code, JetBrains Mono, Cascadia Code)"),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
         let body = row![
             scrollable(self.slot_list()).width(Length::Fill).height(Length::Fill),
             container(self.picker()).width(380).height(Length::Fill),
         ]
         .spacing(12);
 
-        container(column![header, share, body].spacing(10))
+        container(column![header, share, font_row, body].spacing(10))
             .padding(12)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -319,6 +352,7 @@ impl ThemeEditor {
             text("Preview").size(12).color(muted),
             container(
                 CodeEditor::new(&self.sample, code_editor::Colors::from_theme(&self.draft), |_| ThemeMessage::Ignore)
+                    .font(code_editor::CodeFont::from_settings(&self.draft.font))
                     .focused(false),
             )
             .height(250),

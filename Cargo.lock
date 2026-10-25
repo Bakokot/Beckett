@@ -1196,6 +1196,7 @@ dependencies = [
  "lsp-client",
  "notify",
  "rfd",
+ "serde",
  "serde_json",
  "terminal",
  "theme",

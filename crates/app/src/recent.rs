@@ -38,7 +38,7 @@ impl RecentProject {
 }
 
 fn file() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("godot-ide").join("recent-projects.txt"))
+    Some(theme::config_dir()?.join("recent-projects.txt"))
 }
 
 /// The saved list, with each project's name read from its project.godot.

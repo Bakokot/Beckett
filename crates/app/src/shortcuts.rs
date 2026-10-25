@@ -21,6 +21,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Shift+P", "Command palette"),
             ("Ctrl+G", "Go to line (type :line or :line:column)"),
             ("F1", "Keyboard shortcuts (this page)"),
+            ("Ctrl+= / Ctrl+- / Ctrl+0", "Zoom the interface in / out / back to 100%"),
         ],
     ),
     (

@@ -164,7 +164,9 @@ crates/
       input, code + terminal preview; the whole IDE updates live; built-ins are saved as a copy
 - [x] Built-in themes: Godot Dark (Godot editor colors) and Godot Light
 - [x] Theme export/import: .toml file dialogs, drag & drop a .toml on the window
-- [ ] Custom fonts, ligatures, line height, UI scale
+- [x] Custom font family, size, line height and ligatures (theme `[font]` section, theme editor row)
+- [x] UI zoom (Ctrl+= / Ctrl+- / Ctrl+0, saved in settings.json); selected theme remembered;
+      `GODOT_IDE_CONFIG_DIR` overrides the config folder — fonts/zoom not yet checked on screen
 
 **Workspace**
 - [x] Command palette (Ctrl+Shift+P, or `>` in the box): ~35 commands incl. editor actions and themes

@@ -13,6 +13,7 @@ mod problems;
 mod recent;
 mod rename;
 mod runner;
+mod settings;
 mod shortcuts;
 mod splitter;
 mod style;
@@ -57,6 +58,7 @@ fn main() -> iced::Result {
     iced::application(move || App::new(initial.clone()), App::update, App::view)
         .title(App::title)
         .theme(App::theme)
+        .scale_factor(App::scale_factor)
         .subscription(App::subscription)
         .window_size(WINDOW_SIZE)
         .run()
@@ -100,6 +102,9 @@ pub enum Message {
     /// The splitter above the bottom panel moved by this many pixels.
     ResizePanel(f32),
     WindowResized(f32),
+    /// Zoom the interface in (positive) or out by this many steps.
+    Zoom(i32),
+    ZoomReset,
     /// Run the main scene (F5).
     RunProject,
     /// Run the scene of the active tab (F6).
@@ -225,6 +230,7 @@ struct App {
     project: Option<Project>,
     /// Recently opened projects, most recent first.
     recent: Vec<recent::RecentProject>,
+    settings: settings::Settings,
     tabs: Vec<Tab>,
     active: Option<usize>,
     themes: Vec<theme::Theme>,
@@ -321,15 +327,18 @@ impl App {
                 status = Some(format!("Theme error: {error}"));
             }
         }
-        let iced_theme = style::iced_theme(&themes[0]);
+        let settings = settings::Settings::load();
+        let theme_index = settings.theme.as_ref().and_then(|name| themes.iter().position(|t| &t.name == name)).unwrap_or(0);
+        let iced_theme = style::iced_theme(&themes[theme_index]);
 
         let mut app = Self {
             project: None,
             recent: recent::load(),
+            settings,
             tabs: Vec::new(),
             active: None,
             themes,
-            theme_index: 0,
+            theme_index,
             iced_theme,
             pending_close: None,
             status,
@@ -384,6 +393,20 @@ impl App {
         self.iced_theme.clone()
     }
 
+    fn scale_factor(&self) -> f32 {
+        self.settings.ui_scale
+    }
+
+    /// Changes the interface zoom and saves it.
+    fn set_zoom(&mut self, change: impl FnOnce(&mut settings::Settings)) {
+        change(&mut self.settings);
+        let percent = (self.settings.ui_scale * 100.0).round();
+        self.status = Some(match self.settings.save() {
+            Ok(()) => format!("Zoom {percent}% (Ctrl+0 resets)"),
+            Err(error) => format!("Zoom {percent}%, not saved: {error}"),
+        });
+    }
+
     /// The theme in effect: the theme editor's draft while it is open.
     fn current_theme(&self) -> &theme::Theme {
         match &self.theme_editor {
@@ -396,6 +419,12 @@ impl App {
     fn apply_theme(&mut self) {
         self.iced_theme = style::iced_theme(self.current_theme());
         self.refresh_marks();
+        // Remember the selected theme (not the editor's draft) for next start.
+        let name = &self.themes[self.theme_index].name;
+        if self.settings.theme.as_ref() != Some(name) {
+            self.settings.theme = Some(name.clone());
+            let _ = self.settings.save();
+        }
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -608,6 +637,8 @@ impl App {
             // Dragging the splitter up makes the panel taller.
             Message::ResizePanel(delta) => self.panel_height = (self.panel_height() - delta).max(MIN_PANEL_HEIGHT),
             Message::WindowResized(height) => self.window_height = height,
+            Message::Zoom(steps) => self.set_zoom(|s| s.zoom(steps)),
+            Message::ZoomReset => self.set_zoom(|s| s.ui_scale = 1.0),
             Message::ClosePanel => {
                 self.panel = None;
                 self.focus = Focus::Editor;
@@ -1047,6 +1078,9 @@ impl App {
             ("Run: Stop", "F8", Message::StopRun),
             ("Godot: Open in Editor", "", Message::OpenInGodot),
             ("View: Toggle Terminal", "Ctrl+J", Message::ToggleTerminal),
+            ("View: Zoom In", "Ctrl+=", Message::Zoom(1)),
+            ("View: Zoom Out", "Ctrl+-", Message::Zoom(-1)),
+            ("View: Reset Zoom", "Ctrl+0", Message::ZoomReset),
             ("View: Problems", "", Message::ShowPanel(Panel::Problems)),
             ("View: Output", "", Message::ShowPanel(Panel::Output)),
             ("View: Search Results", "", Message::ShowPanel(Panel::Search)),
@@ -2659,6 +2693,7 @@ impl App {
             anchor: s.anchor,
         });
         let editor = CodeEditor::new(&tab.buffer, colors, Message::Edit)
+            .font(code_editor::CodeFont::from_settings(&self.current_theme().font))
             .marks(&tab.marks)
             .completion(completion)
             .hover(hover)
@@ -2727,6 +2762,7 @@ impl App {
             Panel::Output => self.output_view(),
             Panel::Terminal => match &self.terminal.session {
                 Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
+                    .font(code_editor::CodeFont::from_settings(&theme.font))
                     .focused(self.focus == Focus::Terminal)
                     .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
                     .into(),
@@ -2938,6 +2974,10 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
         keyboard::Key::Named(keyboard::key::Named::F2) => Some(Message::StartRename),
         keyboard::Key::Named(keyboard::key::Named::F1) => Some(Message::OpenShortcuts),
+        // Zoom: Ctrl+= (or Ctrl++), Ctrl+-, Ctrl+0, also on the numeric keypad.
+        keyboard::Key::Character("=" | "+") if modifiers.command() => Some(Message::Zoom(1)),
+        keyboard::Key::Character("-") if modifiers.command() => Some(Message::Zoom(-1)),
+        keyboard::Key::Character("0") if modifiers.command() => Some(Message::ZoomReset),
         keyboard::Key::Named(keyboard::key::Named::F3) if modifiers.shift() => {
             Some(Message::Find(FindMessage::Previous))
         }
