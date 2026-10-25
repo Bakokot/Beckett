@@ -206,6 +206,49 @@ pub fn classify(text: String, previous: LineKind) -> OutputLine {
     OutputLine { text, kind, link }
 }
 
+/// An error or warning the running game printed, with where it happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProblem {
+    pub res_path: String,
+    /// 1-based.
+    pub line: u32,
+    pub message: String,
+    pub error: bool,
+}
+
+/// Pairs each `ERROR:`/`WARNING:` header line with the first `res://`
+/// location after it (`at: …`, backtrace) — or on it, for parse errors.
+#[derive(Default)]
+pub struct RuntimeParser {
+    /// Header waiting for its location: (message, is error).
+    pending: Option<(String, bool)>,
+}
+
+impl RuntimeParser {
+    pub fn push(&mut self, line: &OutputLine) -> Option<RuntimeProblem> {
+        let header = !line.text.starts_with([' ', '\t']) && matches!(line.kind, LineKind::Error | LineKind::Warning);
+        if header {
+            let message = strip_prefixes(line.text.trim());
+            self.pending = Some((message, line.kind == LineKind::Error));
+        } else if !matches!(line.kind, LineKind::Error | LineKind::Warning) {
+            // The block ended without pointing into the project (engine error).
+            self.pending = None;
+            return None;
+        }
+        let (res_path, number) = line.link.clone()?;
+        let (message, error) = self.pending.take()?;
+        Some(RuntimeProblem { res_path, line: number, message, error })
+    }
+}
+
+/// `SCRIPT ERROR: Invalid call…` → `Invalid call…`.
+fn strip_prefixes(text: &str) -> String {
+    const PREFIXES: [&str; 7] =
+        ["SCRIPT ERROR:", "USER ERROR:", "ERROR:", "Parse Error:", "USER WARNING:", "SCRIPT WARNING:", "WARNING:"];
+    let rest = PREFIXES.iter().find_map(|p| text.strip_prefix(p)).unwrap_or(text);
+    rest.trim().to_string()
+}
+
 /// Finds the first `res://path:line` in a line of output.
 pub fn find_link(text: &str) -> Option<(String, u32)> {
     let start = text.find("res://")?;
@@ -274,6 +317,45 @@ mod tests {
         assert_eq!(find_link("res://a.gd:3:7 - Parse Error"), Some(("res://a.gd".into(), 3)));
         assert_eq!(find_link("Loading res://icon.svg"), None);
         assert_eq!(find_link("no link here"), None);
+    }
+
+    #[test]
+    fn pairs_runtime_errors_with_their_location() {
+        let mut parser = RuntimeParser::default();
+        let mut feed = |lines: &[&str]| -> Vec<RuntimeProblem> {
+            let mut previous = LineKind::Normal;
+            let mut found = Vec::new();
+            for text in lines {
+                let line = classify(text.to_string(), previous);
+                previous = line.kind;
+                found.extend(parser.push(&line));
+            }
+            found
+        };
+        let found = feed(&[
+            "SCRIPT ERROR: Invalid call. Nonexistent function 'foo' in base 'Node'.",
+            "          at: _ready (res://player.gd:5)",
+            "          GDScript backtrace (most recent call first):",
+            "              [0] _ready (res://player.gd:5)",
+            "Hello",
+            "ERROR: Condition \"!is_inside_tree()\" is true.",
+            "   at: get_global_transform (scene/2d/node_2d.cpp:42)",
+            "USER WARNING: low health",
+            "   at: push_warning (core/variant/variant_utility.cpp:1)",
+            "   GDScript backtrace (most recent call first):",
+            "       [0] hurt (res://enemy.gd:30)",
+        ]);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].res_path, "res://player.gd");
+        assert_eq!(found[0].line, 5);
+        assert_eq!(found[0].message, "Invalid call. Nonexistent function 'foo' in base 'Node'.");
+        assert!(found[0].error);
+        assert_eq!((found[1].res_path.as_str(), found[1].line, found[1].error), ("res://enemy.gd", 30, false));
+        assert_eq!(found[1].message, "low health");
+
+        // Parse errors carry their location on the header line.
+        let found = feed(&["Parse Error: res://a.gd:3 - Expected end of statement."]);
+        assert_eq!(found[0].line, 3);
     }
 
     #[test]

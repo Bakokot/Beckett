@@ -129,7 +129,8 @@ crates/
       `.uid`, `.import` and scene headers; binary assets open in the default app); `res://` path
       completion in strings and `load(`/`preload(` (fuzzy on the path; Godot's own file items dropped);
       holding Ctrl underlines clickable targets (paths that exist, words with a definition)
-- [ ] "Open in Godot editor" for current scene
+- [x] "Open in Godot editor" (status bar "Godot" / palette): starts the editor at the current scene
+      (or the scene using the current script); refused when an attached editor is already open
 
 **Run** — `app/src/runner.rs`
 - [x] F5 run project, F6 run current scene (a `.tscn`, or the scene a `.gd` is attached to),
@@ -138,7 +139,8 @@ crates/
       `res://…:line` links, exit code; the game (and its child process) dies with the IDE
 - [x] Bottom panel is now tabbed: Problems / Output / Terminal
 - [ ] Pick among several scenes using the same script (currently the first one)
-- [ ] Feed runtime errors into the Problems panel
+- [x] Runtime errors and warnings in the Problems panel and inline (paired with the first
+      `res://` location after them, repeats counted, cleared on the next run)
 
 **Terminal** — `terminal` crate (`alacritty_terminal` + ConPTY), panel widget in `app`
 - [x] Integrated PTY terminal (PowerShell 7 if installed, else Windows PowerShell; login shell elsewhere)

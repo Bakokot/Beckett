@@ -99,6 +99,8 @@ pub enum Message {
     RunProject,
     /// Run the scene of the active tab (F6).
     RunScene,
+    /// Open the project, at the current scene, in the Godot editor.
+    OpenInGodot,
     StopRun,
     Run(RunEvent),
     ClearOutput,
@@ -167,6 +169,8 @@ struct RunState {
     /// Dropping it stops the game.
     handle: Option<std::sync::Arc<RunHandle>>,
     output: Vec<OutputLine>,
+    /// Picks runtime errors out of the output for the Problems panel.
+    problems: runner::RuntimeParser,
     next_id: u64,
     /// Godot binary for running, found on first use.
     godot: Option<PathBuf>,
@@ -570,6 +574,7 @@ impl App {
                 self.focus = Focus::Editor;
             }
             Message::RunProject => self.start_run(None),
+            Message::OpenInGodot => self.open_in_godot(),
             Message::RunScene => match self.current_scene() {
                 Ok(scene) => self.start_run(Some(scene)),
                 Err(reason) => self.status = Some(reason),
@@ -998,6 +1003,7 @@ impl App {
             ("Run: Project", "F5", Message::RunProject),
             ("Run: Current Scene", "F6", Message::RunScene),
             ("Run: Stop", "F8", Message::StopRun),
+            ("Godot: Open in Editor", "", Message::OpenInGodot),
             ("View: Toggle Terminal", "Ctrl+J", Message::ToggleTerminal),
             ("View: Problems", "", Message::ShowPanel(Panel::Problems)),
             ("View: Output", "", Message::ShowPanel(Panel::Output)),
@@ -1143,6 +1149,41 @@ impl App {
         godot.to_res_path(scene).ok_or_else(|| "Scene is outside the project".to_string())
     }
 
+    /// Starts the Godot editor on the project, opening the current scene
+    /// (the scene itself, or the one the current script is attached to).
+    fn open_in_godot(&mut self) {
+        let Some(project) = &self.project else {
+            return;
+        };
+        let Some(godot) = &project.godot else {
+            self.status = Some("Not a Godot project (no project.godot)".to_string());
+            return;
+        };
+        let attached = self.lsp.client().is_some_and(|c| matches!(c.server(), lsp_client::Server::Attached { .. }));
+        if attached {
+            self.status = Some("The Godot editor is already open on this project".to_string());
+            return;
+        }
+        let installs = lsp_client::godot::discover();
+        let Some(install) = lsp_client::godot::pick(&installs, godot.godot_version().as_deref()) else {
+            self.status = Some("No Godot executable found (set GODOT_BIN)".to_string());
+            return;
+        };
+        let scene = self.current_scene().ok();
+        let mut command = std::process::Command::new(&install.path);
+        command.arg("--editor").arg("--path").arg(&project.root);
+        if let Some(scene) = &scene {
+            command.arg(scene);
+        }
+        self.status = Some(match command.spawn() {
+            Ok(_) => match scene {
+                Some(scene) => format!("Opening {scene} in the Godot editor"),
+                None => "Opening the project in the Godot editor".to_string(),
+            },
+            Err(error) => format!("Cannot start Godot: {error}"),
+        });
+    }
+
     fn start_run(&mut self, scene: Option<String>) {
         let Some(project) = &self.project else {
             return;
@@ -1169,6 +1210,9 @@ impl App {
         self.run.next_id += 1;
         let request = RunRequest { id: self.run.next_id, godot: exe, root, scene };
         self.run.output.clear();
+        self.run.problems = runner::RuntimeParser::default();
+        self.problems.clear_runtime();
+        self.refresh_marks();
         self.push_output(OutputLine::info(format!("> {}", request.command_line())));
         self.run.request = Some(request);
         self.show_panel(Panel::Output);
@@ -1177,7 +1221,12 @@ impl App {
     fn on_run(&mut self, event: RunEvent) {
         match event {
             RunEvent::Started(handle) => self.run.handle = Some(handle),
-            RunEvent::Line(line) => self.push_output(line),
+            RunEvent::Line(line) => {
+                if let Some(problem) = self.run.problems.push(&line) {
+                    self.add_runtime_problem(problem);
+                }
+                self.push_output(line);
+            }
             RunEvent::Exited(code) => {
                 let message = match code {
                     Some(code) => format!("Process exited with code {code}"),
@@ -1192,6 +1241,15 @@ impl App {
                 self.run.request = None;
             }
         }
+    }
+
+    fn add_runtime_problem(&mut self, problem: runner::RuntimeProblem) {
+        let path = self.project.as_ref().and_then(|p| p.godot.as_ref()).and_then(|g| g.resolve(&problem.res_path));
+        let Some(path) = path else {
+            return;
+        };
+        self.problems.add_runtime(path, problem.line.saturating_sub(1), problem.message, problem.error);
+        self.refresh_marks();
     }
 
     fn on_files_changed(&mut self, paths: &[PathBuf]) {
@@ -1987,7 +2045,9 @@ impl App {
             tab.marks = self
                 .problems
                 .for_path(&tab.path)
-                .iter()
+                .into_iter()
+                // Runtime lines may be stale after edits.
+                .filter(|d| (d.range.start.line as usize) < tab.buffer.len_lines())
                 .map(|d| {
                     let color = match d.severity {
                         Severity::Error => ui.danger,
@@ -1997,9 +2057,15 @@ impl App {
                     let (start, end) = (d.range.start, d.range.end);
                     let line = start.line as usize;
                     let end_column = if end.line == start.line { end.character } else { u32::MAX };
+                    // A whole-line (runtime) problem is underlined from the indentation on.
+                    let start_column = if end.character == problems::WHOLE_LINE {
+                        tab.buffer.line_text(line).chars().take_while(|c| matches!(c, ' ' | '\t')).count()
+                    } else {
+                        start.character as usize
+                    };
                     Mark {
                         line,
-                        start: start.character as usize,
+                        start: start_column,
                         end: (end_column as usize).min(tab.buffer.line_len(line)),
                         color: style::to_color(color),
                         message: Some(d.message.split_whitespace().collect::<Vec<_>>().join(" ")),
@@ -2619,6 +2685,9 @@ impl App {
                 .style(button::text)
                 .padding([0, 4]);
             left.push(style::tip(run, description, tooltip::Position::Top, ui));
+            let editor = button(text("Godot").size(12)).on_press(Message::OpenInGodot).style(button::text).padding([0, 4]);
+            let description = "Open the project in the Godot editor, at the current scene";
+            left.push(style::tip(editor, description, tooltip::Position::Top, ui));
         }
         if self.active_tab().is_some_and(|t| t.disk_changed) {
             let reload = button(text("Reload from disk").size(12).color(style::to_color(ui.warning)))
