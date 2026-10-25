@@ -185,6 +185,8 @@ enum Pending {
     /// Whether the symbol `word` at `pos` can be renamed.
     PrepareRename { path: PathBuf, pos: Pos, word: String },
     Rename { from: String, to: String },
+    /// Whether the word at this char range has a definition (Ctrl+hover).
+    LinkProbe((usize, usize)),
 }
 
 /// A snippet being filled in: Tab / Shift+Tab move between its stops.
@@ -239,6 +241,12 @@ struct App {
     hover: Option<(Pos, Doc)>,
     signature: Option<Signature>,
     snippet: Option<SnippetSession>,
+    /// Ctrl+click target under the mouse, underlined while Ctrl is held.
+    link: Option<(usize, usize)>,
+    /// Definition request checking whether the hovered word is a target.
+    link_probe: Option<u64>,
+    /// `uid://` lookups (they scan the project), cleared when files change.
+    uid_cache: HashMap<String, Option<PathBuf>>,
     terminal: TerminalState,
     focus: Focus,
 }
@@ -317,6 +325,9 @@ impl App {
             hover: None,
             signature: None,
             snippet: None,
+            link: None,
+            link_probe: None,
+            uid_cache: HashMap::new(),
             terminal: TerminalState::default(),
             focus: Focus::Editor,
         };
@@ -570,7 +581,10 @@ impl App {
             }
             Message::Run(event) => self.on_run(event),
             Message::ClearOutput => self.run.output.clear(),
-            Message::FilesChanged(paths) => self.on_files_changed(&paths),
+            Message::FilesChanged(paths) => {
+                self.uid_cache.clear();
+                self.on_files_changed(&paths);
+            }
             Message::ReloadActive => {
                 if let Some(index) = self.active {
                     self.reload_tab(index);
@@ -1313,6 +1327,7 @@ impl App {
             },
             EditorEvent::TriggerCompletion => self.request_completion(None),
             EditorEvent::GotoDefinition => self.goto_definition(),
+            EditorEvent::LinkHover(index) => self.on_link_hover(index),
             EditorEvent::NextTabStop | EditorEvent::PreviousTabStop => {
                 self.completion = None;
                 self.signature = None;
@@ -1347,6 +1362,8 @@ impl App {
         let Some(tab) = self.tabs.get_mut(index) else {
             return;
         };
+        // Char ranges no longer match once the text changes.
+        self.link = None;
         let before = tab.buffer.version();
         tab.buffer.apply(command);
         if tab.buffer.version() != before {
@@ -1569,6 +1586,8 @@ impl App {
         self.hover = None;
         self.signature = None;
         self.snippet = None;
+        self.link = None;
+        self.link_probe = None;
     }
 
     /// The active GDScript tab with a connected language server.
@@ -1811,7 +1830,15 @@ impl App {
 
     fn on_response(&mut self, pending: Pending, id: u64, value: serde_json::Value) -> Task<Message> {
         match pending {
-            Pending::References(name) => self.show_references(name, lsp_client::locations(&value)),
+            Pending::LinkProbe(range) => {
+                if self.link_probe == Some(id) {
+                    self.link_probe = None;
+                    if !lsp_client::locations(&value).is_empty() {
+                        self.link = Some(range);
+                    }
+                }
+            }
+            Pending::References(name) =>self.show_references(name, lsp_client::locations(&value)),
             Pending::PrepareRename { path, pos, word } => {
                 // A range means the symbol can be renamed; null means it can't
                 // (e.g. a built-in class or method).
@@ -2007,17 +2034,60 @@ impl App {
         }
     }
 
+    /// The existing file a `res://` or `uid://` path points to.
+    fn resolve_link(&mut self, link: &str) -> Option<PathBuf> {
+        let godot = self.project.as_ref()?.godot.as_ref()?;
+        let path = if link.starts_with("uid://") {
+            self.uid_cache.entry(link.to_string()).or_insert_with(|| godot.find_uid(link)).clone()
+        } else {
+            godot.resolve(link)
+        };
+        path.filter(|p| p.is_file())
+    }
+
+    /// Ctrl is held over char `index` (or released): finds whether a Ctrl+click
+    /// there would go somewhere, to underline it. Paths are checked here;
+    /// words ask the language server for a definition.
+    fn on_link_hover(&mut self, index: Option<usize>) {
+        let Some(index) = index else {
+            self.link = None;
+            self.link_probe = None;
+            return;
+        };
+        if self.link.is_some_and(|(start, end)| (start..end).contains(&index)) {
+            return;
+        }
+        self.link = None;
+        self.link_probe = None;
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if let Some(link) = paths::link_at(&tab.buffer, index) {
+            let range = paths::string_at(&tab.buffer, index).map(|s| (s.content_start, s.content_end));
+            if self.resolve_link(&link).is_some() {
+                self.link = range;
+            }
+            return;
+        }
+        let (start, end) = tab.buffer.word_range(index);
+        let is_word = tab.buffer.slice(start, end).starts_with(|c: char| c.is_alphabetic() || c == '_');
+        let Some((client, tab, _)) = self.lsp_target().filter(|_| is_word) else {
+            return;
+        };
+        let pos = tab.buffer.char_to_pos(index);
+        if let Ok(id) = client.definition(&tab.path, to_lsp(pos)) {
+            self.pending.insert(id, Pending::LinkProbe((start, end)));
+            self.link_probe = Some(id);
+        }
+    }
+
     /// Opens the file a `res://` or `uid://` path points to: text files in a
     /// tab, others (images, sounds, models) with the system's default app.
     fn open_link(&mut self, link: &str) {
-        let Some(godot) = self.project.as_ref().and_then(|p| p.godot.as_ref()) else {
+        if self.project.as_ref().is_none_or(|p| p.godot.is_none()) {
             return;
-        };
-        let target = match link.strip_prefix("uid://") {
-            Some(_) => godot.find_uid(link),
-            None => godot.resolve(link),
-        };
-        let Some(path) = target.filter(|p| p.is_file()) else {
+        }
+        let Some(path) = self.resolve_link(link) else {
             self.status = Some(format!("{link} not found in the project"));
             return;
         };
@@ -2080,6 +2150,7 @@ impl App {
     fn open_file(&mut self, path: PathBuf) -> bool {
         // Opening a file shows it, even from the shortcuts page.
         self.shortcuts = None;
+        self.link = None;
         if let Some(index) = self.tabs.iter().position(|t| uri::same_path(&t.path, &path)) {
             self.active = Some(index);
             return true;
@@ -2350,7 +2421,8 @@ impl App {
             .hover(hover)
             .signature(signature)
             .focused(self.focus == Focus::Editor)
-            .tab_stops(self.snippet.is_some());
+            .tab_stops(self.snippet.is_some())
+            .link(self.link);
 
         let mut area = column![self.tab_bar()];
         if let Some(rename) = &self.rename {

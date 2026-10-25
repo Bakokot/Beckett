@@ -127,7 +127,8 @@ crates/
 **Godot awareness**
 - [x] `res://` / `uid://` paths: Ctrl+click or F12 opens them (also in `.tscn`/`.tres`; uids read from
       `.uid`, `.import` and scene headers; binary assets open in the default app); `res://` path
-      completion in strings and `load(`/`preload(` (fuzzy on the path; Godot's own file items dropped)
+      completion in strings and `load(`/`preload(` (fuzzy on the path; Godot's own file items dropped);
+      holding Ctrl underlines clickable targets (paths that exist, words with a definition)
 - [ ] "Open in Godot editor" for current scene
 
 **Run** — `app/src/runner.rs`

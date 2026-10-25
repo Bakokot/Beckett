@@ -70,6 +70,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Escape", "Close the completion, hover or signature popup"),
             ("Tab / Shift+Tab", "Next / previous placeholder of a snippet (tagged snip in completions)"),
             ("F12 / Ctrl+Click", "Go to definition, or open the res:// or uid:// path in a string"),
+            ("Ctrl (hold)", "Underline what Ctrl+Click can open under the mouse"),
             ("Shift+F12", "Find all references"),
             ("F2", "Rename symbol in every file"),
             ("Mouse rest", "Documentation of the word under the mouse"),

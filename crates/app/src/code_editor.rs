@@ -46,6 +46,9 @@ pub enum EditorEvent {
     Focused,
     /// Ctrl+click: go to the definition (or open the path) under the click.
     GotoDefinition,
+    /// Ctrl is held with the mouse over this char (`None`: released or moved
+    /// away); the app answers with the link range to underline, if any.
+    LinkHover(Option<usize>),
     /// Tab / Shift+Tab while a snippet is being filled in.
     NextTabStop,
     PreviousTabStop,
@@ -185,6 +188,8 @@ pub struct CodeEditor<'a, Message> {
     focused: bool,
     /// A snippet is being filled in: Tab moves between its stops.
     tab_stops: bool,
+    /// Char range underlined while Ctrl is held: a Ctrl+click target.
+    link: Option<(usize, usize)>,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
@@ -206,11 +211,17 @@ impl<'a, Message> CodeEditor<'a, Message> {
             current_highlight: None,
             focused: true,
             tab_stops: false,
+            link: None,
         }
     }
 
     pub fn tab_stops(mut self, active: bool) -> Self {
         self.tab_stops = active;
+        self
+    }
+
+    pub fn link(mut self, range: Option<(usize, usize)>) -> Self {
+        self.link = range;
         self
     }
 
@@ -278,6 +289,10 @@ struct State {
     seen_reveal: u64,
     metrics: Option<Metrics>,
     hover: Option<HoverTrack>,
+    /// Mouse position over the editor, for Ctrl+hover links.
+    mouse: Option<Point>,
+    /// Word range (char indices) last reported with `LinkHover`.
+    link_sent: Option<(usize, usize)>,
 }
 
 impl State {
@@ -295,6 +310,8 @@ impl State {
             seen_reveal: u64::MAX,
             metrics: None,
             hover: None,
+            mouse: None,
+            link_sent: None,
         }
     }
 
@@ -567,6 +584,32 @@ impl<'a, Message> CodeEditor<'a, Message> {
         }
     }
 
+    /// Reports the char under the mouse while Ctrl is held (`None` when it
+    /// isn't), once per word, so the app can find out whether it is a link.
+    fn update_link(&self, state: &mut State, geometry: &Geometry, shell: &mut Shell<'_, Message>) {
+        let index = state
+            .mouse
+            .filter(|p| state.modifiers.command() && !state.dragging && geometry.text_area.contains(*p))
+            .map(|p| self.char_under(geometry, state.scroll, p));
+        let word = index.map(|i| match self.buffer.word_range(i) {
+            (start, end) if start < end => (start, end),
+            _ => (i, i + 1),
+        });
+        if word != state.link_sent {
+            state.link_sent = word;
+            self.emit(shell, EditorEvent::LinkHover(index));
+        }
+    }
+
+    /// Whether `point` is over the underlined link.
+    fn over_link(&self, state: &State, geometry: &Geometry, point: Point) -> bool {
+        let Some((start, end)) = self.link else {
+            return false;
+        };
+        let index = self.char_under(geometry, state.scroll, point);
+        state.modifiers.command() && geometry.text_area.contains(point) && (start..end).contains(&index)
+    }
+
     fn update_hover(
         &self,
         state: &mut State,
@@ -675,6 +718,9 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
+                // Pressing or releasing Ctrl shows or hides the link under the mouse.
+                self.update_link(state, &geometry, shell);
+                shell.request_redraw();
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let Some(point) = cursor.position_over(geometry.bounds) else {
@@ -729,9 +775,13 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 } else {
                     self.update_hover(state, &geometry, shell, cursor.position_over(geometry.bounds));
                 }
+                state.mouse = cursor.position_over(geometry.bounds);
+                self.update_link(state, &geometry, shell);
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 self.update_hover(state, &geometry, shell, None);
+                state.mouse = None;
+                self.update_link(state, &geometry, shell);
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;
@@ -762,6 +812,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 state.scroll = state.scroll - Vector::new(dx, dy);
                 self.clamp_scroll(state, &geometry);
                 self.update_hover(state, &geometry, shell, None);
+                self.update_link(state, &geometry, shell);
                 shell.request_redraw();
                 shell.capture_event();
             }
@@ -916,6 +967,14 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 }
             }
 
+            // Ctrl+hover link.
+            if let Some((start, end)) = self.link.filter(|_| state.modifiers.command()) {
+                for rect in self.range_rects(&g, scroll, start, end, first, last) {
+                    let underline = Rectangle::new(Point::new(rect.x, rect.y + lh - 3.0), Size::new(rect.width, 1.0));
+                    fill(r, underline, colors.accent);
+                }
+            }
+
             // Inline messages: one per line, the first mark's (marks come
             // sorted most severe first).
             let mut shown = std::collections::HashSet::new();
@@ -1021,7 +1080,9 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 return mouse::Interaction::Pointer;
             }
         }
-        if cursor.is_over(geometry.text_area) {
+        if cursor.position().is_some_and(|p| self.over_link(state, &geometry, p)) {
+            mouse::Interaction::Pointer
+        } else if cursor.is_over(geometry.text_area) {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::None
