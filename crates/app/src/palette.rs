@@ -49,7 +49,7 @@ pub struct Item<M> {
 /// A palette command: name, shortcut hint, and the message it sends.
 pub struct CommandEntry<M> {
     pub name: String,
-    pub shortcut: &'static str,
+    pub shortcut: String,
     pub message: M,
 }
 
@@ -284,7 +284,7 @@ fn command_items<M: Clone>(query: &str, commands: &[CommandEntry<M>]) -> Vec<Ite
             let item = Item {
                 label: command.name.clone(),
                 matched: m.positions,
-                detail: command.shortcut.to_string(),
+                detail: command.shortcut.clone(),
                 action: Action::Run(command.message.clone()),
             };
             Some((m.score, order, item))
@@ -477,8 +477,8 @@ mod tests {
     #[test]
     fn modes_follow_the_prefix() {
         let commands = [
-            CommandEntry { name: "Save".into(), shortcut: "Ctrl+S", message: 1 },
-            CommandEntry { name: "Toggle Terminal".into(), shortcut: "Ctrl+J", message: 2 },
+            CommandEntry { name: "Save".into(), shortcut: "Ctrl+S".into(), message: 1 },
+            CommandEntry { name: "Toggle Terminal".into(), shortcut: "Ctrl+J".into(), message: 2 },
         ];
         let mut p = palette(&[]);
         p.input = ">term".into();

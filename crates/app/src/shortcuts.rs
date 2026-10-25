@@ -1,44 +1,22 @@
-//! The keyboard shortcuts page (F1): every binding, grouped and filterable.
+//! The keyboard shortcuts page (F1): the commands with their (changeable)
+//! shortcuts, then the other keys and mouse gestures, all filterable.
 
 use iced::widget::tooltip::Position;
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input, Column};
 use iced::{Alignment, Background, Border, Element, Font, Length};
 
+use crate::keymap::{Keymap, COMMANDS};
 use crate::style;
 
 pub const INPUT: &str = "shortcuts-filter";
 
-/// Sections of (keys, what they do). Keys of one binding are joined by
-/// `+`; alternatives are separated by ` / `.
+/// Keys and gestures that are not commands (fixed). Keys of one binding
+/// are joined by `+`; alternatives are separated by ` / `.
 pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "General",
-        &[
-            ("Ctrl+O", "Open a project folder"),
-            ("Ctrl+S", "Save the current file"),
-            ("Ctrl+W", "Close the current tab (twice to discard unsaved edits)"),
-            ("Ctrl+P", "Go to file (fuzzy search)"),
-            ("Ctrl+Shift+P", "Command palette"),
-            ("Ctrl+\\", "Split the editor: move the current tab to the other side"),
-            ("Ctrl+G", "Go to line (type :line or :line:column)"),
-            ("Ctrl+Shift+O", "Go to a function, variable or signal of this file"),
-            ("F1", "Keyboard shortcuts (this page)"),
-            ("Ctrl+= / Ctrl+- / Ctrl+0", "Zoom the interface in / out / back to 100%"),
-        ],
-    ),
     (
         "Editing",
         &[
-            ("Ctrl+Z", "Undo"),
-            ("Ctrl+Y / Ctrl+Shift+Z", "Redo"),
             ("Ctrl+X / Ctrl+C / Ctrl+V", "Cut, copy, paste (with several cursors, pasted lines are spread)"),
-            ("Ctrl+A", "Select all"),
-            ("Ctrl+K / Ctrl+/", "Toggle comment"),
-            ("Ctrl+Shift+K", "Delete line"),
-            ("Alt+F / Click the gutter", "Fold or unfold the block (indentation or #region)"),
-            ("Shift+Alt+F", "Format the document (gdformat if installed, else trim trailing spaces)"),
-            ("Alt+Up / Alt+Down", "Move line up / down"),
-            ("Shift+Alt+Up / Shift+Alt+Down", "Duplicate line"),
             ("Tab / Shift+Tab", "Indent / outdent"),
             ("Enter", "New line, keeping indentation (indents after : and brackets)"),
             ("Ctrl+Backspace / Ctrl+Delete", "Delete the previous / next word"),
@@ -56,58 +34,37 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Selection and multiple cursors",
+        "Mouse",
         &[
             ("Shift+Click", "Extend the selection to the click"),
             ("Double-click / Triple-click", "Select word / line"),
             ("Alt+Click", "Add a cursor"),
             ("Alt+Drag", "Column (box) selection, one cursor per line"),
-            ("Ctrl+Alt+Up / Ctrl+Alt+Down", "Add a cursor above / below"),
-            ("Ctrl+D", "Select the next occurrence of the selection"),
+            ("Ctrl+Click", "Go to definition, or open the res:// or uid:// path in a string"),
+            ("Ctrl (hold)", "Underline what Ctrl+Click can open under the mouse"),
+            ("Right-click", "Menu of the file, tab or code under the mouse"),
+            ("Click the gutter", "Fold or unfold the block (indentation or #region)"),
+            ("Mouse rest", "Documentation of the word under the mouse"),
             ("Escape", "Back to a single cursor"),
         ],
     ),
     (
-        "Code intelligence (GDScript)",
+        "Popups and snippets",
         &[
-            ("Ctrl+Space", "Show completions"),
             ("Up / Down / PageUp / PageDown", "Move in the completion list"),
             ("Enter / Tab", "Accept the completion"),
             ("Escape", "Close the completion, hover or signature popup"),
             ("Tab / Shift+Tab", "Next / previous placeholder of a snippet (tagged snip in completions)"),
-            ("F12 / Ctrl+Click", "Go to definition, or open the res:// or uid:// path in a string"),
-            ("Ctrl (hold)", "Underline what Ctrl+Click can open under the mouse"),
-            ("Shift+F12", "Find all references"),
-            ("F2", "Rename symbol in every file"),
-            ("Mouse rest", "Documentation of the word under the mouse"),
-        ],
-    ),
-    (
-        "Find and search",
-        &[
-            ("Ctrl+F", "Find in the file (the selection fills the box)"),
-            ("Ctrl+H", "Find and replace"),
             ("Enter / Shift+Enter", "Next / previous match (in the find box)"),
-            ("F3 / Shift+F3", "Next / previous match"),
-            ("Escape", "Close the find bar"),
-            ("Ctrl+Shift+F", "Search in the whole project (Enter to run)"),
-        ],
-    ),
-    (
-        "Run",
-        &[
-            ("F5", "Run the project's main scene"),
-            ("F6", "Run the current scene, or the scene using this script (asks once when several do)"),
-            ("F8 / Shift+F5", "Stop the game"),
         ],
     ),
     (
         "Terminal",
         &[
-            ("Ctrl+J / Ctrl+` / Ctrl+²", "Show or hide the terminal"),
             ("Ctrl+C", "Copy the selection, or interrupt when nothing is selected"),
             ("Ctrl+V", "Paste"),
             ("Double-click / Triple-click", "Select word / line"),
+            ("Shift+Drag", "Select text while a program uses the mouse"),
             ("Mouse wheel", "Scroll back through the output"),
         ],
     ),
@@ -118,8 +75,8 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Enter", "Open the file or run the command"),
             ("Escape / Click outside", "Close"),
             ("> prefix", "Search commands instead of files"),
-            (": prefix", "Go to line"),
             ("@ prefix", "Go to a symbol of this file"),
+            (": prefix", "Go to line"),
         ],
     ),
 ];
@@ -127,19 +84,43 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
 #[derive(Debug, Clone)]
 pub enum ShortcutsMessage {
     Filter(String),
+    /// Wait for the keys of this command's new shortcut.
+    Record(&'static str),
+    /// Back to the default shortcut.
+    Reset(&'static str),
     Close,
 }
 
 #[derive(Default)]
 pub struct Shortcuts {
     pub filter: String,
+    /// The command whose new shortcut the next key press sets.
+    pub recording: Option<&'static str>,
 }
 
 impl Shortcuts {
-    /// Sections with their entries matching the filter (in the keys, the
-    /// description or the section name); empty sections are left out.
+    fn words(&self) -> Vec<String> {
+        self.filter.split_whitespace().map(str::to_lowercase).collect()
+    }
+
+    /// Commands matching the filter (title, id or keys).
+    pub fn matching_commands(&self, keymap: &Keymap) -> Vec<&'static str> {
+        let words = self.words();
+        COMMANDS
+            .iter()
+            .filter(|c| {
+                let keys: Vec<String> = keymap.chords(c.id).iter().map(ToString::to_string).collect();
+                let haystack = format!("{} {} {}", c.title, c.id, keys.join(" ")).to_lowercase();
+                words.iter().all(|w| haystack.contains(w.as_str()))
+            })
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// Reference sections with their entries matching the filter (in the
+    /// keys, the description or the section name); empty ones left out.
     pub fn matching(&self) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
-        let words: Vec<String> = self.filter.split_whitespace().map(str::to_lowercase).collect();
+        let words = self.words();
         SECTIONS
             .iter()
             .map(|&(section, entries)| {
@@ -157,26 +138,28 @@ impl Shortcuts {
             .collect()
     }
 
-    pub fn view<'a>(&'a self, ui: &theme::UiColors) -> Element<'a, ShortcutsMessage> {
+    pub fn view<'a>(&'a self, ui: &theme::UiColors, keymap: &'a Keymap) -> Element<'a, ShortcutsMessage> {
         let muted = style::to_color(ui.text_muted);
         let accent = style::to_color(ui.accent);
         let (cap_background, cap_border, cap_text) =
             (style::to_color(ui.surface), style::to_color(ui.border), style::to_color(ui.text));
-        // One bordered "key cap" per binding; alternatives in between.
-        let keycaps = move |keys: &'static str| {
+        let cap = move |label: String| {
+            container(text(label).size(12).font(Font::MONOSPACE).color(cap_text))
+                .padding([1, 6])
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(cap_background)),
+                    border: Border { color: cap_border, width: 1.0, radius: 4.0.into() },
+                    ..container::Style::default()
+                })
+        };
+        // One key cap per binding; alternatives in between.
+        let keycaps = move |keys: Vec<String>| {
             let mut caps = row![].spacing(4).align_y(Alignment::Center);
-            for (index, binding) in keys.split(" / ").enumerate() {
+            for (index, binding) in keys.into_iter().enumerate() {
                 if index > 0 {
                     caps = caps.push(text("or").size(11).color(muted));
                 }
-                let cap = container(text(binding).size(12).font(Font::MONOSPACE).color(cap_text))
-                    .padding([1, 6])
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(cap_background)),
-                        border: Border { color: cap_border, width: 1.0, radius: 4.0.into() },
-                        ..container::Style::default()
-                    });
-                caps = caps.push(cap);
+                caps = caps.push(cap(binding));
             }
             caps
         };
@@ -196,16 +179,41 @@ impl Shortcuts {
         .spacing(12)
         .align_y(Alignment::Center);
 
-        let sections = self.matching();
         let mut list: Vec<Element<'a, ShortcutsMessage>> = Vec::new();
-        if sections.is_empty() {
-            list.push(text("No shortcut matches the filter").size(13).color(muted).into());
+        let section = |title: String| -> Element<'a, ShortcutsMessage> {
+            container(text(title).size(12).color(accent)).padding([12, 0]).into()
+        };
+
+        let commands = self.matching_commands(keymap);
+        if !commands.is_empty() {
+            list.push(section("COMMANDS  (click a shortcut to change it)".to_string()));
         }
-        for (section, entries) in sections {
-            list.push(container(text(section.to_uppercase()).size(12).color(accent)).padding([12, 0]).into());
+        for id in commands {
+            let title = COMMANDS.iter().find(|c| c.id == id).map_or("", |c| c.title);
+            let keys: Vec<String> = keymap.chords(id).iter().map(ToString::to_string).collect();
+            let shortcut: Element<'a, ShortcutsMessage> = if self.recording == Some(id) {
+                text("Press the new keys…  (Escape cancels, Backspace removes)").size(12).color(accent).into()
+            } else if keys.is_empty() {
+                text("none").size(12).color(muted).into()
+            } else {
+                keycaps(keys).into()
+            };
+            let change = button(shortcut).on_press(ShortcutsMessage::Record(id)).style(button::text).padding([1, 2]);
+            let mut line = row![container(change).width(380), text(title).size(13)].spacing(16).align_y(Alignment::Center);
+            if !keymap.is_default(id) {
+                let reset = button(text("reset").size(11)).on_press(ShortcutsMessage::Reset(id)).style(button::text).padding([0, 6]);
+                line = line.push(style::tip(reset, "Back to the default shortcut", Position::Top, ui));
+            }
+            list.push(line.padding([1, 0]).into());
+        }
+
+        let sections = self.matching();
+        for (title, entries) in sections {
+            list.push(section(title.to_uppercase()));
             for (keys, description) in entries {
+                let keys = keys.split(" / ").map(str::to_string).collect();
                 list.push(
-                    row![container(keycaps(keys)).width(320), text(description).size(13)]
+                    row![container(keycaps(keys)).width(380), text(description).size(13)]
                         .spacing(16)
                         .align_y(Alignment::Center)
                         .padding([3, 0])
@@ -213,11 +221,14 @@ impl Shortcuts {
                 );
             }
         }
+        if list.is_empty() {
+            list.push(text("No shortcut matches the filter").size(13).color(muted).into());
+        }
         // Right padding keeps the scrollbar off the descriptions.
         let list = Column::with_children(list).padding(iced::Padding { left: 4.0, right: 24.0, ..iced::Padding::ZERO });
         let body = scrollable(list).height(Length::Fill);
 
-        container(column![header, body].spacing(12).max_width(900))
+        container(column![header, body].spacing(12).max_width(1000))
             .padding([16, 24])
             .width(Length::Fill)
             .height(Length::Fill)
@@ -230,30 +241,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filter_matches_keys_descriptions_and_sections() {
+    fn filter_matches_commands_by_title_id_or_keys() {
+        let keymap = Keymap::defaults();
         let mut page = Shortcuts::default();
-        let total: usize = SECTIONS.iter().map(|(_, e)| e.len()).sum();
-        assert_eq!(page.matching().iter().map(|(_, e)| e.len()).sum::<usize>(), total);
+        assert_eq!(page.matching_commands(&keymap).len(), COMMANDS.len());
 
         page.filter = "f12".to_string();
-        let keys: Vec<&str> = page.matching().iter().flat_map(|(_, e)| e.iter().map(|(k, _)| *k)).collect();
-        assert_eq!(keys, ["F12 / Ctrl+Click", "Shift+F12"]);
+        assert_eq!(page.matching_commands(&keymap), ["go.definition", "go.references"]);
 
-        page.filter = "RUN stop".to_string();
-        let found = page.matching();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].1, [("F8 / Shift+F5", "Stop the game")]);
+        page.filter = "run stop".to_string();
+        assert_eq!(page.matching_commands(&keymap), ["run.stop"]);
 
         page.filter = "nothing like this".to_string();
-        assert!(page.matching().is_empty());
+        assert!(page.matching_commands(&keymap).is_empty() && page.matching().is_empty());
     }
 
     #[test]
-    fn entries_are_filled_in() {
+    fn reference_lists_only_fixed_keys() {
+        let keymap = Keymap::defaults();
         for (section, entries) in SECTIONS {
             assert!(!entries.is_empty(), "{section}");
             for (keys, description) in *entries {
                 assert!(!keys.trim().is_empty() && !description.trim().is_empty(), "{section}: {keys}");
+                // A key listed here must not also be a command's shortcut.
+                for key in keys.split(" / ") {
+                    if let Some(chord) = crate::keymap::Chord::parse(key) {
+                        assert_eq!(keymap.lookup(&chord), None, "{key} is a command: list it there");
+                    }
+                }
             }
         }
     }

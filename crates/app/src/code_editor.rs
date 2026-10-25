@@ -23,6 +23,7 @@ use iced::{
 };
 
 use crate::docs::Doc;
+use crate::keymap::{Chord, Keymap};
 use crate::style::to_color;
 
 const BLINK_MILLIS: u128 = 500;
@@ -47,6 +48,8 @@ pub enum EditorEvent {
     Focused,
     /// Right-click at this window position: open the editor menu.
     ContextMenu(Point),
+    /// A key bound to this command in the key map was pressed.
+    Shortcut(&'static str),
     /// Shift+Alt+F.
     FormatDocument,
     /// Ctrl+click: go to the definition (or open the path) under the click.
@@ -189,6 +192,7 @@ pub struct CodeEditor<'a, Message> {
     /// Sorted char ranges to highlight (search matches) and the current one.
     highlights: &'a [(usize, usize)],
     current_highlight: Option<usize>,
+    keymap: Option<&'a Keymap>,
     /// Whether this editor owns keyboard focus in the app.
     focused: bool,
     /// A snippet is being filled in: Tab moves between its stops.
@@ -216,8 +220,16 @@ impl<'a, Message> CodeEditor<'a, Message> {
             current_highlight: None,
             focused: true,
             tab_stops: false,
+            keymap: None,
             link: None,
         }
+    }
+
+    /// Key shortcuts the editor turns into `Shortcut` events (none: the
+    /// editor ignores shortcut keys, as in the theme preview).
+    pub fn keymap(mut self, keymap: &'a Keymap) -> Self {
+        self.keymap = Some(keymap);
+        self
     }
 
     pub fn tab_stops(mut self, active: bool) -> Self {
@@ -636,16 +648,28 @@ impl<'a, Message> CodeEditor<'a, Message> {
             }
         }
 
+        // Clipboard keys are fixed (they need the clipboard here).
+        if let Key::Character(c) = key.as_ref() {
+            if ctrl && !alt {
+                match c.to_lowercase().as_str() {
+                    "c" => return Some(KeyAction::Copy),
+                    "x" => return Some(KeyAction::Cut),
+                    "v" => return Some(KeyAction::Paste),
+                    _ => {}
+                }
+            }
+        }
+        // Everything else bound in the (customizable) key map.
+        if let (Some(keymap), Some(chord)) = (self.keymap, Chord::from_key(key, modifiers)) {
+            if let Some(id) = keymap.lookup(&chord) {
+                return event(EditorEvent::Shortcut(id));
+            }
+        }
+
         match key.as_ref() {
-            Key::Named(Named::Space) if ctrl => event(EditorEvent::TriggerCompletion),
             Key::Named(named) => match named {
                 Named::ArrowLeft => movement(if ctrl { Motion::WordLeft } else { Motion::Left }),
                 Named::ArrowRight => movement(if ctrl { Motion::WordRight } else { Motion::Right }),
-                Named::ArrowUp if ctrl && alt => command(Command::AddCursorAbove),
-                Named::ArrowDown if ctrl && alt => command(Command::AddCursorBelow),
-                Named::ArrowUp | Named::ArrowDown if shift && alt => command(Command::DuplicateLines),
-                Named::ArrowUp if alt => command(Command::MoveLinesUp),
-                Named::ArrowDown if alt => command(Command::MoveLinesDown),
                 Named::ArrowUp => movement(Motion::Up),
                 Named::ArrowDown => movement(Motion::Down),
                 Named::Home => movement(if ctrl { Motion::DocumentStart } else { Motion::Home }),
@@ -663,24 +687,9 @@ impl<'a, Message> CodeEditor<'a, Message> {
                 Named::Space => command(Command::Insert(" ".to_string())),
                 _ => None,
             },
-            // Alt+F folds / unfolds, as in the Godot editor.
-            Key::Character(c) if alt && !ctrl && shift && c.eq_ignore_ascii_case("f") => event(EditorEvent::FormatDocument),
-            Key::Character(c) if alt && !ctrl && c.eq_ignore_ascii_case("f") => command(Command::ToggleFoldAtCursor),
-            // Ctrl+Alt is AltGr on many layouts: treat it as typing.
-            Key::Character(c) if ctrl && !alt => match c.to_lowercase().as_str() {
-                "a" => command(Command::SelectAll),
-                "c" => Some(KeyAction::Copy),
-                "x" => Some(KeyAction::Cut),
-                "v" => Some(KeyAction::Paste),
-                "z" if shift => command(Command::Redo),
-                "z" => command(Command::Undo),
-                "y" => command(Command::Redo),
-                "d" => command(Command::SelectNextOccurrence),
-                "k" if shift => command(Command::DeleteLines),
-                // Ctrl+K is Godot's binding, Ctrl+/ VS Code's.
-                "k" | "/" => command(Command::ToggleComment),
-                _ => None,
-            },
+            // An unbound Ctrl+key or Alt+key types nothing; Ctrl+Alt is AltGr
+            // on many layouts, which does type.
+            Key::Character(_) if ctrl != alt => None,
             _ => {
                 let text = text?.chars().filter(|c| !c.is_control()).collect::<String>();
                 (!text.is_empty()).then_some(KeyAction::Event(EditorEvent::Command(Command::Insert(text))))

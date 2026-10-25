@@ -7,6 +7,7 @@ mod docs;
 mod explorer;
 mod find;
 mod format;
+mod keymap;
 mod lsp;
 mod numpad;
 mod on_escape;
@@ -150,7 +151,8 @@ pub enum Message {
     Search(SearchMessage),
     /// Ctrl+Shift+F.
     OpenSearch,
-    ModifiersChanged(keyboard::Modifiers),
+    /// A key event no widget used (shortcuts, palette navigation).
+    Key(keyboard::Event),
     /// Open the palette with this input ("" files, ">" commands, ":" go to line).
     OpenPalette(String),
     Palette(PaletteMessage),
@@ -289,6 +291,8 @@ struct App {
     /// The session as last written, to skip rewriting an unchanged one.
     saved_session: Option<session::Session>,
     settings: settings::Settings,
+    /// Shortcuts in effect (defaults with the user's changes).
+    keymap: keymap::Keymap,
     tabs: Vec<Tab>,
     /// The side of the split with keyboard focus (0 left, 1 right); `active`
     /// is the tab it shows.
@@ -409,6 +413,7 @@ impl App {
             recent: recent::load(),
             saved_session: None,
             settings,
+            keymap: keymap::Keymap::load(),
             tabs: Vec::new(),
             focused_group: 0,
             group_active: [None, None],
@@ -511,7 +516,7 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let keys = keyboard::listen().filter_map(shortcut);
+        let keys = keyboard::listen().map(Message::Key);
 
         let lsp = self
             .project
@@ -593,13 +598,13 @@ impl App {
 
     /// An event from the editor on one side: clicking or typing there moves
     /// the focus to that side; hovering the other side does nothing.
-    fn on_editor_in(&mut self, group: usize, event: EditorEvent) {
+    fn on_editor_in(&mut self, group: usize, event: EditorEvent) -> Task<Message> {
         if group != self.focused_group {
             if matches!(event, EditorEvent::Hover(_) | EditorEvent::HoverEnd | EditorEvent::LinkHover(_)) {
-                return;
+                return Task::none();
             }
             let Some(index) = self.group_active[group] else {
-                return;
+                return Task::none();
             };
             self.dismiss_popups();
             self.find = None;
@@ -607,7 +612,7 @@ impl App {
             self.active = Some(index);
             self.sync_groups();
         }
-        self.on_editor(event);
+        self.on_editor(event)
     }
 
     /// Moves the current tab to the other side, splitting the view (or
@@ -736,9 +741,30 @@ impl App {
                     page.filter = filter;
                 }
             }
+            Message::Shortcuts(ShortcutsMessage::Record(id)) => {
+                if let Some(page) = &mut self.shortcuts {
+                    page.recording = Some(id);
+                }
+                self.status = Some(format!("Press the new shortcut for \"{}\"", keymap::title(id)));
+                // Take focus from the filter box so the keys reach the recorder.
+                return iced::widget::operation::focus("shortcuts-recording");
+            }
+            Message::Shortcuts(ShortcutsMessage::Reset(id)) => {
+                self.keymap.reset(id);
+                self.status = Some(match self.keymap.save() {
+                    Ok(()) => format!("{}: back to {}", keymap::title(id), self.keymap.label(id)),
+                    Err(error) => format!("Cannot save shortcuts: {error}"),
+                });
+            }
             Message::Shortcuts(ShortcutsMessage::Close) => {
-                self.shortcuts = None;
-                self.focus = Focus::Editor;
+                // Escape while recording cancels the recording, not the page.
+                if let Some(page) = self.shortcuts.as_mut().filter(|p| p.recording.is_some()) {
+                    page.recording = None;
+                    self.status = Some("Shortcut unchanged".to_string());
+                } else {
+                    self.shortcuts = None;
+                    self.focus = Focus::Editor;
+                }
             }
             Message::CloseTab(index) => {
                 self.dismiss_popups();
@@ -750,8 +776,8 @@ impl App {
                     self.close_tab(index);
                 }
             }
-            Message::Edit(event) => self.on_editor(event),
-            Message::EditIn(group, event) => self.on_editor_in(group, event),
+            Message::Edit(event) => return self.on_editor(event),
+            Message::EditIn(group, event) => return self.on_editor_in(group, event),
             Message::SplitMove => self.split_move(),
             Message::FocusOtherSide => {
                 let other = 1 - self.focused_group;
@@ -916,7 +942,7 @@ impl App {
             Message::Find(message) => return self.on_find(message),
             Message::OpenSearch => return self.open_search(),
             Message::Search(message) => return self.on_search(message),
-            Message::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+            Message::Key(event) => return self.on_key(event),
             Message::OpenPalette(input) => return self.open_palette(input),
             Message::Palette(message) => return self.on_palette(message),
             Message::OpenOutputLink(res_path, line) => {
@@ -1306,60 +1332,60 @@ impl App {
     fn commands(&self) -> Vec<CommandEntry<Message>> {
         let edit = |command: Command| Message::Edit(EditorEvent::Command(command));
         let mut commands: Vec<(&str, &'static str, Message)> = vec![
-            ("File: Save", "Ctrl+S", Message::Save),
-            ("Format Document", "Shift+Alt+F", Message::Edit(EditorEvent::FormatDocument)),
-            ("File: Open Folder", "Ctrl+O", Message::OpenFolderDialog),
+            ("File: Save", "file.save", Message::Save),
+            ("Format Document", "edit.format", Message::Edit(EditorEvent::FormatDocument)),
+            ("File: Open Folder", "file.openFolder", Message::OpenFolderDialog),
             ("File: Close Folder", "", Message::CloseFolder),
-            ("File: Close Tab", "Ctrl+W", Message::CloseActiveTab),
+            ("File: Close Tab", "file.closeTab", Message::CloseActiveTab),
             ("File: Reload from Disk", "", Message::ReloadActive),
-            ("Go to File", "Ctrl+P", Message::OpenPalette(String::new())),
-            ("Go to Line", "Ctrl+G", Message::OpenPalette(":".to_string())),
-            ("Go to Symbol in File", "Ctrl+Shift+O", Message::OpenPalette("@".to_string())),
+            ("Go to File", "file.quickOpen", Message::OpenPalette(String::new())),
+            ("Go to Line", "go.line", Message::OpenPalette(":".to_string())),
+            ("Go to Symbol in File", "go.symbol", Message::OpenPalette("@".to_string())),
             ("View: Outline", "", Message::ShowSidebar(SidebarView::Outline)),
             ("View: Files", "", Message::ShowSidebar(SidebarView::Files)),
-            ("Go to Definition", "F12", Message::GotoDefinition),
-            ("Find All References", "Shift+F12", Message::FindReferences),
-            ("Rename Symbol", "F2", Message::StartRename),
-            ("Find", "Ctrl+F", Message::OpenFind { replace: false }),
-            ("Replace", "Ctrl+H", Message::OpenFind { replace: true }),
-            ("Search in Project", "Ctrl+Shift+F", Message::OpenSearch),
-            ("Run: Project", "F5", Message::RunProject),
-            ("Run: Current Scene", "F6", Message::RunScene),
+            ("Go to Definition", "go.definition", Message::GotoDefinition),
+            ("Find All References", "go.references", Message::FindReferences),
+            ("Rename Symbol", "refactor.rename", Message::StartRename),
+            ("Find", "find.find", Message::OpenFind { replace: false }),
+            ("Replace", "find.replace", Message::OpenFind { replace: true }),
+            ("Search in Project", "search.project", Message::OpenSearch),
+            ("Run: Project", "run.project", Message::RunProject),
+            ("Run: Current Scene", "run.scene", Message::RunScene),
             ("Run: Choose Scene for This Script...", "", Message::ChooseScene),
-            ("Run: Stop", "F8", Message::StopRun),
+            ("Run: Stop", "run.stop", Message::StopRun),
             ("Godot: Open in Editor", "", Message::OpenInGodot),
-            ("View: Toggle Terminal", "Ctrl+J", Message::ToggleTerminal),
-            ("View: Split Editor (Move Tab to the Other Side)", "Ctrl+\\", Message::SplitMove),
+            ("View: Toggle Terminal", "view.terminal", Message::ToggleTerminal),
+            ("View: Split Editor (Move Tab to the Other Side)", "view.split", Message::SplitMove),
             ("View: Focus the Other Side", "", Message::FocusOtherSide),
-            ("View: Zoom In", "Ctrl+=", Message::Zoom(1)),
-            ("View: Zoom Out", "Ctrl+-", Message::Zoom(-1)),
-            ("View: Reset Zoom", "Ctrl+0", Message::ZoomReset),
+            ("View: Zoom In", "view.zoomIn", Message::Zoom(1)),
+            ("View: Zoom Out", "view.zoomOut", Message::Zoom(-1)),
+            ("View: Reset Zoom", "view.zoomReset", Message::ZoomReset),
             ("View: Problems", "", Message::ShowPanel(Panel::Problems)),
             ("View: Output", "", Message::ShowPanel(Panel::Output)),
             ("View: Search Results", "", Message::ShowPanel(Panel::Search)),
             ("Terminal: Kill", "", Message::KillTerminal),
             ("Output: Clear", "", Message::ClearOutput),
             ("Language Server: Restart", "", Message::RestartLsp),
-            ("Edit: Undo", "Ctrl+Z", edit(Command::Undo)),
-            ("Edit: Redo", "Ctrl+Y", edit(Command::Redo)),
-            ("Edit: Select All", "Ctrl+A", edit(Command::SelectAll)),
-            ("Edit: Toggle Comment", "Ctrl+K", edit(Command::ToggleComment)),
-            ("Fold / Unfold", "Alt+F", edit(Command::ToggleFoldAtCursor)),
+            ("Edit: Undo", "edit.undo", edit(Command::Undo)),
+            ("Edit: Redo", "edit.redo", edit(Command::Redo)),
+            ("Edit: Select All", "edit.selectAll", edit(Command::SelectAll)),
+            ("Edit: Toggle Comment", "edit.toggleComment", edit(Command::ToggleComment)),
+            ("Fold / Unfold", "edit.fold", edit(Command::ToggleFoldAtCursor)),
             ("Fold", "", edit(Command::Fold)),
             ("Unfold", "", edit(Command::Unfold)),
             ("Fold All", "", edit(Command::FoldAll)),
             ("Unfold All", "", edit(Command::UnfoldAll)),
-            ("Edit: Duplicate Line", "Shift+Alt+Down", edit(Command::DuplicateLines)),
-            ("Edit: Delete Line", "Ctrl+Shift+K", edit(Command::DeleteLines)),
-            ("Edit: Move Line Up", "Alt+Up", edit(Command::MoveLinesUp)),
-            ("Edit: Move Line Down", "Alt+Down", edit(Command::MoveLinesDown)),
+            ("Edit: Duplicate Line", "edit.duplicateLine", edit(Command::DuplicateLines)),
+            ("Edit: Delete Line", "edit.deleteLine", edit(Command::DeleteLines)),
+            ("Edit: Move Line Up", "edit.moveLineUp", edit(Command::MoveLinesUp)),
+            ("Edit: Move Line Down", "edit.moveLineDown", edit(Command::MoveLinesDown)),
             ("Edit: Indent", "Tab", edit(Command::Indent)),
             ("Edit: Outdent", "Shift+Tab", edit(Command::Outdent)),
-            ("Edit: Select Next Occurrence", "Ctrl+D", edit(Command::SelectNextOccurrence)),
-            ("Edit: Add Cursor Above", "Ctrl+Alt+Up", edit(Command::AddCursorAbove)),
-            ("Edit: Add Cursor Below", "Ctrl+Alt+Down", edit(Command::AddCursorBelow)),
-            ("Edit: Trigger Completion", "Ctrl+Space", Message::Edit(EditorEvent::TriggerCompletion)),
-            ("Help: Keyboard Shortcuts", "F1", Message::OpenShortcuts),
+            ("Edit: Select Next Occurrence", "edit.selectNextOccurrence", edit(Command::SelectNextOccurrence)),
+            ("Edit: Add Cursor Above", "edit.cursorAbove", edit(Command::AddCursorAbove)),
+            ("Edit: Add Cursor Below", "edit.cursorBelow", edit(Command::AddCursorBelow)),
+            ("Edit: Trigger Completion", "edit.completion", Message::Edit(EditorEvent::TriggerCompletion)),
+            ("Help: Keyboard Shortcuts", "view.shortcuts", Message::OpenShortcuts),
             ("Theme: Edit Colors", "", Message::OpenThemeEditor),
             ("Theme: Import File...", "", Message::ThemeEditor(ThemeMessage::Import)),
             ("Theme: Export File...", "", Message::ThemeEditor(ThemeMessage::Export)),
@@ -1373,9 +1399,13 @@ impl App {
             .collect();
         let mut entries: Vec<CommandEntry<Message>> = commands
             .drain(..)
-            .map(|(name, shortcut, message)| CommandEntry { name: name.to_string(), shortcut, message })
+            .map(|(name, shortcut, message)| {
+                // A command id shows its current key; anything else is literal.
+                let shortcut = if shortcut.contains('.') { self.keymap.label(shortcut) } else { shortcut.to_string() };
+                CommandEntry { name: name.to_string(), shortcut, message }
+            })
             .collect();
-        entries.extend(themes.into_iter().map(|(name, message)| CommandEntry { name, shortcut: "", message }));
+        entries.extend(themes.into_iter().map(|(name, message)| CommandEntry { name, shortcut: String::new(), message }));
         let current = self.project.as_ref().map(|p| p.root.as_path());
         entries.extend(
             self.recent
@@ -1383,7 +1413,7 @@ impl App {
                 .filter(|r| !r.missing && current.is_none_or(|c| !uri::same_path(c, &r.root)))
                 .map(|r| CommandEntry {
                     name: format!("Open Recent: {} ({})", r.name, r.root.display()),
-                    shortcut: "",
+                    shortcut: String::new(),
                     message: Message::OpenRecent(r.root.clone()),
                 }),
         );
@@ -1807,7 +1837,7 @@ impl App {
         self.focus = Focus::Editor;
     }
 
-    fn on_editor(&mut self, event: EditorEvent) {
+    fn on_editor(&mut self, event: EditorEvent) -> Task<Message> {
         match event {
             EditorEvent::Command(command) => {
                 let typed = match &command {
@@ -1874,7 +1904,9 @@ impl App {
                 self.focus = Focus::Editor;
                 self.palette = None;
             }
+            EditorEvent::Shortcut(id) => return self.run_command(id),
         }
+        Task::none()
     }
 
     /// Applies an edit to the active tab and syncs it to the language server.
@@ -2737,6 +2769,94 @@ impl App {
         }
     }
 
+    /// Keys the terminal leaves to the IDE (all others go to the shell).
+    fn terminal_passthrough(&self) -> Vec<keymap::Chord> {
+        keymap::TERMINAL_PASSTHROUGH.iter().flat_map(|id| self.keymap.chords(id).iter().cloned()).collect()
+    }
+
+    /// Runs a key-mapped command.
+    fn run_command(&mut self, id: &str) -> Task<Message> {
+        match command_message(id) {
+            Some(message) => self.handle(message),
+            None => Task::none(),
+        }
+    }
+
+    /// A key press that no widget used: shortcut recording on the shortcuts
+    /// page, palette navigation, then the key map.
+    fn on_key(&mut self, event: keyboard::Event) -> Task<Message> {
+        let (key, modifiers) = match numpad::fix_key_event(event) {
+            keyboard::Event::KeyPressed { key, modifiers, .. } => (key, modifiers),
+            keyboard::Event::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
+                return Task::none();
+            }
+            keyboard::Event::KeyReleased { .. } => return Task::none(),
+        };
+        if let Some(id) = self.shortcuts.as_ref().and_then(|page| page.recording) {
+            self.record_shortcut(id, &key, modifiers);
+            return Task::none();
+        }
+        use keyboard::key::Named;
+        // Palette list navigation (text inputs leave these keys alone).
+        let palette_move = match key.as_ref() {
+            keyboard::Key::Named(Named::ArrowUp) => Some(-1),
+            keyboard::Key::Named(Named::ArrowDown) => Some(1),
+            keyboard::Key::Named(Named::PageUp) => Some(-12),
+            keyboard::Key::Named(Named::PageDown) => Some(12),
+            _ => None,
+        };
+        if let (Some(delta), Some(_)) = (palette_move, &self.palette) {
+            return self.handle(Message::Palette(PaletteMessage::Move(delta)));
+        }
+        match keymap::Chord::from_key(&key, modifiers).and_then(|chord| self.keymap.lookup(&chord)) {
+            Some(id) => self.run_command(id),
+            None => Task::none(),
+        }
+    }
+
+    /// The next key pressed on the shortcuts page becomes `id`'s shortcut.
+    fn record_shortcut(&mut self, id: &'static str, key: &keyboard::Key, modifiers: keyboard::Modifiers) {
+        use keyboard::key::Named;
+        let done = |app: &mut Self| {
+            if let Some(page) = &mut app.shortcuts {
+                page.recording = None;
+            }
+        };
+        match key.as_ref() {
+            keyboard::Key::Named(Named::Escape) => {
+                done(self);
+                self.status = Some("Shortcut unchanged".to_string());
+                return;
+            }
+            keyboard::Key::Named(Named::Backspace | Named::Delete) if modifiers.is_empty() => {
+                done(self);
+                self.keymap.unbind(id);
+                self.status = Some(format!("{}: no shortcut", keymap::title(id)));
+            }
+            _ => {
+                // Lone modifier presses arrive as named keys: wait for more.
+                let Some(chord) = keymap::Chord::from_key(key, modifiers) else {
+                    if matches!(key, keyboard::Key::Character(_)) || matches!(key.as_ref(), keyboard::Key::Named(Named::Enter | Named::Tab | Named::Space)) {
+                        self.status = Some("Shortcuts need Ctrl or Alt (or a function key). Escape cancels".to_string());
+                    }
+                    return;
+                };
+                done(self);
+                let taken = self.keymap.rebind(id, chord.clone());
+                let mut status = format!("{}: {chord}", keymap::title(id));
+                if !taken.is_empty() {
+                    let titles: Vec<&str> = taken.iter().map(|other| keymap::title(other)).collect();
+                    status.push_str(&format!(" (removed from {})", titles.join(", ")));
+                }
+                self.status = Some(status);
+            }
+        }
+        if let Err(error) = self.keymap.save() {
+            self.status = Some(format!("Cannot save shortcuts: {error}"));
+        }
+    }
+
     /// Copies the selection to the clipboard (the right-click menu's Copy /
     /// Cut; the keys are handled in the editor itself).
     fn copy_selection(&mut self, cut: bool) -> Task<Message> {
@@ -2785,6 +2905,8 @@ impl App {
     fn context_entries(&self, target: &ContextTarget) -> Vec<context_menu::Entry<Message>> {
         use context_menu::Entry;
         let pick = |message: Message| Message::MenuPick(Box::new(message));
+        // Current keys of a command, as the menus show them.
+        let key = |id: &str| self.keymap.label(id);
         let godot = self.project.as_ref().and_then(|p| p.godot.as_ref());
         let paths = |path: &Path| -> Vec<Entry<Message>> {
             let mut entries = vec![Entry::item("Copy Path", pick(Message::CopyText(path.display().to_string())))];
@@ -2811,9 +2933,9 @@ impl App {
                 };
                 let side = if tab.group == 0 && !self.is_split() { "Move to the Right Side" } else { "Move to the Other Side" };
                 let mut entries = vec![
-                    Entry::with_shortcut("Close", "Ctrl+W", Some(pick(Message::CloseTab(*index)))),
+                    Entry::with_shortcut("Close", key("file.closeTab"), Some(pick(Message::CloseTab(*index)))),
                     Entry::item("Close Others", pick(Message::CloseOtherTabs(*index))),
-                    Entry::with_shortcut(side, "Ctrl+\\", Some(pick(Message::MoveTabToOtherSide(*index)))),
+                    Entry::with_shortcut(side, key("view.split"), Some(pick(Message::MoveTabToOtherSide(*index)))),
                     Entry::Separator,
                 ];
                 entries.extend(paths(&tab.path));
@@ -2827,19 +2949,19 @@ impl App {
                 let selection = !tab.buffer.primary().is_empty();
                 let when = |enabled: bool, message: Message| enabled.then(|| pick(message));
                 vec![
-                    Entry::with_shortcut("Go to Definition", "F12", when(code, Message::GotoDefinition)),
-                    Entry::with_shortcut("Find All References", "Shift+F12", when(code, Message::FindReferences)),
-                    Entry::with_shortcut("Rename Symbol", "F2", when(code, Message::StartRename)),
+                    Entry::with_shortcut("Go to Definition", key("go.definition"), when(code, Message::GotoDefinition)),
+                    Entry::with_shortcut("Find All References", key("go.references"), when(code, Message::FindReferences)),
+                    Entry::with_shortcut("Rename Symbol", key("refactor.rename"), when(code, Message::StartRename)),
                     Entry::Separator,
                     Entry::with_shortcut("Cut", "Ctrl+X", when(selection, Message::EditorCut)),
                     Entry::with_shortcut("Copy", "Ctrl+C", when(selection, Message::EditorCopy)),
                     Entry::with_shortcut("Paste", "Ctrl+V", Some(pick(Message::EditorPaste))),
                     Entry::Separator,
-                    Entry::with_shortcut("Toggle Comment", "Ctrl+K", Some(pick(Message::Edit(EditorEvent::Command(Command::ToggleComment))))),
-                    Entry::with_shortcut("Fold / Unfold", "Alt+F", Some(pick(Message::Edit(EditorEvent::Command(Command::ToggleFoldAtCursor))))),
-                    Entry::with_shortcut("Format Document", "Shift+Alt+F", Some(pick(Message::Edit(EditorEvent::FormatDocument)))),
+                    Entry::with_shortcut("Toggle Comment", key("edit.toggleComment"), Some(pick(Message::Edit(EditorEvent::Command(Command::ToggleComment))))),
+                    Entry::with_shortcut("Fold / Unfold", key("edit.fold"), Some(pick(Message::Edit(EditorEvent::Command(Command::ToggleFoldAtCursor))))),
+                    Entry::with_shortcut("Format Document", key("edit.format"), Some(pick(Message::Edit(EditorEvent::FormatDocument)))),
                     Entry::Separator,
-                    Entry::with_shortcut("Move to the Other Side", "Ctrl+\\", Some(pick(Message::SplitMove))),
+                    Entry::with_shortcut("Move to the Other Side", key("view.split"), Some(pick(Message::SplitMove))),
                 ]
             }
         }
@@ -3152,7 +3274,7 @@ impl App {
             return space().into();
         };
         let ui = &self.current_theme().ui;
-        let view = page.view(ui).map(Message::Shortcuts);
+        let view = page.view(ui, &self.keymap).map(Message::Shortcuts);
         let view = on_escape::on_escape(view, Message::Shortcuts(ShortcutsMessage::Close));
         container(view).width(Length::Fill).height(Length::Fill).style(style::surface(ui)).into()
     }
@@ -3292,6 +3414,7 @@ impl App {
         let colors = code_editor::Colors::from_theme(self.current_theme());
         let mut editor = CodeEditor::new(&tab.buffer, colors, move |event| Message::EditIn(group, event))
             .font(code_editor::CodeFont::from_settings(&self.current_theme().font))
+            .keymap(&self.keymap)
             .marks(&tab.marks)
             .focused(focused && self.focus == Focus::Editor);
         let mut area = column![self.tab_bar(group)];
@@ -3377,6 +3500,7 @@ impl App {
             Panel::Terminal => match &self.terminal.session {
                 Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
                     .font(code_editor::CodeFont::from_settings(&theme.font))
+                    .passthrough(self.terminal_passthrough())
                     .focused(self.focus == Focus::Terminal)
                     .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
                     .into(),
@@ -3578,58 +3702,6 @@ impl App {
     }
 }
 
-/// Global shortcuts, for key presses no widget handled.
-fn shortcut(event: keyboard::Event) -> Option<Message> {
-    // Numpad keys arrive as navigation keys even with NumLock on.
-    let (key, modifiers) = match numpad::fix_key_event(event) {
-        keyboard::Event::KeyPressed { key, modifiers, .. } => (key, modifiers),
-        keyboard::Event::ModifiersChanged(modifiers) => return Some(Message::ModifiersChanged(modifiers)),
-        keyboard::Event::KeyReleased { .. } => return None,
-    };
-    match key.as_ref() {
-        keyboard::Key::Named(keyboard::key::Named::F12) if modifiers.shift() => Some(Message::FindReferences),
-        keyboard::Key::Named(keyboard::key::Named::F12) => Some(Message::GotoDefinition),
-        keyboard::Key::Named(keyboard::key::Named::F2) => Some(Message::StartRename),
-        keyboard::Key::Named(keyboard::key::Named::F1) => Some(Message::OpenShortcuts),
-        keyboard::Key::Character("\\") if modifiers.command() => Some(Message::SplitMove),
-        // Zoom: Ctrl+= (or Ctrl++), Ctrl+-, Ctrl+0, also on the numeric keypad.
-        keyboard::Key::Character("=" | "+") if modifiers.command() => Some(Message::Zoom(1)),
-        keyboard::Key::Character("-") if modifiers.command() => Some(Message::Zoom(-1)),
-        keyboard::Key::Character("0") if modifiers.command() => Some(Message::ZoomReset),
-        keyboard::Key::Named(keyboard::key::Named::F3) if modifiers.shift() => {
-            Some(Message::Find(FindMessage::Previous))
-        }
-        keyboard::Key::Named(keyboard::key::Named::F3) => Some(Message::Find(FindMessage::Next)),
-        // Palette list navigation; ignored while it is closed. (Text inputs
-        // leave these keys alone, and the editor captures them itself.)
-        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(Message::Palette(PaletteMessage::Move(-1))),
-        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(Message::Palette(PaletteMessage::Move(1))),
-        keyboard::Key::Named(keyboard::key::Named::PageUp) => Some(Message::Palette(PaletteMessage::Move(-12))),
-        keyboard::Key::Named(keyboard::key::Named::PageDown) => Some(Message::Palette(PaletteMessage::Move(12))),
-        keyboard::Key::Character("p" | "P") if modifiers.command() && modifiers.shift() => {
-            Some(Message::OpenPalette(">".to_string()))
-        }
-        keyboard::Key::Character("p") if modifiers.command() => Some(Message::OpenPalette(String::new())),
-        keyboard::Key::Character("g") if modifiers.command() => Some(Message::OpenPalette(":".to_string())),
-        keyboard::Key::Character("o" | "O") if modifiers.command() && modifiers.shift() => {
-            Some(Message::OpenPalette("@".to_string()))
-        }
-        keyboard::Key::Character("f" | "F") if modifiers.command() && modifiers.shift() => Some(Message::OpenSearch),
-        keyboard::Key::Character("f") if modifiers.command() => Some(Message::OpenFind { replace: false }),
-        keyboard::Key::Character("h") if modifiers.command() => Some(Message::OpenFind { replace: true }),
-        // Godot editor bindings: F5 run, F6 run current scene, F8 stop.
-        keyboard::Key::Named(keyboard::key::Named::F5) if modifiers.shift() => Some(Message::StopRun),
-        keyboard::Key::Named(keyboard::key::Named::F5) => Some(Message::RunProject),
-        keyboard::Key::Named(keyboard::key::Named::F6) => Some(Message::RunScene),
-        keyboard::Key::Named(keyboard::key::Named::F8) => Some(Message::StopRun),
-        keyboard::Key::Character("s") if modifiers.command() => Some(Message::Save),
-        keyboard::Key::Character("o") if modifiers.command() => Some(Message::OpenFolderDialog),
-        keyboard::Key::Character("w") if modifiers.command() => Some(Message::CloseActiveTab),
-        // Ctrl+J (VS Code), Ctrl+` and Ctrl+² (the key left of 1 on AZERTY).
-        keyboard::Key::Character("j" | "`" | "²") if modifiers.command() => Some(Message::ToggleTerminal),
-        _ => None,
-    }
-}
 
 /// How often the session is saved while working (when it changed).
 const AUTOSAVE_SECONDS: u64 = 30;
@@ -3651,6 +3723,52 @@ async fn sleep(duration: std::time::Duration) {
 /// UTF-8 without NUL bytes: worth opening in the editor.
 fn is_text_file(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|text| !text.contains('\0'))
+}
+
+/// What a key-mapped command does (ids from `keymap::COMMANDS`).
+fn command_message(id: &str) -> Option<Message> {
+    let edit = |command: Command| Message::Edit(EditorEvent::Command(command));
+    Some(match id {
+        "file.save" => Message::Save,
+        "file.openFolder" => Message::OpenFolderDialog,
+        "file.closeTab" => Message::CloseActiveTab,
+        "file.quickOpen" => Message::OpenPalette(String::new()),
+        "palette.commands" => Message::OpenPalette(">".to_string()),
+        "go.line" => Message::OpenPalette(":".to_string()),
+        "go.symbol" => Message::OpenPalette("@".to_string()),
+        "go.definition" => Message::GotoDefinition,
+        "go.references" => Message::FindReferences,
+        "refactor.rename" => Message::StartRename,
+        "find.find" => Message::OpenFind { replace: false },
+        "find.replace" => Message::OpenFind { replace: true },
+        "find.next" => Message::Find(FindMessage::Next),
+        "find.previous" => Message::Find(FindMessage::Previous),
+        "search.project" => Message::OpenSearch,
+        "run.project" => Message::RunProject,
+        "run.scene" => Message::RunScene,
+        "run.stop" => Message::StopRun,
+        "view.terminal" => Message::ToggleTerminal,
+        "view.split" => Message::SplitMove,
+        "view.shortcuts" => Message::OpenShortcuts,
+        "view.zoomIn" => Message::Zoom(1),
+        "view.zoomOut" => Message::Zoom(-1),
+        "view.zoomReset" => Message::ZoomReset,
+        "edit.undo" => edit(Command::Undo),
+        "edit.redo" => edit(Command::Redo),
+        "edit.selectAll" => edit(Command::SelectAll),
+        "edit.toggleComment" => edit(Command::ToggleComment),
+        "edit.deleteLine" => edit(Command::DeleteLines),
+        "edit.moveLineUp" => edit(Command::MoveLinesUp),
+        "edit.moveLineDown" => edit(Command::MoveLinesDown),
+        "edit.duplicateLine" => edit(Command::DuplicateLines),
+        "edit.cursorAbove" => edit(Command::AddCursorAbove),
+        "edit.cursorBelow" => edit(Command::AddCursorBelow),
+        "edit.selectNextOccurrence" => edit(Command::SelectNextOccurrence),
+        "edit.completion" => Message::Edit(EditorEvent::TriggerCompletion),
+        "edit.fold" => edit(Command::ToggleFoldAtCursor),
+        "edit.format" => Message::Edit(EditorEvent::FormatDocument),
+        _ => return None,
+    })
 }
 
 /// Shows a file (selected) or folder in the system file manager.

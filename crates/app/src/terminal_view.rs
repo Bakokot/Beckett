@@ -19,6 +19,7 @@ use terminal::{
 };
 
 use crate::code_editor::{measure, CodeFont, Metrics};
+use crate::keymap::Chord;
 
 const PADDING: f32 = 6.0;
 
@@ -29,6 +30,7 @@ pub struct TerminalView<'a, Message> {
     focused: bool,
     on_focus: Message,
     font: CodeFont,
+    passthrough: Vec<Chord>,
 }
 
 impl<'a, Message: Clone> TerminalView<'a, Message> {
@@ -40,7 +42,14 @@ impl<'a, Message: Clone> TerminalView<'a, Message> {
             focused: false,
             on_focus,
             font: CodeFont::default(),
+            passthrough: Vec::new(),
         }
+    }
+
+    /// Key presses left to the app instead of sent to the shell.
+    pub fn passthrough(mut self, chords: Vec<Chord>) -> Self {
+        self.passthrough = chords;
+        self
     }
 
     pub fn font(mut self, font: CodeFont) -> Self {
@@ -326,12 +335,14 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })
                 if self.focused =>
             {
+                // IDE-wide shortcuts (palette, terminal toggle, run…) go to the app.
+                if Chord::from_key(key, *modifiers).is_some_and(|chord| self.passthrough.contains(&chord)) {
+                    return;
+                }
                 let mods = Mods { ctrl: modifiers.control(), alt: modifiers.alt(), shift: modifiers.shift() };
                 if mods.ctrl && !mods.alt {
                     if let keyboard::Key::Character(c) = key.as_ref() {
                         match c.to_lowercase().as_str() {
-                            // Left to the app (panel toggle).
-                            "j" | "`" | "²" => return,
                             // Copy when something is selected, else send ^C.
                             "c" if mods.shift || self.terminal.selected_text().is_some() => {
                                 if let Some(selected) = self.terminal.selected_text() {

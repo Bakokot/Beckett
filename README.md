@@ -21,7 +21,9 @@ Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to 
 `Ctrl+Space` completion, `Ctrl+J` (or `Ctrl+²`) toggle terminal, `F5` run project,
 `F6` run current scene, `F8` stop, `Ctrl+F` find, `Ctrl+H` replace, `Ctrl+Shift+F` search in project,
 `Ctrl+P` go to file, `Ctrl+Shift+P` command palette, `Ctrl+G` go to line.
-Press `F1` (or click `?` in the status bar) for the full list inside the IDE.
+Press `F1` (or click `?` in the status bar) for the full list inside the IDE. Click a
+command's shortcut there and press new keys to change it; changes are saved to
+`keybindings.json` in the config folder (only the bindings that differ from the defaults).
 
 ## Themes
 
