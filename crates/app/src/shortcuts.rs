@@ -91,7 +91,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Run",
         &[
             ("F5", "Run the project's main scene"),
-            ("F6", "Run the current scene (or the scene using this script)"),
+            ("F6", "Run the current scene, or the scene using this script (asks once when several do)"),
             ("F8 / Shift+F5", "Stop the game"),
         ],
     ),

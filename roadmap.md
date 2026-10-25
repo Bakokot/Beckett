@@ -140,7 +140,8 @@ crates/
 - [x] Output tab: ANSI stripped, errors/warnings colored (backtrace lines inherit), clickable
       `res://…:line` links, exit code; the game (and its child process) dies with the IDE
 - [x] Bottom panel is now tabbed: Problems / Output / Terminal
-- [ ] Pick among several scenes using the same script (currently the first one)
+- [x] Pick among several scenes using the same script: F6 asks once in the palette and remembers
+      the choice per script; "Run: Choose Scene for This Script..." asks again
 - [x] Runtime errors and warnings in the Problems panel and inline (paired with the first
       `res://` location after them, repeats counted, cleared on the next run)
 

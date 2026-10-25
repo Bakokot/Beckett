@@ -100,6 +100,10 @@ pub enum Message {
     RunProject,
     /// Run the scene of the active tab (F6).
     RunScene,
+    /// Pick which scene F6 runs for the current script.
+    ChooseScene,
+    /// Run this scene for this script, and remember the choice.
+    RunChosenScene(PathBuf, String),
     /// Open the project, at the current scene, in the Godot editor.
     OpenInGodot,
     StopRun,
@@ -256,6 +260,8 @@ struct App {
     link_probe: Option<u64>,
     /// `uid://` lookups (they scan the project), cleared when files change.
     uid_cache: HashMap<String, Option<PathBuf>>,
+    /// Scene F6 runs for a script used by several scenes, once picked.
+    scene_choice: HashMap<PathBuf, String>,
     terminal: TerminalState,
     focus: Focus,
 }
@@ -338,6 +344,7 @@ impl App {
             link: None,
             link_probe: None,
             uid_cache: HashMap::new(),
+            scene_choice: HashMap::new(),
             terminal: TerminalState::default(),
             focus: Focus::Editor,
         };
@@ -589,10 +596,12 @@ impl App {
             }
             Message::RunProject => self.start_run(None),
             Message::OpenInGodot => self.open_in_godot(),
-            Message::RunScene => match self.current_scene() {
-                Ok(scene) => self.start_run(Some(scene)),
-                Err(reason) => self.status = Some(reason),
-            },
+            Message::RunScene => return self.run_scene(false),
+            Message::ChooseScene => return self.run_scene(true),
+            Message::RunChosenScene(script, scene) => {
+                self.scene_choice.insert(script, scene.clone());
+                self.start_run(Some(scene));
+            }
             Message::StopRun => {
                 if self.run.handle.take().is_some() {
                     self.push_output(OutputLine::info("Stopping..."));
@@ -1016,6 +1025,7 @@ impl App {
             ("Search in Project", "Ctrl+Shift+F", Message::OpenSearch),
             ("Run: Project", "F5", Message::RunProject),
             ("Run: Current Scene", "F6", Message::RunScene),
+            ("Run: Choose Scene for This Script...", "", Message::ChooseScene),
             ("Run: Stop", "F8", Message::StopRun),
             ("Godot: Open in Editor", "", Message::OpenInGodot),
             ("View: Toggle Terminal", "Ctrl+J", Message::ToggleTerminal),
@@ -1148,6 +1158,16 @@ impl App {
     /// The `res://` scene to run for the active tab: the scene itself, or
     /// a scene its script is attached to.
     fn current_scene(&self) -> Result<String, String> {
+        let (path, scenes) = self.scenes_for_active()?;
+        match self.scene_choice.get(&path).filter(|s| scenes.contains(s)) {
+            Some(chosen) => Ok(chosen.clone()),
+            None => Ok(scenes[0].clone()),
+        }
+    }
+
+    /// The active tab's path and the `res://` scenes it can run as: itself
+    /// for a scene, the scenes it is attached to for a script (never empty).
+    fn scenes_for_active(&self) -> Result<(PathBuf, Vec<String>), String> {
         let godot = self
             .project
             .as_ref()
@@ -1156,11 +1176,46 @@ impl App {
         let tab = self.active_tab().ok_or("No file open")?;
         let res_path = godot.to_res_path(&tab.path).ok_or("File is outside the project")?;
         if res_path.ends_with(".tscn") {
-            return Ok(res_path);
+            return Ok((tab.path.clone(), vec![res_path]));
         }
-        let scenes = godot.scenes_using(&res_path);
-        let scene = scenes.first().ok_or_else(|| format!("No scene uses {res_path}"))?;
-        godot.to_res_path(scene).ok_or_else(|| "Scene is outside the project".to_string())
+        let scenes: Vec<String> =
+            godot.scenes_using(&res_path).iter().filter_map(|scene| godot.to_res_path(scene)).collect();
+        if scenes.is_empty() {
+            return Err(format!("No scene uses {res_path}"));
+        }
+        Ok((tab.path.clone(), scenes))
+    }
+
+    /// F6: runs the current scene, asking which one first when several
+    /// scenes use the script and none was picked yet (or `ask` is set).
+    fn run_scene(&mut self, ask: bool) -> Task<Message> {
+        let (path, scenes) = match self.scenes_for_active() {
+            Ok(found) => found,
+            Err(reason) => {
+                self.status = Some(reason);
+                return Task::none();
+            }
+        };
+        let chosen = self.scene_choice.get(&path).filter(|s| scenes.contains(s)).cloned();
+        if scenes.len() == 1 || (chosen.is_some() && !ask) {
+            let scene = chosen.unwrap_or_else(|| scenes[0].clone());
+            self.start_run(Some(scene));
+            return Task::none();
+        }
+        let choices = scenes
+            .into_iter()
+            .map(|scene| palette::Choice {
+                detail: if chosen.as_ref() == Some(&scene) { "last run".to_string() } else { String::new() },
+                message: Message::RunChosenScene(path.clone(), scene.clone()),
+                label: scene,
+            })
+            .collect();
+        let mut palette = Palette::choose("Several scenes use this script: run which one?", choices);
+        palette.refresh(&[]);
+        self.palette = Some(palette);
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        iced::widget::operation::focus(palette::INPUT)
     }
 
     /// Starts the Godot editor on the project, opening the current scene

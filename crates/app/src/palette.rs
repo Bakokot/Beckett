@@ -53,8 +53,19 @@ pub struct CommandEntry<M> {
     pub message: M,
 }
 
+/// One option when the palette asks to pick among a few things.
+#[derive(Debug, Clone)]
+pub struct Choice<M> {
+    pub label: String,
+    pub detail: String,
+    pub message: M,
+}
+
 pub struct Palette<M> {
     pub input: String,
+    /// Asking to pick one of these (with this prompt) instead of the
+    /// files / commands / line modes.
+    choices: Option<(&'static str, Vec<Choice<M>>)>,
     pub items: Vec<Item<M>>,
     pub selected: usize,
     /// First visible row; the wheel moves it independently of `selected`.
@@ -72,14 +83,30 @@ impl<M: Clone> Palette<M> {
         collect(root, root, &mut files);
         files.sort();
         let recent = open.iter().filter_map(|p| relative(root, p)).collect();
-        Self { input, items: Vec::new(), selected: 0, scroll: 0, files, root: root.to_path_buf(), recent }
+        Self { input, choices: None, items: Vec::new(), selected: 0, scroll: 0, files, root: root.to_path_buf(), recent }
+    }
+
+    /// Asks to pick one of `choices`; typing filters them.
+    pub fn choose(prompt: &'static str, choices: Vec<Choice<M>>) -> Self {
+        Self {
+            input: String::new(),
+            choices: Some((prompt, choices)),
+            items: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            files: Vec::new(),
+            root: PathBuf::new(),
+            recent: Vec::new(),
+        }
     }
 
     /// Rebuilds the list for the current input.
     pub fn refresh(&mut self, commands: &[CommandEntry<M>]) {
         self.selected = 0;
         self.scroll = 0;
-        self.items = if let Some(query) = self.input.strip_prefix('>') {
+        self.items = if let Some((_, choices)) = &self.choices {
+            choice_items(self.input.trim(), choices)
+        } else if let Some(query) = self.input.strip_prefix('>') {
             command_items(query.trim(), commands)
         } else if let Some(target) = self.input.strip_prefix(':') {
             line_items(target.trim())
@@ -111,6 +138,9 @@ impl<M: Clone> Palette<M> {
     }
 
     pub fn placeholder(&self) -> &'static str {
+        if let Some((prompt, _)) = &self.choices {
+            return prompt;
+        }
         match self.input.chars().next() {
             Some('>') => "Type a command",
             Some(':') => "Line number, optionally :column",
@@ -254,6 +284,25 @@ fn command_items<M: Clone>(query: &str, commands: &[CommandEntry<M>]) -> Vec<Ite
     scored.into_iter().map(|(_, _, item)| item).collect()
 }
 
+fn choice_items<M: Clone>(query: &str, choices: &[Choice<M>]) -> Vec<Item<M>> {
+    let mut scored: Vec<(i64, usize, Item<M>)> = choices
+        .iter()
+        .enumerate()
+        .filter_map(|(order, choice)| {
+            let m = fuzzy_match(query, &choice.label)?;
+            let item = Item {
+                label: choice.label.clone(),
+                matched: m.positions,
+                detail: choice.detail.clone(),
+                action: Action::Run(choice.message.clone()),
+            };
+            Some((m.score, order, item))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, _, item)| item).collect()
+}
+
 fn line_items<M>(target: &str) -> Vec<Item<M>> {
     let mut parts = target.split(':');
     let line = parts.next().and_then(|l| l.trim().parse::<u32>().ok()).filter(|&l| l > 0);
@@ -335,6 +384,7 @@ mod tests {
     fn palette(files: &[&str]) -> Palette<u8> {
         Palette {
             input: String::new(),
+            choices: None,
             items: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -357,6 +407,23 @@ mod tests {
         p.refresh(&[]);
         assert_eq!(p.items[0].label, "main.gd");
         assert_eq!(p.items.len(), 3);
+    }
+
+    #[test]
+    fn choices_ignore_prefixes_and_filter_by_label() {
+        let choice = |label: &str, message| Choice { label: label.into(), detail: String::new(), message };
+        let mut p = Palette::choose("Pick", vec![choice("res://levels/forest.tscn", 1), choice("res://levels/cave.tscn", 2)]);
+        p.refresh(&[]);
+        assert_eq!(p.items.len(), 2);
+        assert_eq!(p.placeholder(), "Pick");
+        p.input = "cave".into();
+        p.refresh(&[]);
+        assert_eq!(p.items.len(), 1);
+        assert!(matches!(p.items[0].action, Action::Run(2)));
+        // ">" and ":" are just text here, not mode switches.
+        p.input = ":".into();
+        p.refresh(&[]);
+        assert!(p.items.iter().all(|i| matches!(i.action, Action::Run(_))));
     }
 
     #[test]
