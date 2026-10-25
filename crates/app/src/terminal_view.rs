@@ -8,11 +8,15 @@ use iced::advanced::text::{self, Renderer as _};
 use iced::advanced::widget::{tree, Tree, Widget};
 use iced::advanced::{clipboard, mouse, Clipboard, Renderer as _, Shell};
 use iced::keyboard::{self, key::Named, Modifiers};
+use iced::time::{Duration, Instant};
 use iced::{
-    alignment, font, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size,
-    Theme,
+    alignment, font, window, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle,
+    Size, Theme,
 };
-use terminal::{encode_key, CellView, Key, Mods, Palette, Rgb, SelectionKind, Terminal};
+use terminal::{
+    encode_key, encode_mouse, CellView, Key, Mods, MouseAction, MouseButton, MouseTracking, Palette, Rgb,
+    SelectionKind, Terminal,
+};
 
 use crate::code_editor::{measure, Metrics};
 
@@ -57,10 +61,37 @@ struct State {
     dragging: bool,
     moved: bool,
     last_click: Option<mouse::Click>,
+    /// Button held down while an app tracks the mouse, and the last cell
+    /// reported, so moves within one cell aren't sent again.
+    reported_button: Option<MouseButton>,
+    reported_cell: Option<(usize, usize)>,
+    /// Cursor blink phase starts here (reset on focus and on typing).
+    blink_from: Option<Instant>,
+    now: Option<Instant>,
+}
+
+const BLINK_MILLIS: u128 = 500;
+
+impl State {
+    fn cursor_visible(&self) -> bool {
+        match (self.blink_from, self.now) {
+            (Some(from), Some(now)) => (now.saturating_duration_since(from).as_millis() / BLINK_MILLIS).is_multiple_of(2),
+            _ => true,
+        }
+    }
 }
 
 fn color(rgb: Rgb) -> Color {
     Color::from_rgb8(rgb.r, rgb.g, rgb.b)
+}
+
+fn to_mouse_button(button: mouse::Button) -> Option<MouseButton> {
+    match button {
+        mouse::Button::Left => Some(MouseButton::Left),
+        mouse::Button::Middle => Some(MouseButton::Middle),
+        mouse::Button::Right => Some(MouseButton::Right),
+        _ => None,
+    }
 }
 
 /// Grid cell under `point`.
@@ -155,9 +186,84 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
         };
         let bounds = layout.bounds();
 
+        // Mouse reporting: when the app tracks the mouse (and Shift isn't
+        // held, which keeps selecting text), clicks, moves and the wheel go
+        // to it instead.
+        let modes = self.terminal.input_modes();
+        let tracking = modes.mouse != MouseTracking::Off && !state.modifiers.shift();
+        let mods = Mods { ctrl: state.modifiers.control(), alt: state.modifiers.alt(), shift: state.modifiers.shift() };
+        let report = |state: &mut State, action: MouseAction, cell: (usize, usize)| {
+            if modes.mouse.reports(action) {
+                if let Some(bytes) = encode_mouse(action, cell.0, cell.1, mods, modes.sgr_mouse) {
+                    self.terminal.write(bytes);
+                }
+                state.reported_cell = Some(cell);
+            }
+        };
+
         match event {
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                state.now = Some(*now);
+                if self.focused {
+                    let from = *state.blink_from.get_or_insert(*now);
+                    let elapsed = now.saturating_duration_since(from).as_millis();
+                    let wait = BLINK_MILLIS - elapsed % BLINK_MILLIS;
+                    shell.request_redraw_at(*now + Duration::from_millis(wait as u64));
+                } else {
+                    // Blinking restarts, cursor shown, when focus comes back.
+                    state.blink_from = None;
+                }
+            }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(button)) if tracking => {
+                let (Some(point), Some(button)) = (cursor.position_over(bounds), to_mouse_button(*button)) else {
+                    return;
+                };
+                if !self.focused {
+                    shell.publish(self.on_focus.clone());
+                }
+                state.reported_button = Some(button);
+                report(state, MouseAction::Press(button), cell_at(bounds, metrics, point));
+                shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(button)) if state.reported_button.is_some() => {
+                if let (Some(pressed), Some(point)) = (state.reported_button, cursor.position()) {
+                    if Some(pressed) == to_mouse_button(*button) {
+                        state.reported_button = None;
+                        report(state, MouseAction::Release(pressed), cell_at(bounds, metrics, point));
+                    }
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position })
+                if tracking && (state.reported_button.is_some() || cursor.is_over(bounds)) =>
+            {
+                let cell = cell_at(bounds, metrics, *position);
+                if state.reported_cell != Some(cell) {
+                    report(state, MouseAction::Move(state.reported_button), cell);
+                }
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) && (tracking || modes.alt_screen) => {
+                let lines = match *delta {
+                    mouse::ScrollDelta::Lines { y, .. } => y * 3.0,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / metrics.line_height,
+                };
+                let steps = (lines.round() as i32).clamp(-10, 10);
+                let cell = cursor.position().map_or((0, 0), |p| cell_at(bounds, metrics, p));
+                for _ in 0..steps.unsigned_abs() {
+                    if tracking {
+                        report(state, if steps > 0 { MouseAction::WheelUp } else { MouseAction::WheelDown }, cell);
+                    } else if modes.alternate_scroll {
+                        // A full-screen app without mouse tracking (less, man):
+                        // the wheel scrolls it with arrow keys.
+                        let key = if steps > 0 { Key::Up } else { Key::Down };
+                        if let Some(bytes) = encode_key(&key, Mods::default(), modes.app_cursor) {
+                            self.terminal.write(bytes);
+                        }
+                    }
+                }
+                shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let Some(point) = cursor.position_over(bounds) else {
@@ -236,6 +342,8 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
                 let Some(key) = to_key(key, text.as_deref(), mods.ctrl && !mods.alt) else {
                     return;
                 };
+                // Keep the cursor visible while typing.
+                state.blink_from = state.now;
                 let app_cursor = self.terminal.input_modes().app_cursor;
                 if let Some(bytes) = encode_key(&key, mods, app_cursor) {
                     self.terminal.write(bytes);
@@ -327,11 +435,13 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
                 flush(r, &mut run, run_start, run_style);
             }
 
-            // Cursor: a block when focused, an outline otherwise.
+            // Cursor: a blinking block when focused, an outline otherwise.
             if let Some((row, column)) = snapshot.cursor {
                 let rect = cell_rect(row, column, 1);
                 let cursor = color(self.palette.cursor);
-                if self.focused {
+                if self.focused && !state.cursor_visible() {
+                    // Blinked off.
+                } else if self.focused {
                     fill(r, rect, cursor);
                     let under: Option<&CellView> = snapshot.rows[row]
                         .iter()
@@ -358,7 +468,10 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
         _viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        if cursor.is_over(layout.bounds()) {
+        let tracking = self.terminal.input_modes().mouse != MouseTracking::Off;
+        if cursor.is_over(layout.bounds()) && tracking {
+            mouse::Interaction::Idle
+        } else if cursor.is_over(layout.bounds()) {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::None

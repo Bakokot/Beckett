@@ -154,7 +154,9 @@ crates/
 - [x] Selection (drag, double-click word, triple-click line), Ctrl+C copies when selected, Ctrl+V paste
       (bracketed paste), wheel scrollback, keyboard focus switches between editor and terminal
 - [x] Resizable bottom panel: drag the line above it (kept between 100 px and the window minus 200)
-- [ ] Mouse reporting for TUI apps, cursor blink
+- [x] Mouse reporting for TUI apps (click/drag/motion tracking, SGR and X10 encodings; Shift+drag
+      still selects; wheel sends arrows in full-screen apps without tracking) — verified with WSL
+- [x] Blinking cursor (solid while typing)
 
 **Theming**
 - [x] Single-file theme (TOML): UI, syntax and terminal ANSI colors (fonts still to come)

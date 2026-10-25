@@ -2,8 +2,10 @@
 //! parsed by `alacritty_terminal`, exposed as a cell grid snapshot.
 
 mod keys;
+mod mouse;
 
 pub use keys::{encode_key, Key, Mods};
+pub use mouse::{encode_mouse, MouseAction, MouseButton, MouseTracking};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -101,6 +103,13 @@ pub struct Snapshot {
 pub struct InputModes {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
+    pub mouse: MouseTracking,
+    /// Report mouse events with the SGR encoding (DECSET 1006).
+    pub sgr_mouse: bool,
+    /// A full-screen app is showing (`less`, `vim`…): no scrollback.
+    pub alt_screen: bool,
+    /// With `alt_screen`, the wheel should send arrow keys (DECSET 1007).
+    pub alternate_scroll: bool,
 }
 
 pub struct Terminal {
@@ -243,9 +252,22 @@ impl Terminal {
 
     pub fn input_modes(&self) -> InputModes {
         let mode = *self.term.lock().mode();
+        let mouse = if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseTracking::Motion
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseTracking::Drags
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseTracking::Clicks
+        } else {
+            MouseTracking::Off
+        };
         InputModes {
             app_cursor: mode.contains(TermMode::APP_CURSOR),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+            mouse,
+            sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
+            alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
         }
     }
 
