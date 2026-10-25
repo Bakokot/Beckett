@@ -17,6 +17,9 @@ pub struct Completion {
     pub snippets_from: usize,
     /// Whether snippets are offered here (not after `.`, in strings, …).
     pub with_snippets: bool,
+    /// `res://` paths inside a string: `anchor` is the string's start and
+    /// the typed text may contain `/`, `.`, `:`.
+    pub paths: bool,
     /// Indices into `items`, best first.
     pub filtered: Vec<usize>,
     pub rows: Vec<CompletionRow>,
@@ -35,12 +38,34 @@ impl Completion {
             items: Vec::new(),
             snippets_from: 0,
             with_snippets,
+            paths: false,
             filtered: Vec::new(),
             rows: Vec::new(),
             selected: 0,
             doc: None,
         };
         completion.set_items(Vec::new());
+        completion
+    }
+
+    /// Completion of the `res://` paths in `files` for a string starting
+    /// at `anchor`.
+    pub fn paths(anchor: usize, files: Vec<String>) -> Self {
+        let mut completion = Self::new(None, anchor, false);
+        completion.paths = true;
+        completion.set_items(
+            files
+                .into_iter()
+                .map(|path| CompletionItem {
+                    label: path.clone(),
+                    insert_text: path,
+                    kind: CompletionKind::File,
+                    // Known to have no docs, so none are requested.
+                    documentation: Some(String::new()),
+                    raw: serde_json::Value::Null,
+                })
+                .collect(),
+        );
         completion
     }
 

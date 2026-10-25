@@ -69,7 +69,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Enter / Tab", "Accept the completion"),
             ("Escape", "Close the completion, hover or signature popup"),
             ("Tab / Shift+Tab", "Next / previous placeholder of a snippet (tagged snip in completions)"),
-            ("F12", "Go to definition"),
+            ("F12 / Ctrl+Click", "Go to definition, or open the res:// or uid:// path in a string"),
             ("Shift+F12", "Find all references"),
             ("F2", "Rename symbol in every file"),
             ("Mouse rest", "Documentation of the word under the mouse"),
@@ -229,7 +229,7 @@ mod tests {
 
         page.filter = "f12".to_string();
         let keys: Vec<&str> = page.matching().iter().flat_map(|(_, e)| e.iter().map(|(k, _)| *k)).collect();
-        assert_eq!(keys, ["F12", "Shift+F12"]);
+        assert_eq!(keys, ["F12 / Ctrl+Click", "Shift+F12"]);
 
         page.filter = "RUN stop".to_string();
         let found = page.matching();

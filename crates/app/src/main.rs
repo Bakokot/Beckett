@@ -8,6 +8,7 @@ mod find;
 mod lsp;
 mod on_escape;
 mod palette;
+mod paths;
 mod problems;
 mod recent;
 mod rename;
@@ -1311,6 +1312,7 @@ impl App {
                 }
             },
             EditorEvent::TriggerCompletion => self.request_completion(None),
+            EditorEvent::GotoDefinition => self.goto_definition(),
             EditorEvent::NextTabStop | EditorEvent::PreviousTabStop => {
                 self.completion = None;
                 self.signature = None;
@@ -1536,6 +1538,14 @@ impl App {
     }
 
     fn after_typing(&mut self, c: char) {
+        // Inside a `res://` string, every typed char narrows the path list.
+        if let Some(anchor) = self.path_completion_anchor() {
+            match &self.completion {
+                Some(completion) if completion.paths && completion.anchor == anchor => self.refilter_completion(),
+                _ => self.open_path_completion(anchor),
+            }
+            return;
+        }
         if c.is_alphanumeric() || c == '_' {
             if self.completion.is_some() {
                 self.refilter_completion();
@@ -1572,6 +1582,9 @@ impl App {
     /// Asks the server for completions; snippets are offered too, and alone
     /// when the server is not connected.
     fn request_completion(&mut self, trigger: Option<char>) {
+        if let Some(anchor) = self.path_completion_anchor() {
+            return self.open_path_completion(anchor);
+        }
         let Some(tab) = self.active_tab().filter(|t| t.language == Language::GDScript) else {
             return;
         };
@@ -1591,6 +1604,23 @@ impl App {
         }
     }
 
+    /// Where `res://` path completion starts for the cursor of the active
+    /// GDScript tab, if it is in a string where a path goes.
+    fn path_completion_anchor(&self) -> Option<usize> {
+        let tab = self.active_tab().filter(|t| t.language == Language::GDScript)?;
+        let single = tab.buffer.selections().len() == 1;
+        single.then(|| paths::path_completion_anchor(&tab.buffer, tab.buffer.primary().head)).flatten()
+    }
+
+    fn open_path_completion(&mut self, anchor: usize) {
+        let Some(godot) = self.project.as_ref().and_then(|p| p.godot.as_ref()) else {
+            return;
+        };
+        let files = godot.resource_files().iter().filter_map(|f| godot.to_res_path(f)).collect();
+        self.completion = Some(Completion::paths(anchor, files));
+        self.refilter_completion();
+    }
+
     /// Narrows the completion list to the word typed since it opened.
     fn refilter_completion(&mut self) {
         let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
@@ -1602,21 +1632,31 @@ impl App {
         let head = tab.buffer.primary().head;
         let same_line = tab.buffer.char_to_pos(head).line == tab.buffer.char_to_pos(c.anchor).line;
         let prefix = tab.buffer.slice(c.anchor, head);
-        if head < c.anchor || !same_line || !prefix.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+        let valid = if c.paths {
+            !prefix.contains(['"', '\''])
+        } else {
+            prefix.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+        };
+        if head < c.anchor || !same_line || !valid {
             self.completion = None;
             return;
         }
         if c.request.is_some() {
             return; // Narrowed when the answer arrives.
         }
-        // Snippets only on a prefix match: fuzzy matches would pop them up
-        // for almost any word.
-        let lower = prefix.to_lowercase();
-        let filtered = completion::rank(&c.items, &prefix)
-            .into_iter()
-            .filter(|&i| !c.is_snippet(i) || c.items[i].label.to_lowercase().starts_with(&lower))
-            .collect();
-        c.filtered = filtered;
+        if c.paths {
+            let labels: Vec<String> = c.items.iter().map(|i| i.label.clone()).collect();
+            c.filtered = paths::rank_paths(&labels, &prefix);
+        } else {
+            // Snippets only on a prefix match: fuzzy matches would pop them
+            // up for almost any word.
+            let lower = prefix.to_lowercase();
+            let filtered = completion::rank(&c.items, &prefix)
+                .into_iter()
+                .filter(|&i| !c.is_snippet(i) || c.items[i].label.to_lowercase().starts_with(&lower))
+                .collect();
+            c.filtered = filtered;
+        }
         if c.filtered.is_empty() {
             self.completion = None;
             return;
@@ -1794,7 +1834,12 @@ impl App {
             Pending::Completion => {
                 if let Some(c) = &mut self.completion {
                     if c.request == Some(id) {
-                        c.set_items(lsp_client::completion_items(&value));
+                        let mut items = lsp_client::completion_items(&value);
+                        // Godot's path items replace the whole string, quotes
+                        // included (a range we don't apply); paths come from
+                        // our own `res://` completion instead.
+                        items.retain(|i| i.kind != CompletionKind::File);
+                        c.set_items(items);
                         c.request = None;
                         self.refilter_completion();
                     }
@@ -1941,6 +1986,11 @@ impl App {
         let Some(tab) = self.active_tab() else {
             return;
         };
+        // A `res://` / `uid://` path in a string opens that file.
+        if let Some(link) = paths::link_at(&tab.buffer, tab.buffer.primary().head) {
+            self.open_link(&link);
+            return;
+        }
         if tab.language != Language::GDScript {
             return;
         }
@@ -1954,6 +2004,31 @@ impl App {
                 self.pending.insert(id, Pending::Definition);
             }
             Err(error) => self.status = Some(format!("Go to definition failed: {error}")),
+        }
+    }
+
+    /// Opens the file a `res://` or `uid://` path points to: text files in a
+    /// tab, others (images, sounds, models) with the system's default app.
+    fn open_link(&mut self, link: &str) {
+        let Some(godot) = self.project.as_ref().and_then(|p| p.godot.as_ref()) else {
+            return;
+        };
+        let target = match link.strip_prefix("uid://") {
+            Some(_) => godot.find_uid(link),
+            None => godot.resolve(link),
+        };
+        let Some(path) = target.filter(|p| p.is_file()) else {
+            self.status = Some(format!("{link} not found in the project"));
+            return;
+        };
+        self.dismiss_popups();
+        if is_text_file(&path) {
+            self.open_file(path);
+        } else {
+            self.status = Some(match open_external(&path) {
+                Ok(()) => format!("Opened {} with the default app", self.display_path(&path)),
+                Err(error) => format!("Cannot open {}: {error}", path.display()),
+            });
         }
     }
 
@@ -2585,6 +2660,23 @@ async fn sleep(duration: std::time::Duration) {
         let _ = done.send(());
     });
     let _ = wait.await;
+}
+
+/// UTF-8 without NUL bytes: worth opening in the editor.
+fn is_text_file(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|text| !text.contains('\0'))
+}
+
+/// Opens a file with the operating system's default application.
+fn open_external(path: &Path) -> std::io::Result<()> {
+    let program = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program).arg(path).spawn().map(drop)
 }
 
 async fn pick_folder() -> Option<PathBuf> {

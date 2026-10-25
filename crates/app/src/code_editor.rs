@@ -44,6 +44,8 @@ pub enum EditorEvent {
     HoverEnd,
     /// Clicked while another panel had keyboard focus.
     Focused,
+    /// Ctrl+click: go to the definition (or open the path) under the click.
+    GotoDefinition,
     /// Tab / Shift+Tab while a snippet is being filled in.
     NextTabStop,
     PreviousTabStop,
@@ -703,6 +705,12 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 let alt = state.modifiers.alt();
                 let command = match click.kind() {
                     mouse::click::Kind::Single if alt => Command::AddCursorAt(pos),
+                    mouse::click::Kind::Single if state.modifiers.command() => {
+                        self.emit(shell, EditorEvent::Command(Command::Click { pos, extend: false }));
+                        self.emit(shell, EditorEvent::GotoDefinition);
+                        shell.capture_event();
+                        return;
+                    }
                     mouse::click::Kind::Single => {
                         state.dragging = true;
                         Command::Click { pos, extend: state.modifiers.shift() }

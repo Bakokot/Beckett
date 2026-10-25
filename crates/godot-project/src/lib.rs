@@ -84,6 +84,91 @@ impl GodotProject {
     }
 }
 
+/// At most this many files are listed for `res://` path completion.
+const MAX_RESOURCE_FILES: usize = 10_000;
+
+impl GodotProject {
+    /// Every file Godot can load (bookkeeping like `.import`/`.uid` files
+    /// and the `.godot` folder left out), sorted.
+    pub fn resource_files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        walk_files(&self.root, &mut |path, name| {
+            if !is_hidden(name, false) && files.len() < MAX_RESOURCE_FILES {
+                files.push(path.to_path_buf());
+            }
+        });
+        files.sort();
+        files
+    }
+
+    /// The file with this `uid://`, found the way Godot records it: in a
+    /// `.uid` file next to scripts and shaders, in the header of `.tscn` /
+    /// `.tres` files, or in the `.import` file next to imported assets.
+    pub fn find_uid(&self, uid: &str) -> Option<PathBuf> {
+        let mut found = None;
+        walk_files(&self.root, &mut |path, name| {
+            if found.is_some() {
+                return;
+            }
+            let (owner, recorded) = if let Some(owner) = name.strip_suffix(".uid") {
+                (path.with_file_name(owner), std::fs::read_to_string(path).ok().map(|t| t.trim().to_string()))
+            } else if let Some(owner) = name.strip_suffix(".import") {
+                (path.with_file_name(owner), std::fs::read_to_string(path).ok().and_then(|t| import_uid(&t)))
+            } else if name.ends_with(".tscn") || name.ends_with(".tres") {
+                (path.to_path_buf(), first_line(path).and_then(|l| header_uid(&l)))
+            } else {
+                return;
+            };
+            if recorded.as_deref() == Some(uid) {
+                found = Some(owner);
+            }
+        });
+        found
+    }
+}
+
+/// Calls `visit` with every file under `dir`, skipping hidden folders.
+fn walk_files(dir: &Path, visit: &mut dyn FnMut(&Path, &str)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() && !is_hidden(&name, true) && !name.starts_with('.') => walk_files(&path, visit),
+            Ok(t) if t.is_file() => visit(&path, &name),
+            _ => {}
+        }
+    }
+}
+
+fn first_line(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    io::BufReader::new(std::fs::File::open(path).ok()?).read_line(&mut line).ok()?;
+    Some(line)
+}
+
+/// `uid="uid://…"` in a `[gd_scene …]` / `[gd_resource …]` header line.
+fn header_uid(line: &str) -> Option<String> {
+    if !line.starts_with("[gd_") {
+        return None;
+    }
+    quoted_value(line, "uid")
+}
+
+/// `uid="uid://…"` in the `[remap]` section of an `.import` file.
+fn import_uid(text: &str) -> Option<String> {
+    text.lines().find_map(|line| line.strip_prefix("uid=").map(|v| v.trim().trim_matches('"').to_string()))
+}
+
+fn quoted_value(line: &str, key: &str) -> Option<String> {
+    let start = line.find(&format!(" {key}=\""))? + key.len() + 3;
+    let len = line[start..].find('"')?;
+    Some(line[start..start + len].to_string())
+}
+
 fn collect_scenes(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -162,6 +247,38 @@ mod tests {
         assert!(scene_references(scene, "res://scenes/player.gd"));
         assert!(!scene_references(scene, "res://player.gd"));
         assert!(!scene_references("[node name=\"x\"]\n# path=\"res://scenes/player.gd\"", "res://scenes/player.gd"));
+    }
+
+    #[test]
+    fn reads_uids_from_headers_and_import_files() {
+        let scene = "[gd_scene load_steps=2 format=3 uid=\"uid://b1x\"]\n";
+        assert_eq!(header_uid(scene).as_deref(), Some("uid://b1x"));
+        assert_eq!(header_uid("[ext_resource uid=\"uid://c2\"]"), None);
+        let import = "[remap]\n\nimporter=\"texture\"\ntype=\"CompressedTexture2D\"\nuid=\"uid://dq4\"\npath=\"res://.godot/imported/x.ctex\"\n";
+        assert_eq!(import_uid(import).as_deref(), Some("uid://dq4"));
+    }
+
+    #[test]
+    fn finds_files_by_uid() {
+        let root = std::env::temp_dir().join(format!("godot-project-uid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("scenes")).unwrap();
+        std::fs::create_dir_all(root.join(".godot")).unwrap();
+        std::fs::write(root.join("player.gd"), "extends Node\n").unwrap();
+        std::fs::write(root.join("player.gd.uid"), "uid://aaa\n").unwrap();
+        std::fs::write(root.join("scenes").join("main.tscn"), "[gd_scene format=3 uid=\"uid://bbb\"]\n").unwrap();
+        std::fs::write(root.join("icon.svg"), "<svg/>").unwrap();
+        std::fs::write(root.join("icon.svg.import"), "[remap]\nuid=\"uid://ccc\"\n").unwrap();
+        std::fs::write(root.join(".godot").join("cache.tres"), "[gd_resource uid=\"uid://zzz\"]\n").unwrap();
+        let project = GodotProject { root: root.clone(), settings: ProjectSettings::parse("") };
+
+        assert_eq!(project.find_uid("uid://aaa"), Some(root.join("player.gd")));
+        assert_eq!(project.find_uid("uid://bbb"), Some(root.join("scenes").join("main.tscn")));
+        assert_eq!(project.find_uid("uid://ccc"), Some(root.join("icon.svg")));
+        assert_eq!(project.find_uid("uid://zzz"), None);
+        let files = project.resource_files();
+        assert_eq!(files, [root.join("icon.svg"), root.join("player.gd"), root.join("scenes").join("main.tscn")]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
