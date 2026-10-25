@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use iced::widget::{button, row, text, Column, Space};
 use iced::{Element, Length};
 
-use crate::Message;
+use crate::context_menu::context_area;
+use crate::{ContextTarget, Message};
 
 pub struct Explorer {
     root: Node,
@@ -139,21 +140,21 @@ fn push_rows<'a>(
             button::text
         };
 
-    rows.push(
-        button(
-            row![
-                Space::new().width(f32::from(depth) * 14.0),
-                text(icon).size(12).width(12),
-                text(&node.name).size(13),
-            ]
-            .spacing(4),
-        )
-        .on_press(message)
-        .style(style)
-        .width(Length::Fill)
-        .padding([2, 8])
-        .into(),
-    );
+    let row_button = button(
+        row![
+            Space::new().width(f32::from(depth) * 14.0),
+            text(icon).size(12).width(12),
+            text(&node.name).size(13),
+        ]
+        .spacing(4),
+    )
+    .on_press(message)
+    .style(style)
+    .width(Length::Fill)
+    .padding([2, 8]);
+    // Right-click: the file or folder menu.
+    let target = if node.is_dir { ContextTarget::Folder(node.path.clone()) } else { ContextTarget::File(node.path.clone()) };
+    rows.push(context_area(row_button, move |point| Message::ContextMenu(target.clone(), point)).into());
 
     if node.expanded {
         for child in node.children.iter().flatten() {

@@ -45,6 +45,8 @@ pub enum EditorEvent {
     HoverEnd,
     /// Clicked while another panel had keyboard focus.
     Focused,
+    /// Right-click at this window position: open the editor menu.
+    ContextMenu(Point),
     /// Shift+Alt+F.
     FormatDocument,
     /// Ctrl+click: go to the definition (or open the path) under the click.
@@ -919,6 +921,21 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 self.update_hover(state, &geometry, shell, None);
                 state.mouse = None;
                 self.update_link(state, &geometry, shell);
+            }
+            // Right-click: move the cursor there (unless inside the selection,
+            // which the menu acts on), then ask for the menu.
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let Some(point) = cursor.position_over(geometry.text_area) else {
+                    return;
+                };
+                let index = self.char_under(&geometry, state.scroll, point);
+                let inside = self.buffer.selections().iter().any(|s| !s.is_empty() && (s.start()..=s.end()).contains(&index));
+                if !inside {
+                    let pos = self.pos_at(&geometry, state.scroll, point);
+                    self.emit(shell, EditorEvent::Command(Command::Click { pos, extend: false }));
+                }
+                self.emit(shell, EditorEvent::ContextMenu(point));
+                shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging = false;

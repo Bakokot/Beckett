@@ -2,6 +2,7 @@
 
 mod code_editor;
 mod completion;
+mod context_menu;
 mod docs;
 mod explorer;
 mod find;
@@ -39,6 +40,7 @@ use iced::widget::{
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task};
 use lsp_client::{uri, CompletionKind, Event, Position, Severity};
 
+use context_menu::context_area;
 use code_editor::{
     CodeEditor, CompletionAction, CompletionPopup, CompletionRow, EditorEvent, HoverPopup, Mark,
     SignaturePopup,
@@ -119,7 +121,7 @@ pub enum Message {
     ClosePanel,
     /// The splitter above the bottom panel moved by this many pixels.
     ResizePanel(f32),
-    WindowResized(f32),
+    WindowResized(iced::Size),
     /// Zoom the interface in (positive) or out by this many steps.
     Zoom(i32),
     ZoomReset,
@@ -162,6 +164,33 @@ pub enum Message {
     ThemeCodePasted(Option<String>),
     /// A file dropped on the window: a theme to import, or a file to open.
     FileDropped(PathBuf),
+    /// Right-click on something: open its menu at this window position.
+    ContextMenu(ContextTarget, iced::Point),
+    CloseMenu,
+    /// A menu item was chosen: close the menu, then do this.
+    MenuPick(Box<Message>),
+    /// Open a file on the other side of the split view.
+    OpenToSide(PathBuf),
+    CopyText(String),
+    /// Show a file or folder in the system file manager.
+    Reveal(PathBuf),
+    CloseOtherTabs(usize),
+    MoveTabToOtherSide(usize),
+    EditorCopy,
+    EditorCut,
+    EditorPaste,
+    PasteText(Option<String>),
+}
+
+/// What a right-click menu is about.
+#[derive(Debug, Clone)]
+pub enum ContextTarget {
+    File(PathBuf),
+    Folder(PathBuf),
+    /// A tab, by index.
+    Tab(usize),
+    /// The code of the focused editor.
+    Editor,
 }
 
 /// What the sidebar shows.
@@ -287,6 +316,9 @@ struct App {
     /// Height of the bottom panel, set with the splitter above it.
     panel_height: f32,
     window_height: f32,
+    window_width: f32,
+    /// The open right-click menu.
+    context_menu: Option<context_menu::Menu<Message>>,
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
@@ -395,6 +427,8 @@ impl App {
             panel: None,
             panel_height: DEFAULT_PANEL_HEIGHT,
             window_height: WINDOW_SIZE.1,
+            window_width: WINDOW_SIZE.0,
+            context_menu: None,
             run: RunState::default(),
             find: None,
             rename: None,
@@ -521,7 +555,7 @@ impl App {
 
         let dropped = iced::event::listen_with(|event, _status, _window| match event {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
-            iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::WindowResized(size.height)),
+            iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::WindowResized(size)),
             _ => None,
         });
 
@@ -811,7 +845,43 @@ impl App {
             }
             // Dragging the splitter up makes the panel taller.
             Message::ResizePanel(delta) => self.panel_height = (self.panel_height() - delta).max(MIN_PANEL_HEIGHT),
-            Message::WindowResized(height) => self.window_height = height,
+            Message::WindowResized(size) => {
+                self.window_height = size.height;
+                self.window_width = size.width;
+            }
+            Message::ContextMenu(target, position) => {
+                self.dismiss_popups();
+                let entries = self.context_entries(&target);
+                self.context_menu = (!entries.is_empty()).then_some(context_menu::Menu { position, entries });
+            }
+            Message::CloseMenu => self.context_menu = None,
+            Message::MenuPick(message) => {
+                self.context_menu = None;
+                return self.handle(*message);
+            }
+            Message::OpenToSide(path) => self.open_to_side(path),
+            Message::CopyText(text) => {
+                self.status = Some(format!("Copied {text}"));
+                return iced::clipboard::write(text);
+            }
+            Message::Reveal(path) => {
+                if let Err(error) = reveal_in_file_manager(&path) {
+                    self.status = Some(format!("Cannot show {}: {error}", path.display()));
+                }
+            }
+            Message::CloseOtherTabs(keep) => self.close_other_tabs(keep),
+            Message::MoveTabToOtherSide(index) => {
+                if index < self.tabs.len() {
+                    self.active = Some(index);
+                    self.sync_groups();
+                    self.split_move();
+                }
+            }
+            Message::EditorCopy => return self.copy_selection(false),
+            Message::EditorCut => return self.copy_selection(true),
+            Message::EditorPaste => return iced::clipboard::read().map(Message::PasteText),
+            Message::PasteText(Some(text)) => self.apply_command(Command::Paste(text)),
+            Message::PasteText(None) => {}
             Message::Zoom(steps) => self.set_zoom(|s| s.zoom(steps)),
             Message::ZoomReset => self.set_zoom(|s| s.ui_scale = 1.0),
             Message::ClosePanel => {
@@ -1781,6 +1851,11 @@ impl App {
             EditorEvent::TriggerCompletion => self.request_completion(None),
             EditorEvent::GotoDefinition => self.goto_definition(),
             EditorEvent::FormatDocument => self.format_active(),
+            EditorEvent::ContextMenu(position) => {
+                self.dismiss_popups();
+                let entries = self.context_entries(&ContextTarget::Editor);
+                self.context_menu = (!entries.is_empty()).then_some(context_menu::Menu { position, entries });
+            }
             EditorEvent::LinkHover(index) => self.on_link_hover(index),
             EditorEvent::NextTabStop | EditorEvent::PreviousTabStop => {
                 self.completion = None;
@@ -2662,6 +2737,114 @@ impl App {
         }
     }
 
+    /// Copies the selection to the clipboard (the right-click menu's Copy /
+    /// Cut; the keys are handled in the editor itself).
+    fn copy_selection(&mut self, cut: bool) -> Task<Message> {
+        let selected = self.active_tab().map(|tab| tab.buffer.selected_text()).unwrap_or_default();
+        if selected.is_empty() {
+            return Task::none();
+        }
+        if cut {
+            self.apply_command(Command::DeleteSelection);
+        }
+        iced::clipboard::write(selected)
+    }
+
+    /// Opens a file on the other side of the split (making one if needed).
+    fn open_to_side(&mut self, path: PathBuf) {
+        let target = if self.is_split() { 1 - self.focused_group } else { 1 };
+        if !self.open_file(path) {
+            return;
+        }
+        if let Some(active) = self.active {
+            self.tabs[active].group = target;
+        }
+        self.dismiss_popups();
+        self.sync_groups();
+    }
+
+    fn close_other_tabs(&mut self, keep: usize) {
+        let Some(path) = self.tabs.get(keep).map(|t| t.path.clone()) else {
+            return;
+        };
+        // Back to front, so indices stay valid; unsaved tabs stay open.
+        for index in (0..self.tabs.len()).rev() {
+            if index != keep && !self.tabs[index].dirty {
+                self.close_tab(index);
+            }
+        }
+        if let Some(index) = self.tabs.iter().position(|t| t.path == path) {
+            self.active = Some(index);
+        }
+        if self.tabs.iter().any(|t| t.dirty && t.path != path) {
+            self.status = Some("Tabs with unsaved changes were kept open".to_string());
+        }
+    }
+
+    /// The right-click menu for a file, folder, tab or the editor.
+    fn context_entries(&self, target: &ContextTarget) -> Vec<context_menu::Entry<Message>> {
+        use context_menu::Entry;
+        let pick = |message: Message| Message::MenuPick(Box::new(message));
+        let godot = self.project.as_ref().and_then(|p| p.godot.as_ref());
+        let paths = |path: &Path| -> Vec<Entry<Message>> {
+            let mut entries = vec![Entry::item("Copy Path", pick(Message::CopyText(path.display().to_string())))];
+            if let Some(res) = godot.and_then(|g| g.to_res_path(path)) {
+                entries.push(Entry::item("Copy res:// Path", pick(Message::CopyText(res))));
+            }
+            entries.push(Entry::item("Reveal in File Explorer", pick(Message::Reveal(path.to_path_buf()))));
+            entries
+        };
+        match target {
+            ContextTarget::File(path) => {
+                let mut entries = vec![
+                    Entry::item("Open", pick(Message::OpenFile(path.clone()))),
+                    Entry::with_shortcut("Open to the Side", "split view", Some(pick(Message::OpenToSide(path.clone())))),
+                    Entry::Separator,
+                ];
+                entries.extend(paths(path));
+                entries
+            }
+            ContextTarget::Folder(path) => paths(path),
+            ContextTarget::Tab(index) => {
+                let Some(tab) = self.tabs.get(*index) else {
+                    return Vec::new();
+                };
+                let side = if tab.group == 0 && !self.is_split() { "Move to the Right Side" } else { "Move to the Other Side" };
+                let mut entries = vec![
+                    Entry::with_shortcut("Close", "Ctrl+W", Some(pick(Message::CloseTab(*index)))),
+                    Entry::item("Close Others", pick(Message::CloseOtherTabs(*index))),
+                    Entry::with_shortcut(side, "Ctrl+\\", Some(pick(Message::MoveTabToOtherSide(*index)))),
+                    Entry::Separator,
+                ];
+                entries.extend(paths(&tab.path));
+                entries
+            }
+            ContextTarget::Editor => {
+                let Some(tab) = self.active_tab() else {
+                    return Vec::new();
+                };
+                let code = tab.language == Language::GDScript && self.lsp.client().is_some();
+                let selection = !tab.buffer.primary().is_empty();
+                let when = |enabled: bool, message: Message| enabled.then(|| pick(message));
+                vec![
+                    Entry::with_shortcut("Go to Definition", "F12", when(code, Message::GotoDefinition)),
+                    Entry::with_shortcut("Find All References", "Shift+F12", when(code, Message::FindReferences)),
+                    Entry::with_shortcut("Rename Symbol", "F2", when(code, Message::StartRename)),
+                    Entry::Separator,
+                    Entry::with_shortcut("Cut", "Ctrl+X", when(selection, Message::EditorCut)),
+                    Entry::with_shortcut("Copy", "Ctrl+C", when(selection, Message::EditorCopy)),
+                    Entry::with_shortcut("Paste", "Ctrl+V", Some(pick(Message::EditorPaste))),
+                    Entry::Separator,
+                    Entry::with_shortcut("Toggle Comment", "Ctrl+K", Some(pick(Message::Edit(EditorEvent::Command(Command::ToggleComment))))),
+                    Entry::with_shortcut("Fold / Unfold", "Alt+F", Some(pick(Message::Edit(EditorEvent::Command(Command::ToggleFoldAtCursor))))),
+                    Entry::with_shortcut("Format Document", "Shift+Alt+F", Some(pick(Message::Edit(EditorEvent::FormatDocument)))),
+                    Entry::Separator,
+                    Entry::with_shortcut("Move to the Other Side", "Ctrl+\\", Some(pick(Message::SplitMove))),
+                ]
+            }
+        }
+    }
+
     /// Leaves the project for the welcome screen, keeping its session.
     fn close_folder(&mut self) {
         self.save_session();
@@ -2946,7 +3129,22 @@ impl App {
                 }
             }
         };
-        numpad::numpad_fix(column![container(body).height(Length::Fill), self.status_bar()]).into()
+        let window: Element<'_, Message> = column![container(body).height(Length::Fill), self.status_bar()].into();
+        // A right-click menu sits over the whole window: a transparent
+        // backdrop closes it on any click elsewhere, Escape too.
+        let window = match &self.context_menu {
+            Some(menu) => {
+                let backdrop = mouse_area(container(space()).width(Length::Fill).height(Length::Fill))
+                    .on_press(Message::CloseMenu)
+                    .on_right_press(Message::CloseMenu);
+                let size = iced::Size::new(self.window_width, self.window_height);
+                let menu = menu.view(&self.current_theme().ui, size, |message| message);
+                let menu = on_escape::on_escape(menu, Message::CloseMenu);
+                iced::widget::stack![window, backdrop, menu].into()
+            }
+            None => window,
+        };
+        numpad::numpad_fix(window).into()
     }
 
     fn shortcuts_page(&self) -> Element<'_, Message> {
@@ -3241,7 +3439,7 @@ impl App {
                 } else {
                     button::text
                 };
-            row![
+            let tab = row![
                 button(text(label).size(13))
                     .on_press(Message::SelectTab(index))
                     .style(style)
@@ -3255,8 +3453,8 @@ impl App {
                     tooltip::Position::Bottom,
                     &self.current_theme().ui,
                 ),
-            ]
-            .into()
+            ];
+            context_area(tab, move |point| Message::ContextMenu(ContextTarget::Tab(index), point)).into()
         });
 
         container(Row::with_children(tabs).spacing(2))
@@ -3453,6 +3651,29 @@ async fn sleep(duration: std::time::Duration) {
 /// UTF-8 without NUL bytes: worth opening in the editor.
 fn is_text_file(path: &Path) -> bool {
     std::fs::read_to_string(path).is_ok_and(|text| !text.contains('\0'))
+}
+
+/// Shows a file (selected) or folder in the system file manager.
+fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    let mut command = if cfg!(windows) {
+        let mut c = std::process::Command::new("explorer");
+        if path.is_file() {
+            // `/select,` must be glued to the path in one argument.
+            c.arg(format!("/select,{}", path.display()));
+        } else {
+            c.arg(path);
+        }
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg("-R").arg(path);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(if path.is_file() { path.parent().unwrap_or(path) } else { path });
+        c
+    };
+    command.spawn().map(drop)
 }
 
 /// Opens a file with the operating system's default application.
