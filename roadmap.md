@@ -182,7 +182,9 @@ crates/
 ## Phase 2 — v1
 
 **Editor**
-- [ ] Code folding (incl. `#region`)
+- [x] Code folding: indentation blocks and `#region` / `#endregion`; Alt+F (as in Godot), gutter
+      click, "..." marker, Fold / Unfold / Fold All / Unfold All; folds follow edits and undo, Up/Down
+      step over them, a cursor landing inside opens them — unit-tested, not yet seen on screen
 - [ ] Split views
 - [ ] Hot exit / persistent undo
 - [ ] Format on save (gdformat or LSP)

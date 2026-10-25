@@ -34,6 +34,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+A", "Select all"),
             ("Ctrl+K / Ctrl+/", "Toggle comment"),
             ("Ctrl+Shift+K", "Delete line"),
+            ("Alt+F / Click the gutter", "Fold or unfold the block (indentation or #region)"),
             ("Alt+Up / Alt+Down", "Move line up / down"),
             ("Shift+Alt+Up / Shift+Alt+Down", "Duplicate line"),
             ("Tab / Shift+Tab", "Indent / outdent"),

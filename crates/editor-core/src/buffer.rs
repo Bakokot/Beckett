@@ -5,9 +5,11 @@
 //! mapped through it and it can be inverted for undo.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use ropey::Rope;
 
+use crate::folding::{self, LineMap};
 use crate::gdscript::{self, LineState, Token};
 use crate::search::Matcher;
 use crate::Language;
@@ -117,6 +119,17 @@ pub enum Command {
     Select { ranges: Vec<(usize, usize)>, primary: usize },
     /// Replace char ranges (sorted, non-overlapping) as one undo step.
     Replace(Vec<(usize, usize, String)>),
+    /// Fold or unfold the block whose header is this line (gutter click).
+    ToggleFold(usize),
+    /// Unfold the cursor line if it is folded, else fold around the cursor
+    /// (Godot's Alt+F).
+    ToggleFoldAtCursor,
+    /// Fold the innermost block around the primary cursor.
+    Fold,
+    /// Unfold the blocks around the primary cursor.
+    Unfold,
+    FoldAll,
+    UnfoldAll,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +163,15 @@ pub struct Buffer {
     language: Language,
     /// Lexer state at the start of each line, valid for a prefix of lines.
     line_states: RefCell<Vec<LineState>>,
+    /// Folded blocks, by the char index where their header line starts
+    /// (moved along by edits like selections are).
+    folds: Vec<usize>,
+    /// Foldable ranges, computed once per text version.
+    fold_cache: RefCell<Option<(u64, FoldRanges)>>,
 }
+
+/// Foldable `(header, last line)` ranges, shared between the cache and callers.
+type FoldRanges = Rc<Vec<(usize, usize)>>;
 
 const PAIRS: &[(char, char)] = &[('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')];
 const BOM: char = '\u{feff}';
@@ -180,7 +201,103 @@ impl Buffer {
             bom,
             language,
             line_states: RefCell::new(vec![LineState::Normal]),
+            folds: Vec::new(),
+            fold_cache: RefCell::new(None),
         }
+    }
+
+    // ---- Folding ----
+
+    /// Blocks that can fold, `(header, last line)`, sorted by header.
+    pub fn fold_ranges(&self) -> FoldRanges {
+        let mut cache = self.fold_cache.borrow_mut();
+        if let Some((version, ranges)) = &*cache {
+            if *version == self.version {
+                return Rc::clone(ranges);
+            }
+        }
+        let text = self.rope.to_string();
+        let ranges = Rc::new(folding::fold_ranges(text.lines(), TAB_WIDTH));
+        *cache = Some((self.version, Rc::clone(&ranges)));
+        ranges
+    }
+
+    /// The last line of the block whose header is `line`, if it can fold.
+    pub fn fold_range_at(&self, line: usize) -> Option<usize> {
+        self.fold_ranges().iter().find(|r| r.0 == line).map(|r| r.1)
+    }
+
+    /// Folded blocks still valid for the current text.
+    pub fn folded(&self) -> Vec<(usize, usize)> {
+        let len = self.len_chars();
+        let mut folded: Vec<(usize, usize)> = self
+            .folds
+            .iter()
+            .filter_map(|&start| {
+                let header = self.rope.char_to_line(start.min(len));
+                self.fold_range_at(header).map(|last| (header, last))
+            })
+            .collect();
+        folded.sort_unstable();
+        folded.dedup();
+        folded
+    }
+
+    pub fn is_folded(&self, line: usize) -> bool {
+        self.folded().iter().any(|&(header, _)| header == line)
+    }
+
+    /// Which lines are shown, for drawing and hit testing.
+    pub fn line_map(&self) -> LineMap {
+        LineMap::new(folding::hidden_ranges(&self.folded()), self.len_lines())
+    }
+
+    fn add_fold(&mut self, header: usize) {
+        self.folds.push(self.rope.line_to_char(header));
+        self.move_cursors_out_of_folds();
+    }
+
+    fn remove_folds(&mut self, remove: impl Fn(usize, usize) -> bool) {
+        let len = self.len_chars();
+        let ranges = self.fold_ranges();
+        self.folds.retain(|&start| {
+            let header = self.rope.char_to_line(start.min(len));
+            let last = ranges.iter().find(|r| r.0 == header).map_or(header, |r| r.1);
+            !remove(header, last)
+        });
+    }
+
+    /// Selections inside a newly folded block collapse to its header's end.
+    fn move_cursors_out_of_folds(&mut self) {
+        let map = self.line_map();
+        let mut moved = false;
+        let selections: Vec<Selection> = self
+            .selections
+            .iter()
+            .map(|&sel| {
+                let line = self.char_to_pos(sel.head).line;
+                match map.range_of(line) {
+                    Some((start, _)) => {
+                        moved = true;
+                        let header = start - 1;
+                        Selection::cursor(self.pos_to_char(Pos { line: header, column: self.line_len(header) }))
+                    }
+                    None => sel,
+                }
+            })
+            .collect();
+        if moved {
+            self.set_selections(selections, self.primary);
+        }
+    }
+
+    /// Opens the folds hiding any cursor.
+    fn unfold_around_cursors(&mut self) {
+        if self.folds.is_empty() {
+            return;
+        }
+        let lines: Vec<usize> = self.selections.iter().map(|s| self.char_to_pos(s.head).line).collect();
+        self.remove_folds(|header, last| lines.iter().any(|&line| header < line && line <= last));
     }
 
     // ---- Queries ----
@@ -375,7 +492,61 @@ impl Buffer {
     }
 
     pub fn apply(&mut self, command: Command) {
+        let folding = matches!(
+            command,
+            Command::ToggleFold(_)
+                | Command::ToggleFoldAtCursor
+                | Command::Fold
+                | Command::Unfold
+                | Command::FoldAll
+                | Command::UnfoldAll
+        );
+        self.apply_inner(command);
+        // A cursor that ends up in a folded block (search, go to line…)
+        // opens it.
+        if !folding {
+            self.unfold_around_cursors();
+        }
+    }
+
+    fn apply_inner(&mut self, command: Command) {
         match command {
+            Command::ToggleFold(line) => {
+                if self.is_folded(line) {
+                    self.remove_folds(|header, _| header == line);
+                } else if self.fold_range_at(line).is_some() {
+                    self.add_fold(line);
+                }
+            }
+            Command::ToggleFoldAtCursor => {
+                let line = self.char_to_pos(self.primary().head).line;
+                let command = if self.is_folded(line) { Command::ToggleFold(line) } else { Command::Fold };
+                self.apply_inner(command);
+            }
+            Command::Fold => {
+                let line = self.char_to_pos(self.primary().head).line;
+                let ranges = self.fold_ranges();
+                let target = ranges
+                    .iter()
+                    .filter(|&&(header, last)| header <= line && line <= last && !self.is_folded(header))
+                    .max_by_key(|&&(header, _)| header);
+                if let Some(&(header, _)) = target {
+                    self.add_fold(header);
+                }
+            }
+            Command::Unfold => {
+                let line = self.char_to_pos(self.primary().head).line;
+                self.remove_folds(|header, last| header <= line && line <= last);
+            }
+            Command::FoldAll => {
+                for (header, _) in self.fold_ranges().iter().copied() {
+                    if !self.is_folded(header) {
+                        self.folds.push(self.rope.line_to_char(header));
+                    }
+                }
+                self.move_cursors_out_of_folds();
+            }
+            Command::UnfoldAll => self.folds.clear(),
             Command::Move { motion, extend } => {
                 let selections = self
                     .selections
@@ -555,16 +726,18 @@ impl Buffer {
     fn move_head(&self, sel: Selection, motion: Motion) -> (usize, Option<usize>) {
         let head = sel.head;
         let pos = self.char_to_pos(head);
+        let map = self.line_map();
         let vertical = |lines: isize| {
             let goal = sel.goal.unwrap_or(self.visual_col(pos.line, pos.column));
-            let target = pos.line as isize + lines;
+            // Count shown rows, so folded blocks are stepped over.
+            let target = map.row_of(pos.line) as isize + lines;
             if target < 0 {
                 return (0, Some(goal));
             }
-            let line = target as usize;
-            if line >= self.len_lines() {
+            if target as usize >= map.rows() {
                 return (self.len_chars(), Some(goal));
             }
+            let line = map.line_at(target as usize);
             let column = self.column_for_visual(line, goal);
             (self.pos_to_char(Pos { line, column }), Some(goal))
         };
@@ -951,6 +1124,16 @@ impl Buffer {
             self.rope.remove(c.start..c.end);
             self.rope.insert(c.start, &c.text);
         }
+        // Folds follow their header line.
+        let len = self.len_chars();
+        let mut folds: Vec<usize> = self
+            .folds
+            .iter()
+            .map(|&start| self.rope.line_to_char(self.rope.char_to_line(map_pos(changes, start).min(len))))
+            .collect();
+        folds.sort_unstable();
+        folds.dedup();
+        self.folds = folds;
     }
 
     fn set_selections(&mut self, selections: Vec<Selection>, primary: usize) {
@@ -1437,6 +1620,39 @@ mod tests {
         assert_eq!(b.matching_bracket(2), Some((1, 6)));
         assert_eq!(b.matching_bracket(7), Some((1, 6)));
         assert_eq!(b.matching_bracket(4), Some((3, 5)));
+    }
+
+    #[test]
+    fn folds_hide_blocks_follow_edits_and_open_for_the_cursor() {
+        let mut b = buf("func a():\n\tvar x = 1\n\treturn x\n\nfunc b():\n\tpass\n");
+        at(&mut b, 1, 3);
+        b.apply(Command::Fold);
+        // The cursor left the hidden lines for the end of the header.
+        assert_eq!(b.char_to_pos(b.primary().head), Pos { line: 0, column: 9 });
+        assert_eq!(b.folded(), [(0, 2)]);
+        assert_eq!(b.line_map().rows(), 5);
+
+        // Down steps over the folded block.
+        b.apply(Command::Move { motion: Motion::Down, extend: false });
+        assert_eq!(b.char_to_pos(b.primary().head).line, 3);
+
+        // Lines added above move the fold with its header.
+        at(&mut b, 0, 0);
+        type_str(&mut b, "\n");
+        assert_eq!(b.folded(), [(1, 3)]);
+        b.apply(Command::Undo);
+        assert_eq!(b.folded(), [(0, 2)]);
+
+        // Putting the cursor inside the block opens it.
+        b.apply(Command::Click { pos: Pos { line: 2, column: 1 }, extend: false });
+        assert!(b.folded().is_empty());
+
+        b.apply(Command::FoldAll);
+        assert_eq!(b.folded(), [(0, 2), (4, 5)]);
+        b.apply(Command::ToggleFold(4));
+        assert_eq!(b.folded(), [(0, 2)]);
+        b.apply(Command::UnfoldAll);
+        assert!(b.folded().is_empty());
     }
 
     #[test]

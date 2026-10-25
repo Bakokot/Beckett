@@ -1,6 +1,7 @@
 //! UI-independent editor logic: text buffer, language detection, lexing.
 
 pub mod buffer;
+pub mod folding;
 pub mod fuzzy;
 pub mod gdscript;
 pub mod search;

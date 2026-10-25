@@ -7,6 +7,7 @@ use std::ops::Range;
 
 use editor_core::buffer::{display_width, TAB_WIDTH};
 use editor_core::gdscript::{Token, TokenKind};
+use editor_core::folding::LineMap;
 use editor_core::{Buffer, Command, Motion, Pos};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
@@ -394,12 +395,17 @@ struct Geometry {
     text_x: f32,
     char_width: f32,
     line_height: f32,
+    /// Which lines are shown (folded ones are not).
+    map: LineMap,
 }
+
+/// Columns of the gutter taken by the fold markers, right of the numbers.
+const FOLD_COLUMNS: f32 = 2.0;
 
 impl Geometry {
     fn new(buffer: &Buffer, bounds: Rectangle, metrics: Metrics) -> Self {
         let digits = buffer.len_lines().to_string().len().max(3) as f32;
-        let gutter = (digits + 2.0) * metrics.char_width;
+        let gutter = (digits + 1.0 + FOLD_COLUMNS) * metrics.char_width;
         let text_area = Rectangle {
             x: bounds.x + gutter,
             width: (bounds.width - gutter).max(0.0),
@@ -411,11 +417,31 @@ impl Geometry {
             text_x: text_area.x + metrics.char_width * 0.5,
             char_width: metrics.char_width,
             line_height: metrics.line_height,
+            map: buffer.line_map(),
         }
     }
 
     fn line_y(&self, line: usize, scroll: Vector) -> f32 {
-        self.bounds.y + line as f32 * self.line_height - scroll.y
+        self.bounds.y + self.map.row_of(line) as f32 * self.line_height - scroll.y
+    }
+
+    /// The line shown at screen `y`.
+    fn line_at_y(&self, y: f32, scroll: Vector) -> usize {
+        let row = ((y - self.bounds.y + scroll.y) / self.line_height).max(0.0) as usize;
+        self.map.line_at(row)
+    }
+
+    /// The fold marker column, left of the text.
+    fn fold_column(&self) -> Rectangle {
+        let width = FOLD_COLUMNS * self.char_width;
+        Rectangle { x: self.text_area.x - width, width, ..self.bounds }
+    }
+
+    /// Where the "..." marker of a folded line is drawn.
+    fn fold_marker(&self, buffer: &Buffer, line: usize, scroll: Vector) -> Rectangle {
+        let end = buffer.visual_col(line, buffer.line_len(line));
+        let x = self.col_x(end + 1, scroll);
+        Rectangle::new(Point::new(x, self.line_y(line, scroll) + 2.0), Size::new(self.char_width * 3.0 + 4.0, self.line_height - 4.0))
     }
 
     fn col_x(&self, visual: usize, scroll: Vector) -> f32 {
@@ -459,8 +485,7 @@ enum KeyAction {
 
 impl<'a, Message> CodeEditor<'a, Message> {
     fn pos_at(&self, geometry: &Geometry, scroll: Vector, point: Point) -> Pos {
-        let line = ((point.y - geometry.bounds.y + scroll.y) / geometry.line_height).max(0.0) as usize;
-        let line = line.min(self.buffer.len_lines() - 1);
+        let line = geometry.line_at_y(point.y, scroll);
         let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).round().max(0.0);
         Pos { line, column: self.buffer.column_for_visual(line, visual as usize) }
     }
@@ -468,15 +493,14 @@ impl<'a, Message> CodeEditor<'a, Message> {
     /// (line, visual column) of the gap nearest to `point`, past line ends
     /// too, for box selection.
     fn grid_at(&self, geometry: &Geometry, scroll: Vector, point: Point) -> (usize, usize) {
-        let line = ((point.y - geometry.bounds.y + scroll.y) / geometry.line_height).max(0.0) as usize;
+        let line = geometry.line_at_y(point.y, scroll);
         let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).round().max(0.0);
-        (line.min(self.buffer.len_lines() - 1), visual as usize)
+        (line, visual as usize)
     }
 
     /// Char index of the character under `point` (not rounded to the nearest gap).
     fn char_under(&self, geometry: &Geometry, scroll: Vector, point: Point) -> usize {
-        let line = ((point.y - geometry.bounds.y + scroll.y) / geometry.line_height).max(0.0) as usize;
-        let line = line.min(self.buffer.len_lines() - 1);
+        let line = geometry.line_at_y(point.y, scroll);
         let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).floor().max(0.0);
         let column = self.buffer.column_for_visual(line, visual as usize);
         self.buffer.pos_to_char(Pos { line, column })
@@ -502,6 +526,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
         let start = buffer.char_to_pos(start);
         let end = buffer.char_to_pos(end);
         (start.line.max(first)..=end.line.min(last.saturating_sub(1)))
+            .filter(|&line| !g.map.is_hidden(line))
             .map(|line| {
                 let from = if line == start.line { buffer.visual_col(line, start.column) } else { 0 };
                 let to = if line == end.line {
@@ -521,7 +546,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
     fn reveal(&self, state: &mut State, geometry: &Geometry) {
         let pos = self.buffer.char_to_pos(self.buffer.primary().head);
         let lh = geometry.line_height;
-        let y = pos.line as f32 * lh;
+        let y = geometry.map.row_of(pos.line) as f32 * lh;
         if y < state.scroll.y {
             state.scroll.y = y;
         } else if y + lh > state.scroll.y + geometry.bounds.height {
@@ -539,7 +564,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
     }
 
     fn clamp_scroll(&self, state: &mut State, geometry: &Geometry) {
-        let max_y = (self.buffer.len_lines() - 1) as f32 * geometry.line_height;
+        let max_y = geometry.map.rows().saturating_sub(1) as f32 * geometry.line_height;
         state.scroll.y = state.scroll.y.clamp(0.0, max_y);
         state.scroll.x = state.scroll.x.max(0.0);
     }
@@ -634,6 +659,8 @@ impl<'a, Message> CodeEditor<'a, Message> {
                 Named::Space => command(Command::Insert(" ".to_string())),
                 _ => None,
             },
+            // Alt+F folds / unfolds, as in the Godot editor.
+            Key::Character(c) if alt && !ctrl && c.eq_ignore_ascii_case("f") => command(Command::ToggleFoldAtCursor),
             // Ctrl+Alt is AltGr on many layouts: treat it as typing.
             Key::Character(c) if ctrl && !alt => match c.to_lowercase().as_str() {
                 "a" => command(Command::SelectAll),
@@ -819,6 +846,16 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     self.emit(shell, EditorEvent::Focused);
                 }
 
+                // Fold markers in the gutter, and the "..." of a folded line.
+                let line = geometry.line_at_y(point.y, state.scroll);
+                let on_marker = self.buffer.is_folded(line)
+                    && geometry.fold_marker(self.buffer, line, state.scroll).contains(point);
+                if (geometry.fold_column().contains(point) && self.buffer.fold_range_at(line).is_some()) || on_marker {
+                    self.emit(shell, EditorEvent::Command(Command::ToggleFold(line)));
+                    shell.capture_event();
+                    return;
+                }
+
                 // A click on the completion list accepts that row.
                 if let Some(popup) = &self.completion {
                     let layout = self.completion_layout(popup, &geometry, state.scroll, metrics);
@@ -990,26 +1027,40 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
         let colors = &self.colors;
         let g = Geometry::new(buffer, layout.bounds(), metrics);
         // The buffer may have shrunk since the last scroll update.
-        let max_y = (buffer.len_lines() - 1) as f32 * g.line_height;
+        let max_y = g.map.rows().saturating_sub(1) as f32 * g.line_height;
         let scroll = Vector::new(state.scroll.x, state.scroll.y.min(max_y));
         let lh = g.line_height;
         let cw = g.char_width;
 
         fill(renderer, g.bounds, colors.background);
 
-        let first = (scroll.y / lh).floor() as usize;
+        // Lines `first..last` cover the visible rows; folded ones among them
+        // are skipped with `shown`.
+        let first_row = (scroll.y / lh).floor() as usize;
         let visible = (g.bounds.height / lh).ceil() as usize + 1;
-        let last = (first + visible).min(buffer.len_lines());
+        let first = g.map.line_at(first_row);
+        let last = (g.map.line_at(first_row + visible) + 1).min(buffer.len_lines());
+        let shown = |line: usize| !g.map.is_hidden(line);
         let primary = buffer.primary();
         let primary_pos = buffer.char_to_pos(primary.head);
+        let folded: Vec<usize> = buffer.folded().iter().map(|&(header, _)| header).collect();
+        let mouse_in_gutter = state.mouse.is_some_and(|p| p.x < g.text_area.x && g.bounds.contains(p));
 
-        // Gutter: line numbers.
+        // Gutter: line numbers, and fold markers (folded blocks always,
+        // foldable ones while the mouse is over the gutter).
         renderer.with_layer(g.bounds, |r| {
-            for line in first..last {
+            let fold_x = g.fold_column().x + cw * 0.4;
+            for line in (first..last).filter(|&l| shown(l)) {
                 let number = (line + 1).to_string();
-                let x = g.text_area.x - (number.len() as f32 + 1.0) * cw;
+                let x = fold_x - (number.len() as f32 + 0.6) * cw;
                 let color = if line == primary_pos.line { colors.gutter_active } else { colors.gutter };
-                draw_text(r, number, Point::new(x, g.line_y(line, scroll)), color, metrics, g.bounds);
+                let y = g.line_y(line, scroll);
+                draw_text(r, number, Point::new(x, y), color, metrics, g.bounds);
+                if folded.contains(&line) {
+                    draw_text(r, ">".to_string(), Point::new(fold_x, y), colors.accent, metrics, g.bounds);
+                } else if mouse_in_gutter && buffer.fold_range_at(line).is_some() {
+                    draw_text(r, "v".to_string(), Point::new(fold_x, y), colors.gutter, metrics, g.bounds);
+                }
             }
         });
 
@@ -1021,7 +1072,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
 
             // Indentation guides.
-            for (line, levels) in (first..last).zip(indent_levels(buffer, first, last)) {
+            for (line, levels) in (first..last).zip(indent_levels(buffer, first, last)).filter(|&(l, _)| shown(l)) {
                 let y = g.line_y(line, scroll);
                 for level in 0..levels {
                     let x = g.col_x(level * TAB_WIDTH, scroll).round();
@@ -1053,7 +1104,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
 
             // Diagnostics underlines.
-            for mark in self.marks.iter().filter(|m| (first..last).contains(&m.line)) {
+            for mark in self.marks.iter().filter(|m| (first..last).contains(&m.line) && shown(m.line)) {
                 let from = buffer.visual_col(mark.line, mark.start);
                 let to = buffer.visual_col(mark.line, mark.end).max(from + 1);
                 let rect = Rectangle::new(
@@ -1075,7 +1126,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
 
             // Text.
-            for line in first..last {
+            for line in (first..last).filter(|&l| shown(l)) {
                 let text = buffer.line_text(line);
                 let tokens = buffer.tokens(line);
                 let y = g.line_y(line, scroll);
@@ -1088,6 +1139,17 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 }
             }
 
+            // "..." after a folded header (click it, or the gutter, to unfold).
+            for &line in folded.iter().filter(|&&l| (first..last).contains(&l)) {
+                let marker = g.fold_marker(buffer, line, scroll);
+                r.fill_quad(
+                    Quad { bounds: marker, border: Border { color: colors.muted, width: 1.0, radius: 3.0.into() }, ..Quad::default() },
+                    colors.current_line,
+                );
+                let text = Point::new(marker.x + 2.0, g.line_y(line, scroll));
+                draw_text(r, "...".to_string(), text, colors.muted, metrics, g.text_area);
+            }
+
             // Ctrl+hover link.
             if let Some((start, end)) = self.link.filter(|_| state.modifiers.command()) {
                 for rect in self.range_rects(&g, scroll, start, end, first, last) {
@@ -1098,12 +1160,12 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
 
             // Inline messages: one per line, the first mark's (marks come
             // sorted most severe first).
-            let mut shown = std::collections::HashSet::new();
-            for mark in self.marks.iter().filter(|m| (first..last).contains(&m.line)) {
+            let mut with_message = std::collections::HashSet::new();
+            for mark in self.marks.iter().filter(|m| (first..last).contains(&m.line) && shown(m.line)) {
                 let Some(message) = &mark.message else {
                     continue;
                 };
-                if !shown.insert(mark.line) {
+                if !with_message.insert(mark.line) {
                     continue;
                 }
                 let end = buffer.visual_col(mark.line, buffer.line_len(mark.line));
