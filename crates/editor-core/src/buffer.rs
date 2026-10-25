@@ -11,6 +11,7 @@ use ropey::Rope;
 
 use crate::folding::{self, LineMap};
 use crate::gdscript::{self, LineState, Token};
+use crate::highlight;
 use crate::search::Matcher;
 use crate::Language;
 
@@ -162,12 +163,28 @@ pub struct Buffer {
     bom: bool,
     language: Language,
     /// Lexer state at the start of each line, valid for a prefix of lines.
-    line_states: RefCell<Vec<LineState>>,
+    line_states: RefCell<Vec<LexState>>,
     /// Folded blocks, by the char index where their header line starts
     /// (moved along by edits like selections are).
     folds: Vec<usize>,
     /// Foldable ranges, computed once per text version.
     fold_cache: RefCell<Option<(u64, FoldRanges)>>,
+}
+
+/// Lexer state at the start of a line, for whichever language the buffer has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexState {
+    GdScript(LineState),
+    Other(highlight::State),
+}
+
+impl LexState {
+    fn initial(language: Language) -> Self {
+        match language {
+            Language::GDScript => LexState::GdScript(LineState::Normal),
+            _ => LexState::Other(highlight::State::Normal),
+        }
+    }
 }
 
 /// Foldable `(header, last line)` ranges, shared between the cache and callers.
@@ -200,7 +217,7 @@ impl Buffer {
             crlf,
             bom,
             language,
-            line_states: RefCell::new(vec![LineState::Normal]),
+            line_states: RefCell::new(vec![LexState::initial(language)]),
             folds: Vec::new(),
             fold_cache: RefCell::new(None),
         }
@@ -427,16 +444,41 @@ impl Buffer {
 
     /// Syntax tokens of one line (empty for plain text).
     pub fn tokens(&self, line: usize) -> Vec<Token> {
-        if self.language != Language::GDScript || line >= self.len_lines() {
+        if self.language == Language::Plain || line >= self.len_lines() {
             return Vec::new();
         }
         let mut states = self.line_states.borrow_mut();
         while states.len() <= line {
             let i = states.len() - 1;
-            let (_, next) = gdscript::lex_line(&self.line_text(i), states[i]);
+            let (_, next) = self.lex(&self.line_text(i), states[i]);
             states.push(next);
         }
-        gdscript::lex_line(&self.line_text(line), states[line]).0
+        self.lex(&self.line_text(line), states[line]).0
+    }
+
+    /// Lexes one line with this buffer's language.
+    fn lex(&self, line: &str, state: LexState) -> (Vec<Token>, LexState) {
+        let line = line.trim_end_matches(['\n', '\r']);
+        match (self.language, state) {
+            (Language::GDScript, LexState::GdScript(state)) => {
+                let (tokens, next) = gdscript::lex_line(line, state);
+                (tokens, LexState::GdScript(next))
+            }
+            (Language::Shader, LexState::Other(state)) => {
+                let (tokens, next) = highlight::lex_shader(line, state);
+                (tokens, LexState::Other(next))
+            }
+            (Language::Resource, LexState::Other(state)) => {
+                let (tokens, next) = highlight::lex_resource(line, state);
+                (tokens, LexState::Other(next))
+            }
+            (Language::Markdown, LexState::Other(state)) => {
+                let (tokens, next) = highlight::lex_markdown(line, state);
+                (tokens, LexState::Other(next))
+            }
+            (Language::Json, state) => (highlight::lex_json(line), state),
+            (_, state) => (Vec::new(), state),
+        }
     }
 
     /// The bracket pair touching `index` (before or after it), if balanced.
@@ -972,10 +1014,13 @@ impl Buffer {
 
     /// Godot-style: `#` at column 0; removed if every touched line has one.
     fn toggle_comment(&mut self) {
+        let Some(marker) = self.language.line_comment() else {
+            return;
+        };
         let lines = self.touched_lines();
         let all_commented = lines.iter().all(|&line| {
             let text = self.line_text(line);
-            text.trim().is_empty() || text.trim_start().starts_with('#')
+            text.trim().is_empty() || text.trim_start().starts_with(marker)
         });
         let changes = lines
             .into_iter()
@@ -983,10 +1028,11 @@ impl Buffer {
                 let text = self.line_text(line);
                 let start = self.rope.line_to_char(line);
                 if all_commented {
-                    let offset = text.chars().position(|c| c == '#')?;
-                    Some(change(start + offset, start + offset + 1, ""))
+                    let byte = text.find(marker)?;
+                    let offset = text[..byte].chars().count();
+                    Some(change(start + offset, start + offset + marker.chars().count(), ""))
                 } else {
-                    Some(change(start, start, "#"))
+                    Some(change(start, start, marker))
                 }
             })
             .collect();
@@ -1620,6 +1666,26 @@ mod tests {
         assert_eq!(b.matching_bracket(2), Some((1, 6)));
         assert_eq!(b.matching_bracket(7), Some((1, 6)));
         assert_eq!(b.matching_bracket(4), Some((3, 5)));
+    }
+
+    #[test]
+    fn other_languages_get_their_comments_and_tokens() {
+        let mut b = Buffer::new("void fragment() {\n\tALBEDO = vec3(1.0);\n}\n", Language::Shader);
+        b.apply(Command::SelectAll);
+        b.apply(Command::ToggleComment);
+        assert_eq!(b.text(), "//void fragment() {\n//\tALBEDO = vec3(1.0);\n//}\n");
+        b.apply(Command::ToggleComment);
+        assert_eq!(b.text(), "void fragment() {\n\tALBEDO = vec3(1.0);\n}\n");
+        assert_eq!(b.tokens(1)[0].kind, gdscript::TokenKind::Constant);
+
+        // A comment opened on one line colors the next ones.
+        let b = Buffer::new("/* a\nb */ uniform", Language::Shader);
+        assert_eq!(b.tokens(1)[0].kind, gdscript::TokenKind::Comment);
+
+        let mut json = Buffer::new("{\"a\": 1}\n", Language::Json);
+        json.apply(Command::ToggleComment);
+        assert_eq!(json.text(), "{\"a\": 1}\n");
+        assert_eq!(Buffer::new("[node]\n", Language::Resource).tokens(0)[1].kind, gdscript::TokenKind::Keyword);
     }
 
     #[test]

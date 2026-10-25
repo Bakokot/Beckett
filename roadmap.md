@@ -190,7 +190,8 @@ crates/
       flagged "(changed on disk)" when the file changed meanwhile — seen on screen
 - [ ] Persistent undo
 - [ ] Format on save (gdformat or LSP)
-- [ ] Highlighting for `.gdshader`, `.tscn`, `.tres`, `project.godot`, `.cfg`, JSON, Markdown
+- [x] Highlighting for `.gdshader`, `.tscn`, `.tres`, `project.godot`, `.cfg`, `.import`, JSON, Markdown
+      (theme syntax colors; Toggle Comment uses `//` in shaders, `;` in config files) — seen on screen
 
 **LSP / Godot**
 - [x] Outline panel (sidebar OUTLINE tab, nested, current symbol highlighted, remembered) and go to
