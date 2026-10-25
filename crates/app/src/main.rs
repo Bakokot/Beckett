@@ -14,6 +14,7 @@ mod recent;
 mod rename;
 mod runner;
 mod shortcuts;
+mod splitter;
 mod style;
 mod terminal_panel;
 mod terminal_view;
@@ -57,7 +58,7 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(App::theme)
         .subscription(App::subscription)
-        .window_size((1280.0, 800.0))
+        .window_size(WINDOW_SIZE)
         .run()
 }
 
@@ -96,6 +97,9 @@ pub enum Message {
     Terminal(TerminalEvent),
     ShowPanel(Panel),
     ClosePanel,
+    /// The splitter above the bottom panel moved by this many pixels.
+    ResizePanel(f32),
+    WindowResized(f32),
     /// Run the main scene (F5).
     RunProject,
     /// Run the scene of the active tab (F6).
@@ -164,6 +168,11 @@ struct TerminalState {
 }
 
 const MAX_OUTPUT_LINES: usize = 5000;
+const WINDOW_SIZE: (f32, f32) = (1280.0, 800.0);
+const DEFAULT_PANEL_HEIGHT: f32 = 260.0;
+const MIN_PANEL_HEIGHT: f32 = 100.0;
+/// Room the bottom panel always leaves for the tabs, editor and status bar.
+const MIN_EDITOR_HEIGHT: f32 = 200.0;
 /// Waits before each automatic language server reconnect, in seconds.
 const RECONNECT_DELAYS: [u64; 5] = [1, 2, 5, 10, 20];
 
@@ -235,6 +244,9 @@ struct App {
     lsp_wait_editor: bool,
     pending: HashMap<u64, Pending>,
     problems: Problems,
+    /// Height of the bottom panel, set with the splitter above it.
+    panel_height: f32,
+    window_height: f32,
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
@@ -328,6 +340,8 @@ impl App {
             pending: HashMap::new(),
             problems: Problems::default(),
             panel: None,
+            panel_height: DEFAULT_PANEL_HEIGHT,
+            window_height: WINDOW_SIZE.1,
             run: RunState::default(),
             find: None,
             rename: None,
@@ -429,6 +443,7 @@ impl App {
 
         let dropped = iced::event::listen_with(|event, _status, _window| match event {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
+            iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::WindowResized(size.height)),
             _ => None,
         });
 
@@ -590,6 +605,9 @@ impl App {
                 }
             }
             Message::ShowPanel(panel) => self.show_panel(panel),
+            // Dragging the splitter up makes the panel taller.
+            Message::ResizePanel(delta) => self.panel_height = (self.panel_height() - delta).max(MIN_PANEL_HEIGHT),
+            Message::WindowResized(height) => self.window_height = height,
             Message::ClosePanel => {
                 self.panel = None;
                 self.focus = Focus::Editor;
@@ -1205,6 +1223,12 @@ impl App {
             Some(error) => format!("Replace incomplete, cannot write {error}"),
             None => format!("Replaced {} in {}", plural(count, "occurrence"), plural(file_count, "file")),
         });
+    }
+
+    /// The bottom panel's height, kept within what the window allows.
+    fn panel_height(&self) -> f32 {
+        let max = (self.window_height - MIN_EDITOR_HEIGHT).max(MIN_PANEL_HEIGHT);
+        self.panel_height.clamp(MIN_PANEL_HEIGHT, max)
     }
 
     fn toggle_panel(&mut self, panel: Panel) {
@@ -2491,6 +2515,9 @@ impl App {
             Some(project) => {
                 let mut main = column![self.editor_area()];
                 if let Some(panel) = self.panel {
+                    let ui = &self.current_theme().ui;
+                    let (line, active) = (style::to_color(ui.border), style::to_color(ui.accent));
+                    main = main.push(splitter::splitter(line, active, Message::ResizePanel));
                     main = main.push(self.bottom_panel(panel));
                 }
                 let body = row![self.sidebar(project), main];
@@ -2709,7 +2736,7 @@ impl App {
 
         container(column![header.padding([4, 8]), body])
             .width(Length::Fill)
-            .height(260)
+            .height(self.panel_height())
             .style(style::surface(ui))
             .into()
     }
