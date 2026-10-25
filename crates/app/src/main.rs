@@ -1928,7 +1928,8 @@ impl App {
 
     fn view(&self) -> Element<'_, Message> {
         let body: Element<'_, Message> = match &self.project {
-            None if self.shortcuts.is_some() => self.shortcuts_page(),
+            // Pages that don't need a project replace the welcome screen.
+            None if self.theme_editor.is_some() || self.shortcuts.is_some() => self.editor_area(),
             None => self.welcome(),
             Some(project) => {
                 let mut main = column![self.editor_area()];
