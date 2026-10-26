@@ -5,7 +5,7 @@ use iced::widget::tooltip::Position;
 use iced::widget::{button, column, container, row, scrollable, space, text, text_input, Column};
 use iced::{Alignment, Background, Border, Element, Font, Length};
 
-use crate::keymap::{Keymap, COMMANDS};
+use crate::keymap::{Keymap, Preset, COMMANDS};
 use crate::style;
 
 pub const INPUT: &str = "shortcuts-filter";
@@ -86,8 +86,10 @@ pub enum ShortcutsMessage {
     Filter(String),
     /// Wait for the keys of this command's new shortcut.
     Record(&'static str),
-    /// Back to the default shortcut.
+    /// Back to the preset's shortcut.
     Reset(&'static str),
+    /// Start over from a preset (drops the changes).
+    Preset(Preset),
     Close,
 }
 
@@ -165,9 +167,17 @@ impl Shortcuts {
         };
 
         let close = button(text("x").size(12)).on_press(ShortcutsMessage::Close).style(button::text).padding([2, 6]);
+        let mut presets = row![text("Preset").size(12).color(muted)].spacing(4).align_y(Alignment::Center);
+        for preset in Preset::ALL {
+            let style: fn(&iced::Theme, button::Status) -> button::Style =
+                if keymap.preset() == preset { button::secondary } else { button::text };
+            let choose = button(text(preset.name()).size(12)).on_press(ShortcutsMessage::Preset(preset)).style(style).padding([2, 8]);
+            presets = presets.push(style::tip(choose, "Use these shortcuts (your changes are dropped)", Position::Bottom, ui));
+        }
         let header = row![
             text("Keyboard Shortcuts").size(20),
             space::horizontal(),
+            presets,
             text_input("Filter (e.g. \"cursor\" or \"F5\")", &self.filter)
                 .id(INPUT)
                 .on_input(ShortcutsMessage::Filter)
@@ -202,7 +212,7 @@ impl Shortcuts {
             let mut line = row![container(change).width(380), text(title).size(13)].spacing(16).align_y(Alignment::Center);
             if !keymap.is_default(id) {
                 let reset = button(text("reset").size(11)).on_press(ShortcutsMessage::Reset(id)).style(button::text).padding([0, 6]);
-                line = line.push(style::tip(reset, "Back to the default shortcut", Position::Top, ui));
+                line = line.push(style::tip(reset, "Back to the preset's shortcut", Position::Top, ui));
             }
             list.push(line.padding([1, 0]).into());
         }

@@ -756,6 +756,17 @@ impl App {
                     Err(error) => format!("Cannot save shortcuts: {error}"),
                 });
             }
+            Message::Shortcuts(ShortcutsMessage::Preset(preset)) => {
+                if let Some(page) = &mut self.shortcuts {
+                    page.recording = None;
+                }
+                let dropped = self.keymap.set_preset(preset);
+                self.status = Some(match self.keymap.save() {
+                    Ok(()) if dropped > 0 => format!("{} shortcuts ({dropped} changed shortcuts reset)", preset.name()),
+                    Ok(()) => format!("{} shortcuts", preset.name()),
+                    Err(error) => format!("Cannot save shortcuts: {error}"),
+                });
+            }
             Message::Shortcuts(ShortcutsMessage::Close) => {
                 // Escape while recording cancels the recording, not the page.
                 if let Some(page) = self.shortcuts.as_mut().filter(|p| p.recording.is_some()) {
@@ -1406,6 +1417,11 @@ impl App {
             })
             .collect();
         entries.extend(themes.into_iter().map(|(name, message)| CommandEntry { name, shortcut: String::new(), message }));
+        entries.extend(keymap::Preset::ALL.into_iter().map(|preset| CommandEntry {
+            name: format!("Keyboard Shortcuts: Use {} Preset", preset.name()),
+            shortcut: String::new(),
+            message: Message::Shortcuts(ShortcutsMessage::Preset(preset)),
+        }));
         let current = self.project.as_ref().map(|p| p.root.as_path());
         entries.extend(
             self.recent

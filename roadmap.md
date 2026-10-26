@@ -224,7 +224,8 @@ crates/
 - [x] Remappable keybindings: click a shortcut on the F1 page and press the new keys (Backspace
       unbinds, "reset" restores); overrides in `keybindings.json`; menus and palette show the
       current keys; terminal passthrough follows the bindings
-- [ ] Keybinding presets (VS Code, Godot)
+- [x] Keybinding presets: Default, VS Code and Godot (buttons on the F1 page, or the palette);
+      changes are kept on top of the preset in `keybindings.json`, picking a preset resets them
 - [ ] Settings UI + user/project JSON
 - [x] Session restore: per-project tabs, active tab, cursors, folds; the last project reopens at
       launch; "File: Close Folder" goes back to the welcome screen

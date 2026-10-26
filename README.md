@@ -23,7 +23,10 @@ Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to 
 `Ctrl+P` go to file, `Ctrl+Shift+P` command palette, `Ctrl+G` go to line.
 Press `F1` (or click `?` in the status bar) for the full list inside the IDE. Click a
 command's shortcut there and press new keys to change it; changes are saved to
-`keybindings.json` in the config folder (only the bindings that differ from the defaults).
+`keybindings.json` in the config folder (only the bindings that differ from the preset).
+The page also switches between the Default, VS Code and Godot presets (Godot: `Ctrl+L` go to
+line, `Ctrl+R` replace, `Shift+Alt+O` quick open, `Shift+Alt+Up/Down` add cursors, `Ctrl+Shift+D`
+duplicate line); picking one resets your changes.
 
 ## Themes
 

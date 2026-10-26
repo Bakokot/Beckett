@@ -1,6 +1,7 @@
-//! Customizable shortcuts: the commands that can be bound, their default
-//! keys, and the user's changes kept in `<config>/keybindings.json` (only
-//! what differs from the defaults, so new defaults still reach them).
+//! Customizable shortcuts: the commands that can be bound, their keys in
+//! each preset (Default, VS Code, Godot), and the user's changes kept in
+//! `<config>/keybindings.json` with the chosen preset (only what differs
+//! from the preset, so new defaults still reach them).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -195,6 +196,77 @@ pub const COMMANDS: &[CommandDef] = &[
     def("edit.format", "Format Document", &["Shift+Alt+F"]),
 ];
 
+/// A starting set of shortcuts; the user's changes go on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preset {
+    #[default]
+    Default,
+    VsCode,
+    Godot,
+}
+
+impl Preset {
+    pub const ALL: [Preset; 3] = [Preset::Default, Preset::VsCode, Preset::Godot];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Preset::Default => "Default",
+            Preset::VsCode => "VS Code",
+            Preset::Godot => "Godot",
+        }
+    }
+
+    /// The name saved in keybindings.json.
+    fn id(self) -> &'static str {
+        match self {
+            Preset::Default => "default",
+            Preset::VsCode => "vscode",
+            Preset::Godot => "godot",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.id() == id)
+    }
+
+    /// The commands whose keys differ from the Default preset. Ctrl+Alt+letter
+    /// can't be used (it is AltGr on many layouts), so Godot's Go to Function
+    /// (Ctrl+Alt+F) is left out.
+    fn changes(self) -> &'static [(&'static str, &'static [&'static str])] {
+        match self {
+            Preset::Default => &[],
+            Preset::VsCode => &[
+                ("palette.commands", &["Ctrl+Shift+P", "F1"]),
+                // Ctrl+K Ctrl+S in VS Code: two-key chords aren't supported.
+                ("view.shortcuts", &[]),
+                ("file.closeTab", &["Ctrl+W", "Ctrl+F4"]),
+                ("edit.toggleComment", &["Ctrl+/"]),
+                ("view.terminal", &["Ctrl+`"]),
+                ("run.stop", &["Shift+F5"]),
+            ],
+            Preset::Godot => &[
+                ("file.quickOpen", &["Shift+Alt+O"]),
+                ("go.line", &["Ctrl+L"]),
+                ("find.replace", &["Ctrl+R"]),
+                ("edit.toggleComment", &["Ctrl+K"]),
+                ("edit.duplicateLine", &["Ctrl+Shift+D"]),
+                ("edit.cursorAbove", &["Shift+Alt+Up"]),
+                ("edit.cursorBelow", &["Shift+Alt+Down"]),
+                ("run.stop", &["F8"]),
+            ],
+        }
+    }
+
+    /// The keys of `command` in this preset.
+    fn keys(self, command: &CommandDef) -> &'static [&'static str] {
+        self.changes().iter().find(|(id, _)| *id == command.id).map_or(command.defaults, |(_, keys)| keys)
+    }
+
+    fn chords(self, command: &CommandDef) -> Vec<Chord> {
+        self.keys(command).iter().filter_map(|k| Chord::parse(k)).collect()
+    }
+}
+
 /// The commands that work even while the terminal has focus (everything
 /// else goes to the shell, which needs Ctrl+letters).
 pub const TERMINAL_PASSTHROUGH: &[&str] = &[
@@ -210,27 +282,45 @@ pub const TERMINAL_PASSTHROUGH: &[&str] = &[
     "view.zoomReset",
 ];
 
-/// The keys in effect: defaults with the user's changes applied.
+/// The keys in effect: the preset with the user's changes applied.
 pub struct Keymap {
+    preset: Preset,
     bindings: BTreeMap<&'static str, Vec<Chord>>,
 }
 
 impl Keymap {
     pub fn defaults() -> Self {
-        let bindings = COMMANDS.iter().map(|c| (c.id, c.defaults.iter().filter_map(|k| Chord::parse(k)).collect())).collect();
-        Self { bindings }
+        Self::of(Preset::Default)
     }
 
-    /// Defaults with `overrides` (command id → key list) applied; unknown
+    /// A preset's keys, without changes.
+    pub fn of(preset: Preset) -> Self {
+        let bindings = COMMANDS.iter().map(|c| (c.id, preset.chords(c))).collect();
+        Self { preset, bindings }
+    }
+
+    /// `preset` with `overrides` (command id → key list) applied; unknown
     /// ids and unparsable keys are skipped.
-    pub fn with_overrides(overrides: &BTreeMap<String, Vec<String>>) -> Self {
-        let mut keymap = Self::defaults();
+    pub fn with_overrides(preset: Preset, overrides: &BTreeMap<String, Vec<String>>) -> Self {
+        let mut keymap = Self::of(preset);
         for (id, keys) in overrides {
             if let Some(command) = COMMANDS.iter().find(|c| c.id == id) {
                 keymap.bindings.insert(command.id, keys.iter().filter_map(|k| Chord::parse(k)).collect());
             }
         }
         keymap
+    }
+
+    pub fn preset(&self) -> Preset {
+        self.preset
+    }
+
+    /// Switches to `preset`, dropping the user's changes; returns how many
+    /// commands had them.
+    pub fn set_preset(&mut self, preset: Preset) -> usize {
+        let changed = self.overrides().len();
+        *self = Self::of(preset);
+        changed
     }
 
     /// The command bound to a key press.
@@ -269,18 +359,19 @@ impl Keymap {
         }
     }
 
+    /// Back to the preset's keys.
     pub fn reset(&mut self, id: &str) {
         if let Some(command) = COMMANDS.iter().find(|c| c.id == id) {
-            self.bindings.insert(command.id, command.defaults.iter().filter_map(|k| Chord::parse(k)).collect());
+            self.bindings.insert(command.id, self.preset.chords(command));
         }
     }
 
+    /// Whether `id` has the preset's keys.
     pub fn is_default(&self, id: &str) -> bool {
-        let defaults = Self::defaults();
-        defaults.chords(id) == self.chords(id)
+        COMMANDS.iter().find(|c| c.id == id).is_none_or(|c| self.preset.chords(c) == self.chords(id))
     }
 
-    /// The commands whose keys differ from the defaults, as saved.
+    /// The commands whose keys differ from the preset, as saved.
     pub fn overrides(&self) -> BTreeMap<String, Vec<String>> {
         COMMANDS
             .iter()
@@ -290,11 +381,34 @@ impl Keymap {
     }
 
     pub fn load() -> Self {
-        let overrides = file()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())
-            .unwrap_or_default();
-        Self::with_overrides(&overrides)
+        let text = file().and_then(|path| std::fs::read_to_string(path).ok()).unwrap_or_default();
+        Self::from_json(text.trim_start_matches('\u{feff}'))
+    }
+
+    /// Reads keybindings.json: `"preset": "godot"` and the changed commands'
+    /// key lists (files without a preset use the Default one).
+    fn from_json(text: &str) -> Self {
+        let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text).unwrap_or_default();
+        let preset = map.get("preset").and_then(|v| v.as_str()).and_then(Preset::from_id).unwrap_or_default();
+        let overrides = map
+            .into_iter()
+            .filter_map(|(id, keys)| {
+                let keys = keys.as_array()?.iter().filter_map(|k| k.as_str().map(str::to_string)).collect();
+                Some((id, keys))
+            })
+            .collect();
+        Self::with_overrides(preset, &overrides)
+    }
+
+    fn to_json(&self) -> String {
+        let mut map = serde_json::Map::new();
+        if self.preset != Preset::Default {
+            map.insert("preset".to_string(), self.preset.id().into());
+        }
+        for (id, keys) in self.overrides() {
+            map.insert(id, keys.into());
+        }
+        serde_json::to_string_pretty(&map).unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<(), String> {
@@ -302,8 +416,7 @@ impl Keymap {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        let text = serde_json::to_string_pretty(&self.overrides()).map_err(|e| e.to_string())?;
-        std::fs::write(path, text).map_err(|e| e.to_string())
+        std::fs::write(path, self.to_json()).map_err(|e| e.to_string())
     }
 }
 
@@ -357,7 +470,7 @@ mod tests {
         assert_eq!(saved["run.project"], ["Ctrl+S"]);
         assert!(saved["file.save"].is_empty());
 
-        let reloaded = Keymap::with_overrides(&saved);
+        let reloaded = Keymap::with_overrides(Preset::Default, &saved);
         assert_eq!(reloaded.lookup(&Chord::parse("Ctrl+S").unwrap()), Some("run.project"));
         keymap.reset("file.save");
         keymap.reset("run.project");
@@ -366,19 +479,50 @@ mod tests {
         let mut wild = BTreeMap::new();
         wild.insert("no.such.command".to_string(), vec!["Ctrl+Q".to_string()]);
         wild.insert("file.save".to_string(), vec!["garbage".to_string(), "Ctrl+Shift+S".to_string()]);
-        let keymap = Keymap::with_overrides(&wild);
+        let keymap = Keymap::with_overrides(Preset::Default, &wild);
         assert_eq!(keymap.chords("file.save"), [Chord::parse("Ctrl+Shift+S").unwrap()]);
     }
 
     #[test]
-    fn defaults_parse_and_dont_clash() {
-        let keymap = Keymap::defaults();
-        let mut seen = std::collections::HashSet::new();
-        for command in COMMANDS {
-            assert_eq!(keymap.chords(command.id).len(), command.defaults.len(), "{}", command.id);
-            for chord in keymap.chords(command.id) {
-                assert!(seen.insert(chord.clone()), "{chord} bound twice");
+    fn presets_parse_and_dont_clash() {
+        for preset in Preset::ALL {
+            for (id, _) in preset.changes() {
+                assert!(COMMANDS.iter().any(|c| c.id == *id), "{}: unknown command {id}", preset.name());
             }
+            let keymap = Keymap::of(preset);
+            let mut seen = std::collections::HashSet::new();
+            for command in COMMANDS {
+                assert_eq!(keymap.chords(command.id).len(), preset.keys(command).len(), "{}: {}", preset.name(), command.id);
+                for chord in keymap.chords(command.id) {
+                    assert!(seen.insert(chord.clone()), "{}: {chord} bound twice", preset.name());
+                }
+            }
+            assert!(keymap.overrides().is_empty());
         }
+    }
+
+    #[test]
+    fn presets_are_saved_with_the_changes_on_top() {
+        let mut keymap = Keymap::defaults();
+        keymap.rebind("file.save", Chord::parse("F9").unwrap());
+        // Picking a preset drops the changes.
+        assert_eq!(keymap.set_preset(Preset::Godot), 1);
+        assert_eq!(keymap.lookup(&Chord::parse("Ctrl+L").unwrap()), Some("go.line"));
+        assert_eq!(keymap.lookup(&Chord::parse("Ctrl+G").unwrap()), None);
+        assert!(keymap.is_default("go.line"));
+
+        keymap.rebind("go.line", Chord::parse("Ctrl+G").unwrap());
+        let mut reloaded = Keymap::from_json(&keymap.to_json());
+        assert_eq!(reloaded.preset(), Preset::Godot);
+        assert_eq!(reloaded.chords("go.line"), [Chord::parse("Ctrl+G").unwrap()]);
+        assert_eq!(reloaded.label("find.replace"), "Ctrl+R");
+        reloaded.reset("go.line");
+        assert_eq!(reloaded.label("go.line"), "Ctrl+L");
+
+        // Files from before presets: a plain map of changes.
+        let old = Keymap::from_json(r#"{"file.save": ["F9"]}"#);
+        assert_eq!(old.preset(), Preset::Default);
+        assert_eq!(old.label("file.save"), "F9");
+        assert_eq!(Keymap::from_json("not json").preset(), Preset::Default);
     }
 }
