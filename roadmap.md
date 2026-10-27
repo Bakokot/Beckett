@@ -251,7 +251,7 @@ crates/
 - [x] Remappable keybindings: click a shortcut on the F1 page and press the new keys (Backspace
       unbinds, "reset" restores); overrides in `keybindings.json`; menus and palette show the
       current keys; terminal passthrough follows the bindings
-- [x] Explorer: New Folder, Rename (Godot's `.uid` / `.import` companions follow, so `uid://` paths
+- [x] Explorer: right-click the empty space for the project root (New Script, New Folder); New Folder, Rename (Godot's `.uid` / `.import` companions follow, so `uid://` paths
       keep working; open tabs follow; files still using the old `res://` path are listed in SEARCH) and
       Delete (to the Recycle Bin with its companions, after a confirmation bar; its tabs close) —
       unit-tested, not yet seen on screen

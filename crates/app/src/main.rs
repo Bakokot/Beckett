@@ -49,7 +49,7 @@ use iced::widget::{
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task};
 use lsp_client::{uri, CompletionKind, Event, Position, Severity};
 
-use context_menu::context_area;
+use context_menu::{context_area, fallback_context_area};
 use code_editor::{
     CodeEditor, CompletionAction, CompletionPopup, CompletionRow, EditorEvent, HoverPopup, Mark,
     SignaturePopup,
@@ -3590,10 +3590,15 @@ impl App {
                     Entry::item("New Script...", pick(Message::OpenNewScript(Some(path.clone())))),
                     Entry::item("New Folder...", pick(Message::OpenFileOp(FileOp::NewFolder(path.clone())))),
                     Entry::Separator,
-                    Entry::item("Rename...", pick(Message::OpenFileOp(FileOp::Rename(path.clone())))),
-                    Entry::item("Delete", pick(Message::OpenFileOp(FileOp::Delete(path.clone())))),
-                    Entry::Separator,
                 ];
+                // The project root itself can't be renamed or deleted from here.
+                if self.project.as_ref().is_none_or(|p| p.root != *path) {
+                    entries.extend([
+                        Entry::item("Rename...", pick(Message::OpenFileOp(FileOp::Rename(path.clone())))),
+                        Entry::item("Delete", pick(Message::OpenFileOp(FileOp::Delete(path.clone())))),
+                        Entry::Separator,
+                    ]);
+                }
                 entries.extend(paths(path));
                 entries
             }
@@ -4066,7 +4071,10 @@ impl App {
         let body: Element<'a, Message> = match self.sidebar_view {
             SidebarView::Files => {
                 let active = self.active_tab().map(|t| t.path.as_path());
-                scrollable(project.explorer.view(active)).height(Length::Fill).into()
+                // Right-click below or between the rows: the project root's menu.
+                let root = project.root.clone();
+                let files = scrollable(project.explorer.view(active)).height(Length::Fill);
+                fallback_context_area(files, move |point| Message::ContextMenu(ContextTarget::Folder(root.clone()), point)).into()
             }
             SidebarView::Outline => {
                 let tab = self.active_tab();

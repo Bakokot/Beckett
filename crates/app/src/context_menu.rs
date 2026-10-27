@@ -89,13 +89,24 @@ impl<M: Clone + 'static> Menu<M> {
 pub struct ContextArea<'a, Message> {
     child: Element<'a, Message>,
     on_right_click: Box<dyn Fn(Point) -> Message + 'a>,
+    /// Let the child handle the click first; report only clicks it didn't
+    /// take (the empty space around rows with their own menus).
+    fallback: bool,
 }
 
 pub fn context_area<'a, Message>(
     child: impl Into<Element<'a, Message>>,
     on_right_click: impl Fn(Point) -> Message + 'a,
 ) -> ContextArea<'a, Message> {
-    ContextArea { child: child.into(), on_right_click: Box::new(on_right_click) }
+    ContextArea { child: child.into(), on_right_click: Box::new(on_right_click), fallback: false }
+}
+
+/// A context area for the right-clicks no element inside it handles.
+pub fn fallback_context_area<'a, Message>(
+    child: impl Into<Element<'a, Message>>,
+    on_right_click: impl Fn(Point) -> Message + 'a,
+) -> ContextArea<'a, Message> {
+    ContextArea { fallback: true, ..context_area(child, on_right_click) }
 }
 
 impl<'a, Message> Widget<Message, Theme, iced::Renderer> for ContextArea<'a, Message> {
@@ -134,6 +145,12 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for ContextArea<'a, Mes
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.fallback {
+            self.child.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
+            if shell.is_event_captured() {
+                return;
+            }
+        }
         if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event {
             if let Some(point) = cursor.position_over(layout.bounds()) {
                 shell.publish((self.on_right_click)(point));
@@ -141,7 +158,9 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for ContextArea<'a, Mes
                 return;
             }
         }
-        self.child.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
+        if !self.fallback {
+            self.child.as_widget_mut().update(&mut tree.children[0], event, layout, cursor, renderer, clipboard, shell, viewport);
+        }
     }
 
     fn draw(
