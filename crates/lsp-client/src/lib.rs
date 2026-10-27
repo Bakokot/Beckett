@@ -4,6 +4,7 @@
 //! spawns a headless one. It returns a [`Client`] for sending and a
 //! [`Reader`] that turns incoming messages into [`Event`]s on its thread.
 
+pub mod dap;
 pub mod godot;
 #[cfg(windows)]
 pub mod job;
@@ -67,7 +68,22 @@ pub enum Server {
     /// A Godot editor the user already had open.
     Attached { port: u16 },
     /// A headless Godot we started; it dies with the last [`Client`].
-    Spawned { port: u16, godot: PathBuf },
+    /// `dap_port` is its debug adapter.
+    Spawned { port: u16, dap_port: u16, godot: PathBuf },
+}
+
+/// The Godot editor's default debug adapter port (Editor Settings >
+/// Network > Debug Adapter).
+pub const EDITOR_DAP_PORT: u16 = 6006;
+
+impl Server {
+    /// Where this Godot's debug adapter listens.
+    pub fn dap_port(&self) -> u16 {
+        match self {
+            Server::Attached { .. } => EDITOR_DAP_PORT,
+            Server::Spawned { dap_port, .. } => *dap_port,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -377,16 +393,15 @@ fn local(port: u16) -> SocketAddr {
 }
 
 fn spawn_server(godot: &Path, root: &Path) -> Result<(TcpStream, Server, ServerProcess), String> {
-    let port = SPAWN_PORTS
-        .clone()
-        .find(|&port| TcpListener::bind(local(port)).is_ok())
-        .ok_or("No free port for the language server")?;
+    let mut free = SPAWN_PORTS.clone().filter(|&port| TcpListener::bind(local(port)).is_ok());
+    let port = free.next().ok_or("No free port for the language server")?;
+    let dap_port = free.next().ok_or("No free port for the debug adapter")?;
 
     let mut command = Command::new(godot);
     command
         .args(["--headless", "--editor", "--path"])
         .arg(root)
-        .args(["--lsp-port", &port.to_string()])
+        .args(["--lsp-port", &port.to_string(), "--dap-port", &dap_port.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -413,7 +428,7 @@ fn spawn_server(godot: &Path, root: &Path) -> Result<(TcpStream, Server, ServerP
                 #[cfg(windows)]
                 _job: job,
             };
-            let server = Server::Spawned { port, godot: godot.to_path_buf() };
+            let server = Server::Spawned { port, dap_port, godot: godot.to_path_buf() };
             return Ok((stream, server, process));
         }
         if Instant::now() > deadline {

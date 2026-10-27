@@ -175,6 +175,12 @@ pub const COMMANDS: &[CommandDef] = &[
     def("run.project", "Run Project", &["F5"]),
     def("run.scene", "Run Current Scene", &["F6"]),
     def("run.stop", "Stop", &["F8", "Shift+F5"]),
+    def("debug.start", "Start Debugging (Main Scene)", &["Alt+F5"]),
+    def("debug.startScene", "Start Debugging (Current Scene)", &["Alt+F6"]),
+    def("debug.toggleBreakpoint", "Toggle Breakpoint", &["F9"]),
+    def("debug.stepOver", "Step Over", &["F10"]),
+    def("debug.stepInto", "Step Into", &["F11"]),
+    def("debug.stepOut", "Step Out", &["Shift+F11"]),
     def("view.terminal", "Toggle Terminal", &["Ctrl+J", "Ctrl+`", "Ctrl+²"]),
     def("view.split", "Split Editor (Move Tab to the Other Side)", &["Ctrl+\\"]),
     def("view.shortcuts", "Keyboard Shortcuts", &["F1"]),
@@ -282,6 +288,11 @@ pub const TERMINAL_PASSTHROUGH: &[&str] = &[
     "run.project",
     "run.scene",
     "run.stop",
+    "debug.start",
+    "debug.startScene",
+    "debug.stepOver",
+    "debug.stepInto",
+    "debug.stepOut",
     "view.zoomIn",
     "view.zoomOut",
     "view.zoomReset",
@@ -509,7 +520,7 @@ mod tests {
     #[test]
     fn presets_are_saved_with_the_changes_on_top() {
         let mut keymap = Keymap::defaults();
-        keymap.rebind("file.save", Chord::parse("F9").unwrap());
+        keymap.rebind("file.save", Chord::parse("F7").unwrap());
         // Picking a preset drops the changes.
         assert_eq!(keymap.set_preset(Preset::Godot), 1);
         assert_eq!(keymap.lookup(&Chord::parse("Ctrl+L").unwrap()), Some("go.line"));

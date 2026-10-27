@@ -238,7 +238,15 @@ crates/
       not yet seen on screen
 
 **Debug**
-- [ ] DAP debugger: breakpoints, stepping, call stack, variables
+- [x] DAP debugger, first stage: breakpoints (F9 or click a line number; red dots that follow edits and
+      undo; kept in the session), Debug: Start (Alt+F5 main scene, Alt+F6 current scene) through the debug
+      adapter of the Godot serving the language server (`--dap-port`, or the editor's 6006), paused line
+      highlighted and shown, F5 continue, F10 / F11 / Shift+F11 step over / into / out, Shift+F5 stop; a
+      DEBUG panel with the call stack (click a frame) and expandable variables (Locals / Members / Globals,
+      expanded rows kept from one pause to the next); runtime errors pause at their line with the message;
+      game prints go to Output. Protocol checked live against Godot 4.7.1 (examples `dap_probe`,
+      `dap_client`); UI not yet seen on screen. Not yet: push_error / warnings in Output while debugging
+      (Godot's adapter doesn't forward them), watch expressions, hover values, conditional breakpoints
 
 **Terminal**
 - [x] Multiple terminal tabs: + in the panel header (or "Terminal: New Terminal"), one chip per shell with

@@ -46,6 +46,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Middle-click a tab", "Close it"),
             ("Drag a file into code", "Insert preload(\"res://…\") (Ctrl: a const holding it; in a string: the path)"),
             ("Click the gutter", "Fold or unfold the block (indentation or #region)"),
+            ("Click a line number", "Add or remove a breakpoint (GDScript)"),
             ("Mouse rest", "Documentation of the word under the mouse"),
             ("Escape", "Back to a single cursor"),
         ],

@@ -17,6 +17,9 @@ pub struct Session {
     /// The Godot executable chosen for the project.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub godot: Option<PathBuf>,
+    /// Breakpoint lines (zero-based) by file.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub breakpoints: std::collections::BTreeMap<PathBuf, Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +124,7 @@ mod tests {
             active: Some(1),
             split_ratio: Some(0.25),
             godot: Some("C:/Godot/Godot_v4.5.1-stable_win64.exe".into()),
+            breakpoints: [("C:/game/a.gd".into(), vec![2, 9])].into_iter().collect(),
         };
         let text = serde_json::to_string(&session).unwrap();
         assert!(!text.contains("\"folds\":[]"), "{text}");

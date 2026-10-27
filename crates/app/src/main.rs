@@ -6,6 +6,7 @@ mod code_editor;
 mod completion;
 mod context_menu;
 mod drag;
+mod debugger;
 mod docs;
 mod explorer;
 mod file_icons;
@@ -170,6 +171,15 @@ pub enum Message {
     ZoomReset,
     /// Run the main scene (F5).
     RunProject,
+    /// Run under the debugger: the main scene, or the current one.
+    StartDebug { scene: bool },
+    /// F9: add or remove a breakpoint on the cursor's line.
+    ToggleBreakpoint,
+    /// An event of the debug session of this generation.
+    Debugger(u64, debugger::DebugEvent),
+    Debug(debugger::DebugMessage),
+    /// Ask again for variables Godot wasn't ready to give (session, reference, attempt).
+    DebugRetry(u64, i64, u32),
     /// Run the scene of the active tab (F6).
     RunScene,
     /// Pick which installed Godot the project uses.
@@ -290,6 +300,8 @@ pub enum Panel {
     Search,
     /// Files changed since the staged text, with their hunks.
     Changes,
+    /// The debug session: call stack and variables.
+    Debug,
 }
 
 /// The shells of the terminal panel, one per tab.
@@ -498,6 +510,12 @@ struct App {
     /// installed match for its version). Kept in the session.
     godot_choice: Option<PathBuf>,
     terminals: Terminals,
+    /// Breakpoint lines (zero-based) by file; kept in the session.
+    breakpoints: std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<usize>>,
+    /// The debug session, while one runs.
+    debug: Option<debugger::Session>,
+    /// Bumped for each session, so a finished one's events are ignored.
+    debug_generation: u64,
     focus: Focus,
 }
 
@@ -681,6 +699,9 @@ impl App {
             scene_choice: HashMap::new(),
             godot_choice: None,
             terminals: Terminals::default(),
+            breakpoints: std::collections::BTreeMap::new(),
+            debug: None,
+            debug_generation: 0,
             focus: Focus::Editor,
         };
         // Without a folder to open, pick up where the last session left off.
@@ -797,7 +818,13 @@ impl App {
 
         let close = iced::window::close_requests().map(Message::CloseRequested);
 
-        Subscription::batch([keys, lsp, terminal, run, files, dropped, close])
+        let debug = match &self.debug {
+            Some(session) => debugger::connect(session.generation, session.port)
+                .map(|(generation, event)| Message::Debugger(generation, event)),
+            None => Subscription::none(),
+        };
+
+        Subscription::batch([keys, lsp, terminal, run, files, dropped, close, debug])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -1302,7 +1329,20 @@ impl App {
                 self.panel = None;
                 self.focus = Focus::Editor;
             }
+            // F5 while paused in the debugger continues.
+            Message::RunProject if self.debug.as_ref().is_some_and(debugger::Session::paused) => {
+                self.on_debug(debugger::DebugMessage::Step("continue"));
+            }
             Message::RunProject => self.start_run(None),
+            Message::StartDebug { scene } => self.start_debug(scene),
+            Message::ToggleBreakpoint => self.toggle_breakpoint_at_cursor(),
+            Message::Debugger(generation, event) => return self.on_debugger(generation, event),
+            Message::Debug(message) => self.on_debug(message),
+            Message::DebugRetry(generation, reference, attempt) => {
+                if let Some(session) = self.debug.as_mut().filter(|s| s.generation == generation) {
+                    session.request_variables(reference, attempt);
+                }
+            }
             Message::OpenInGodot => self.open_in_godot(),
             Message::RunScene => return self.run_scene(false),
             Message::ChooseScene => return self.run_scene(true),
@@ -1313,6 +1353,9 @@ impl App {
                 self.start_run(Some(scene));
             }
             Message::StopRun => {
+                if self.debug.is_some() {
+                    self.on_debug(debugger::DebugMessage::Stop);
+                }
                 if self.run.handle.take().is_some() {
                     self.push_output(OutputLine::info("Stopping..."));
                 }
@@ -1399,7 +1442,7 @@ impl App {
         self.focus = match panel {
             Panel::Terminal => Focus::Terminal,
             Panel::Search => Focus::Input,
-            Panel::Problems | Panel::Output | Panel::Changes => Focus::Editor,
+            Panel::Problems | Panel::Output | Panel::Changes | Panel::Debug => Focus::Editor,
         };
         self.dismiss_popups();
     }
@@ -1803,6 +1846,10 @@ impl App {
             ("Run: Project", "run.project", Message::RunProject),
             ("Run: Current Scene", "run.scene", Message::RunScene),
             ("Run: Choose Scene for This Script...", "", Message::ChooseScene),
+            ("Debug: Start Debugging (Main Scene)", "debug.start", Message::StartDebug { scene: false }),
+            ("Debug: Start Debugging (Current Scene)", "debug.startScene", Message::StartDebug { scene: true }),
+            ("Debug: Toggle Breakpoint", "debug.toggleBreakpoint", Message::ToggleBreakpoint),
+            ("Debug: Show Debug Panel", "", Message::ShowPanel(Panel::Debug)),
             ("Godot: Choose Version...", "", Message::ChooseGodot),
             ("Run: Stop", "run.stop", Message::StopRun),
             ("Godot: Open in Editor", "", Message::OpenInGodot),
@@ -2136,6 +2183,201 @@ impl App {
         });
     }
 
+    /// Runs the game under the debugger (the main scene, or the current
+    /// one), through the debug adapter of the Godot serving the language
+    /// server: breakpoints stop it, so do runtime errors.
+    fn start_debug(&mut self, current_scene: bool) {
+        if self.debug.is_some() {
+            self.status = Some("Already debugging (Shift+F5 stops)".to_string());
+            return;
+        }
+        if self.project.as_ref().is_none_or(|p| p.godot.is_none()) {
+            self.status = Some("Not a Godot project (no project.godot)".to_string());
+            return;
+        }
+        let Some(client) = self.lsp.client() else {
+            self.status = Some("The debugger runs in the Godot that serves the language server: wait until it is connected".to_string());
+            return;
+        };
+        let port = client.server().dap_port();
+        let scene = if current_scene {
+            match self.current_scene() {
+                Ok(scene) => Some(scene),
+                Err(reason) => {
+                    self.status = Some(reason);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        // One game at a time.
+        self.run.handle = None;
+        self.save_all();
+        self.run.output.clear();
+        self.run.problems = runner::RuntimeParser::default();
+        self.problems.clear_runtime();
+        self.refresh_marks();
+        let what = scene.clone().unwrap_or_else(|| "the main scene".to_string());
+        self.push_output(OutputLine::info(format!("> Debugging {what}")));
+        self.debug_generation += 1;
+        self.debug = Some(debugger::Session::new(self.debug_generation, port, scene));
+        self.show_panel(Panel::Debug);
+    }
+
+    fn on_debugger(&mut self, generation: u64, event: debugger::DebugEvent) -> Task<Message> {
+        let root = self.project.as_ref().map(|p| p.root.clone()).unwrap_or_default();
+        let Some(session) = self.debug.as_mut().filter(|s| s.generation == generation) else {
+            return Task::none();
+        };
+        let effects = match event {
+            debugger::DebugEvent::Connected(client) => {
+                session.on_connected(client, &root);
+                Vec::new()
+            }
+            debugger::DebugEvent::Message(message) => session.on_message(message),
+            debugger::DebugEvent::Failed(error) => vec![debugger::Effect::Ended(Some(error))],
+            debugger::DebugEvent::Closed => vec![debugger::Effect::Ended(None)],
+        };
+        self.apply_debug_effects(effects)
+    }
+
+    fn on_debug(&mut self, message: debugger::DebugMessage) {
+        let Some(session) = &mut self.debug else {
+            return;
+        };
+        let effects = match message {
+            debugger::DebugMessage::SelectFrame(index) => session.select_frame(index),
+            debugger::DebugMessage::Toggle(path, reference) => {
+                session.toggle(path, reference);
+                Vec::new()
+            }
+            debugger::DebugMessage::Step(command) => {
+                session.step(command);
+                Vec::new()
+            }
+            debugger::DebugMessage::Stop if session.client.is_none() => vec![debugger::Effect::Ended(None)],
+            debugger::DebugMessage::Stop => {
+                session.stop();
+                Vec::new()
+            }
+        };
+        // Frames and toggles only jump: nothing to wait for.
+        let _ = self.apply_debug_effects(effects);
+    }
+
+    fn apply_debug_effects(&mut self, effects: Vec<debugger::Effect>) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for effect in effects {
+            match effect {
+                debugger::Effect::Configure => {
+                    if let Some(client) = self.debug.as_ref().and_then(|s| s.client.clone()) {
+                        debugger::send_breakpoints(&client, &self.all_breakpoints());
+                        let _ = client.configuration_done();
+                    }
+                }
+                debugger::Effect::Jump(path, line) => {
+                    self.dismiss_popups();
+                    self.focus = Focus::Editor;
+                    self.jump_to(path, line as u32, 0);
+                }
+                debugger::Effect::Output(text, error) => {
+                    for line in text.lines() {
+                        let previous = self.run.output.last().map_or(runner::LineKind::Normal, |l| l.kind);
+                        let mut line = runner::classify(line.to_string(), previous);
+                        if error && line.kind == runner::LineKind::Normal {
+                            line.kind = runner::LineKind::Error;
+                        }
+                        self.on_run(RunEvent::Line(line));
+                    }
+                }
+                debugger::Effect::Retry(reference, attempt) => {
+                    let generation = self.debug_generation;
+                    tasks.push(Task::perform(sleep(std::time::Duration::from_millis(100)), move |()| {
+                        Message::DebugRetry(generation, reference, attempt)
+                    }));
+                }
+                debugger::Effect::Ended(reason) => {
+                    self.debug = None;
+                    self.push_output(OutputLine::info("Debugging ended"));
+                    self.status = Some(reason.unwrap_or_else(|| "Debugging ended".to_string()));
+                }
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// A tab's breakpoints; `None` for files that can't have any.
+    fn breakpoints_of(&self, tab: &Tab) -> Option<Vec<usize>> {
+        (tab.language == Language::GDScript).then(|| tab.buffer.line_marks())
+    }
+
+    /// Every breakpoint: open files' from their buffers (where they follow
+    /// edits), the others' as last known. Files without any are kept, so
+    /// Godot is told to forget their last one.
+    fn all_breakpoints(&self) -> std::collections::BTreeMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut all = self.breakpoints.clone();
+        for tab in self.tabs.iter().filter(|t| t.language == Language::GDScript) {
+            let marks: std::collections::BTreeSet<usize> = tab.buffer.line_marks().into_iter().collect();
+            if !marks.is_empty() || all.contains_key(&tab.path) {
+                all.insert(tab.path.clone(), marks);
+            }
+        }
+        all
+    }
+
+    /// Sends one file's breakpoints to a running debug session.
+    fn send_file_breakpoints(&self, path: &Path) {
+        let Some(client) = self.debug.as_ref().and_then(|s| s.client.as_ref()) else {
+            return;
+        };
+        let lines = match self.tabs.iter().find(|t| t.path == path) {
+            Some(tab) => tab.buffer.line_marks(),
+            None => self.breakpoints.get(path).map(|l| l.iter().copied().collect()).unwrap_or_default(),
+        };
+        let one_based: Vec<usize> = lines.iter().map(|l| l + 1).collect();
+        let _ = client.set_breakpoints(path, &one_based);
+    }
+
+    /// The (zero-based) line of `path` the debugger is paused on.
+    fn paused_line_in(&self, path: &Path) -> Option<usize> {
+        let session = self.debug.as_ref().filter(|s| s.paused())?;
+        let (file, line) = session.location()?;
+        uri::same_path(file, path).then(|| line.saturating_sub(1))
+    }
+
+    /// F9: a breakpoint on the cursor's line of the active GDScript tab.
+    fn toggle_breakpoint_at_cursor(&mut self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let line = tab.buffer.char_to_pos(tab.buffer.primary().head).line;
+        let path = tab.path.clone();
+        self.toggle_breakpoint(path, line);
+    }
+
+    fn toggle_breakpoint(&mut self, path: PathBuf, line: usize) {
+        if Language::from_path(&path) != Language::GDScript {
+            self.status = Some("Breakpoints go in GDScript files".to_string());
+            return;
+        }
+        let tab = self.tabs.iter_mut().find(|t| t.path == path);
+        let mut lines: std::collections::BTreeSet<usize> = match &tab {
+            Some(tab) => tab.buffer.line_marks().into_iter().collect(),
+            None => self.breakpoints.get(&path).cloned().unwrap_or_default(),
+        };
+        if !lines.remove(&line) {
+            lines.insert(line);
+        }
+        if let Some(tab) = tab {
+            tab.buffer.set_line_marks(lines.iter().copied());
+        }
+        self.breakpoints.insert(path.clone(), lines);
+        // A running session gets the file's new list at once (an empty one
+        // too, so Godot forgets the last).
+        self.send_file_breakpoints(&path);
+    }
+
     fn start_run(&mut self, scene: Option<String>) {
         let Some(project) = &self.project else {
             return;
@@ -2266,7 +2508,9 @@ impl App {
             }
         };
         let cursor = tab.buffer.char_to_pos(tab.buffer.primary().head);
+        let marks = tab.buffer.line_marks();
         tab.buffer = Buffer::new(&text, tab.language);
+        tab.buffer.set_line_marks(marks);
         tab.buffer.set_cursor(cursor);
         tab.dirty = false;
         tab.disk_changed = false;
@@ -2379,6 +2623,11 @@ impl App {
                 }
             }
             EditorEvent::DropFile { path, pos, ctrl } => self.drop_file(&path, pos, ctrl),
+            EditorEvent::ToggleBreakpoint(line) => {
+                if let Some(path) = self.active_tab().map(|t| t.path.clone()) {
+                    self.toggle_breakpoint(path, line);
+                }
+            }
             EditorEvent::GitMarker => {
                 let path = self.active_tab().map(|t| t.path.clone());
                 return self.update(Message::ShowChanges(path));
@@ -3386,6 +3635,14 @@ impl App {
     /// Open tabs follow a renamed file or folder; files still using its old
     /// `res://` path are listed in the SEARCH tab.
     fn after_rename(&mut self, from: &Path, to: &Path) -> Task<Message> {
+        // Breakpoints of closed files follow too (open ones live in their tab).
+        let moved: Vec<(PathBuf, PathBuf)> =
+            self.breakpoints.keys().filter_map(|p| file_ops::moved(p, from, to).map(|n| (p.clone(), n))).collect();
+        for (old, new) in moved {
+            if let Some(lines) = self.breakpoints.remove(&old) {
+                self.breakpoints.insert(new, lines);
+            }
+        }
         let client = self.lsp.client().cloned();
         for tab in &mut self.tabs {
             let Some(path) = file_ops::moved(&tab.path, from, to) else {
@@ -3439,6 +3696,8 @@ impl App {
             }
         }
         self.sync_groups();
+        // After closing its tabs, which hand their breakpoints back.
+        self.breakpoints.retain(|p, _| file_ops::moved(p, path, path).is_none());
         let Some(project) = &mut self.project else {
             return Task::none();
         };
@@ -4115,6 +4374,9 @@ impl App {
             group: self.focused_group,
             git: GitMarks::default(),
         };
+        if let Some(lines) = self.breakpoints.get(&tab.path) {
+            tab.buffer.set_line_marks(lines.iter().copied());
+        }
         // The staged text from the last refresh shows the markers at once.
         if let Some(file) = self.project.as_ref().and_then(|p| p.git_files.iter().find(|f| uri::same_path(&f.path, &tab.path))) {
             tab.git.set_base(file.base.clone());
@@ -4148,7 +4410,13 @@ impl App {
             })
             .collect();
         let split_ratio = Some(self.split_ratio).filter(|&r| r != 0.5);
-        session::Session { tabs, active: self.active, split_ratio, godot: self.godot_choice.clone() }
+        let breakpoints = self
+            .all_breakpoints()
+            .iter()
+            .filter(|(_, lines)| !lines.is_empty())
+            .map(|(path, lines)| (path.clone(), lines.iter().copied().collect()))
+            .collect();
+        session::Session { tabs, active: self.active, split_ratio, godot: self.godot_choice.clone(), breakpoints }
     }
 
     /// Saves the project's session if it changed since the last save.
@@ -4174,6 +4442,7 @@ impl App {
         let saved = session::load(&project.root);
         self.split_ratio = saved.split_ratio.unwrap_or(0.5).clamp(0.0, 1.0);
         self.godot_choice = saved.godot.clone();
+        self.breakpoints = saved.breakpoints.iter().map(|(path, lines)| (path.clone(), lines.iter().copied().collect())).collect();
         for state in &saved.tabs {
             if self.tabs.iter().any(|t| uri::same_path(&t.path, &state.path)) {
                 continue;
@@ -4227,6 +4496,13 @@ impl App {
         if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
             let _ = client.did_close(&tab.path);
         }
+        // Its breakpoints, as moved by edits, stay known once it is closed.
+        if tab.language == Language::GDScript {
+            let marks: std::collections::BTreeSet<usize> = tab.buffer.line_marks().into_iter().collect();
+            if !marks.is_empty() || self.breakpoints.contains_key(&tab.path) {
+                self.breakpoints.insert(tab.path.clone(), marks);
+            }
+        }
         self.pending_close = None;
         self.tabs.remove(index);
         // Indices after the removed tab shift down; sync_groups refills gaps.
@@ -4279,6 +4555,11 @@ impl App {
                 tab.disk_changed = false;
                 if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
                     let _ = client.did_save(&tab.path, &tab.buffer.text());
+                }
+                // Godot reads the saved file: its breakpoints may have moved with edits.
+                if tab.language == Language::GDScript {
+                    let path = tab.path.clone();
+                    self.send_file_breakpoints(&path);
                 }
                 true
             }
@@ -4563,7 +4844,8 @@ impl App {
             .marks(&tab.marks)
             .focused(focused && self.focus == Focus::Editor)
             .dropping(self.file_drag.as_deref())
-            .git_changes(tab.git.changes(&tab.buffer));
+            .git_changes(tab.git.changes(&tab.buffer))
+            .breakpoints(self.breakpoints_of(tab), self.paused_line_in(&tab.path));
         let mut area = column![self.tab_bar(group)];
         if !focused {
             return area.push(editor).into();
@@ -4622,6 +4904,11 @@ impl App {
                 0 => "CHANGES".to_string(),
                 n => format!("CHANGES  {n}"),
             }),
+            (Panel::Debug, match &self.debug {
+                Some(session) if session.paused() => "DEBUG (paused)".to_string(),
+                Some(_) => "DEBUG (running)".to_string(),
+                None => "DEBUG".to_string(),
+            }),
         ]
         .into_iter()
         .map(|(tab, label)| {
@@ -4643,6 +4930,17 @@ impl App {
                 }
                 header = header.push(action("refresh", Message::RefreshGit, "Read the git status again"));
             }
+            Panel::Debug => {
+                if let Some(session) = &self.debug {
+                    let key = |id: &str| self.keymap.label(id);
+                    for control in debugger::controls(session, ui, key) {
+                        header = header.push(control.map(Message::Debug));
+                    }
+                } else {
+                    let start = format!("Debug the main scene ({})", self.keymap.label("debug.start"));
+                    header = header.push(action("start", Message::StartDebug { scene: false }, &start));
+                }
+            }
             Panel::Problems | Panel::Search => {}
         }
         header = header.push(action("x", Message::ClosePanel, "Close the panel"));
@@ -4652,6 +4950,7 @@ impl App {
             Panel::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),
             Panel::Output => self.output_view(),
             Panel::Changes => self.changes_view(),
+            Panel::Debug => self.debug_view(),
             Panel::Terminal => match self.terminals.active().and_then(|t| t.session.as_ref()) {
                 Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
                     .font(code_editor::CodeFont::from_settings(&theme.font))
@@ -4674,6 +4973,33 @@ impl App {
             .height(self.panel_height())
             .style(style::surface(ui))
             .into()
+    }
+
+    /// The DEBUG panel: the session's state, call stack and variables, or
+    /// how to start one.
+    fn debug_view(&self) -> Element<'_, Message> {
+        let theme = self.current_theme();
+        let ui = &theme.ui;
+        let Some(session) = &self.debug else {
+            let note = format!(
+                "{} toggles a breakpoint on the cursor's line (or click a line number). {} debugs the main scene, {} the current one; F5 continues, {} / {} / {} step over / into / out. Runtime errors stop at their line too.",
+                self.keymap.label("debug.toggleBreakpoint"),
+                self.keymap.label("debug.start"),
+                self.keymap.label("debug.startScene"),
+                self.keymap.label("debug.stepOver"),
+                self.keymap.label("debug.stepInto"),
+                self.keymap.label("debug.stepOut"),
+            );
+            return container(text(note).size(12).color(style::to_color(ui.text_muted))).padding([6, 12]).into();
+        };
+        let look = debugger::Look {
+            text: style::to_color(theme.syntax.text),
+            muted: style::to_color(ui.text_muted),
+            accent: style::to_color(ui.accent),
+            error: style::to_color(ui.danger),
+            highlight: style::to_color(ui.accent).scale_alpha(0.2),
+        };
+        session.view(&look, |p| self.display_path(p)).map(Message::Debug)
     }
 
     /// The CHANGES panel: open files show their tab's text (unsaved edits
@@ -5030,6 +5356,12 @@ fn command_message(id: &str) -> Option<Message> {
         "run.project" => Message::RunProject,
         "run.scene" => Message::RunScene,
         "run.stop" => Message::StopRun,
+        "debug.start" => Message::StartDebug { scene: false },
+        "debug.startScene" => Message::StartDebug { scene: true },
+        "debug.toggleBreakpoint" => Message::ToggleBreakpoint,
+        "debug.stepOver" => Message::Debug(debugger::DebugMessage::Step("next")),
+        "debug.stepInto" => Message::Debug(debugger::DebugMessage::Step("stepIn")),
+        "debug.stepOut" => Message::Debug(debugger::DebugMessage::Step("stepOut")),
         "view.terminal" => Message::ToggleTerminal,
         "view.split" => Message::SplitMove,
         "view.shortcuts" => Message::OpenShortcuts,

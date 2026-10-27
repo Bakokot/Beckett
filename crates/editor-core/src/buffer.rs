@@ -167,6 +167,8 @@ pub struct Buffer {
     /// Folded blocks, by the char index where their header line starts
     /// (moved along by edits like selections are).
     folds: Vec<usize>,
+    /// Marked lines (breakpoints), kept the same way so they follow edits.
+    marks: Vec<usize>,
     /// Foldable ranges, computed once per text version.
     fold_cache: RefCell<Option<(u64, FoldRanges)>>,
 }
@@ -219,6 +221,7 @@ impl Buffer {
             language,
             line_states: RefCell::new(vec![LexState::initial(language)]),
             folds: Vec::new(),
+            marks: Vec::new(),
             fold_cache: RefCell::new(None),
         }
     }
@@ -1186,6 +1189,33 @@ impl Buffer {
         folds.sort_unstable();
         folds.dedup();
         self.folds = folds;
+        // Marks too; a removed line's mark goes to the line taking its place.
+        let mut marks: Vec<usize> = self
+            .marks
+            .iter()
+            .map(|&start| self.rope.line_to_char(self.rope.char_to_line(map_pos(changes, start).min(len))))
+            .collect();
+        marks.sort_unstable();
+        marks.dedup();
+        self.marks = marks;
+    }
+
+    /// Marks these (zero-based) lines, e.g. breakpoints; the marks follow
+    /// edits and undo.
+    pub fn set_line_marks(&mut self, lines: impl IntoIterator<Item = usize>) {
+        let count = self.rope.len_lines();
+        let mut marks: Vec<usize> = lines.into_iter().filter(|&l| l < count).map(|l| self.rope.line_to_char(l)).collect();
+        marks.sort_unstable();
+        marks.dedup();
+        self.marks = marks;
+    }
+
+    /// The marked lines, in order.
+    pub fn line_marks(&self) -> Vec<usize> {
+        let len = self.len_chars();
+        let mut lines: Vec<usize> = self.marks.iter().map(|&start| self.rope.char_to_line(start.min(len))).collect();
+        lines.dedup();
+        lines
     }
 
     fn set_selections(&mut self, selections: Vec<Selection>, primary: usize) {
@@ -1692,6 +1722,23 @@ mod tests {
         json.apply(Command::ToggleComment);
         assert_eq!(json.text(), "{\"a\": 1}\n");
         assert_eq!(Buffer::new("[node]\n", Language::Resource).tokens(0)[1].kind, gdscript::TokenKind::Keyword);
+    }
+
+    #[test]
+    fn line_marks_follow_edits_and_undo() {
+        let mut b = buf("a\nb\nc\nd\ne\nf\n");
+        b.set_line_marks([2, 5, 99]);
+        assert_eq!(b.line_marks(), [2, 5]);
+        // A line added at the top moves them down; undo moves them back.
+        at(&mut b, 0, 0);
+        type_str(&mut b, "new\n");
+        assert_eq!(b.line_marks(), [3, 6]);
+        b.apply(Command::Undo);
+        assert_eq!(b.line_marks(), [2, 5]);
+        // Deleting a marked line: its mark goes to the line taking its place.
+        at(&mut b, 2, 0);
+        b.apply(Command::DeleteLines);
+        assert_eq!(b.line_marks(), [2, 4]);
     }
 
     #[test]

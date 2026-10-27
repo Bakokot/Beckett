@@ -68,6 +68,8 @@ pub enum EditorEvent {
     DropFile { path: PathBuf, pos: Pos, ctrl: bool },
     /// A git change marker in the gutter was clicked.
     GitMarker,
+    /// A line number was clicked: add or remove a breakpoint on that line.
+    ToggleBreakpoint(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +146,10 @@ pub struct Colors {
     pub git_added: Color,
     pub git_modified: Color,
     pub git_deleted: Color,
+    pub breakpoint: Color,
+    /// Background of the line the debugger is paused on, and its marker.
+    pub paused_line: Color,
+    pub paused_marker: Color,
     pub syntax: theme::SyntaxColors,
 }
 
@@ -171,6 +177,9 @@ impl Colors {
             git_added: to_color(ui.success),
             git_modified: accent,
             git_deleted: to_color(ui.danger),
+            breakpoint: to_color(ui.danger),
+            paused_line: to_color(ui.warning).scale_alpha(0.22),
+            paused_marker: to_color(ui.warning),
             syntax: theme.syntax,
         }
     }
@@ -218,6 +227,11 @@ pub struct CodeEditor<'a, Message> {
     dropping: Option<&'a Path>,
     /// Lines changed since the staged text, marked in the gutter.
     git_changes: Rc<Vec<LineChange>>,
+    /// Lines (zero-based, in order) with a breakpoint; `None` in editors
+    /// that take none.
+    breakpoints: Option<Vec<usize>>,
+    /// The line the debugger is paused on.
+    paused_line: Option<usize>,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
@@ -243,7 +257,15 @@ impl<'a, Message> CodeEditor<'a, Message> {
             link: None,
             dropping: None,
             git_changes: Rc::default(),
+            breakpoints: None,
+            paused_line: None,
         }
+    }
+
+    pub fn breakpoints(mut self, lines: Option<Vec<usize>>, paused_line: Option<usize>) -> Self {
+        self.breakpoints = lines;
+        self.paused_line = paused_line;
+        self
     }
 
     pub fn git_changes(mut self, changes: Rc<Vec<LineChange>>) -> Self {
@@ -448,11 +470,13 @@ struct Geometry {
 
 /// Columns of the gutter taken by the fold markers, right of the numbers.
 const FOLD_COLUMNS: f32 = 2.0;
+/// Columns left of the numbers, for breakpoint dots.
+const BREAKPOINT_COLUMNS: f32 = 1.5;
 
 impl Geometry {
     fn new(buffer: &Buffer, bounds: Rectangle, metrics: Metrics) -> Self {
         let digits = buffer.len_lines().to_string().len().max(3) as f32;
-        let gutter = (digits + 1.0 + FOLD_COLUMNS) * metrics.char_width;
+        let gutter = (BREAKPOINT_COLUMNS + digits + 1.0 + FOLD_COLUMNS) * metrics.char_width;
         let text_area = Rectangle {
             x: bounds.x + gutter,
             width: (bounds.width - gutter).max(0.0),
@@ -533,6 +557,12 @@ enum KeyAction {
 impl<'a, Message> CodeEditor<'a, Message> {
     /// Whether `point` (on `line`) is on a git change marker: the strip at
     /// the gutter's right edge, beside a changed line or a removal wedge.
+    /// Whether `point` is on the line numbers, where a click toggles a
+    /// breakpoint (in editors that take breakpoints).
+    fn on_line_numbers(&self, geometry: &Geometry, point: Point) -> bool {
+        self.breakpoints.is_some() && geometry.bounds.contains(point) && point.x < geometry.fold_column().x
+    }
+
     fn on_git_marker(&self, geometry: &Geometry, point: Point, line: usize) -> bool {
         let strip = point.x >= geometry.text_area.x - geometry.char_width * 0.8 && point.x < geometry.text_area.x;
         strip
@@ -911,6 +941,13 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     shell.capture_event();
                     return;
                 }
+
+                // Line numbers (and the margin left of them): a breakpoint.
+                if self.on_line_numbers(&geometry, point) && line < self.buffer.len_lines() {
+                    self.emit(shell, EditorEvent::ToggleBreakpoint(line));
+                    shell.capture_event();
+                    return;
+                }
                 let on_marker = self.buffer.is_folded(line)
                     && geometry.fold_marker(self.buffer, line, state.scroll).contains(point);
                 if (geometry.fold_column().contains(point) && self.buffer.fold_range_at(line).is_some()) || on_marker {
@@ -1149,6 +1186,21 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 }
             }
 
+            // Breakpoints: red dots left of the numbers; the paused line's
+            // marker over them.
+            let dot = |r: &mut iced::Renderer, line: usize, size: Size, color: Color, radius: f32| {
+                let center = Point::new(g.bounds.x + cw * BREAKPOINT_COLUMNS * 0.5, g.line_y(line, scroll) + lh / 2.0);
+                let bounds = Rectangle::new(Point::new(center.x - size.width / 2.0, center.y - size.height / 2.0), size);
+                r.fill_quad(Quad { bounds, border: Border { radius: radius.into(), ..Border::default() }, ..Quad::default() }, color);
+            };
+            let radius = (lh * 0.3).min(cw * 0.6);
+            for &line in self.breakpoints.iter().flatten().filter(|&&l| (first..last).contains(&l) && shown(l)) {
+                dot(r, line, Size::new(radius * 2.0, radius * 2.0), colors.breakpoint, radius);
+            }
+            if let Some(line) = self.paused_line.filter(|&l| (first..last).contains(&l) && shown(l)) {
+                dot(r, line, Size::new(cw * 1.2, lh * 0.45), colors.paused_marker, lh * 0.12);
+            }
+
             // Git change markers, at the gutter's right edge: a bar beside
             // added or modified lines, a wedge where lines were removed.
             let bar_x = g.text_area.x - cw * 0.45;
@@ -1184,6 +1236,11 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             if primary.is_empty() {
                 let y = g.line_y(primary_pos.line, scroll);
                 fill(r, Rectangle { y, height: lh, ..g.text_area }, colors.current_line);
+            }
+            // The line the debugger is paused on.
+            if let Some(line) = self.paused_line.filter(|&l| shown(l)) {
+                let y = g.line_y(line, scroll);
+                fill(r, Rectangle { y, height: lh, ..g.text_area }, colors.paused_line);
             }
 
             // Indentation guides.
@@ -1398,7 +1455,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             return mouse::Interaction::Grabbing;
         }
         if let Some(point) = cursor.position_over(geometry.bounds) {
-            if self.on_git_marker(&geometry, point, geometry.line_at_y(point.y, state.scroll)) {
+            if self.on_git_marker(&geometry, point, geometry.line_at_y(point.y, state.scroll)) || self.on_line_numbers(&geometry, point) {
                 return mouse::Interaction::Pointer;
             }
         }
