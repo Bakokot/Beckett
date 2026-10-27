@@ -260,7 +260,11 @@ crates/
 
 **Theming**
 - [x] Shareable copy-paste theme codes (`GDTHEME1:` + compressed TOML, ~1 KB)
-- [ ] Import VS Code themes and Godot editor theme settings
+- [x] Import VS Code themes: "Theme: Import from VS Code..." lists the themes of the installed VS Code
+      (built-in and extensions, by their labels), or Theme: Import File... takes a `.json`; UI, terminal and
+      TextMate syntax colors mapped (most specific scope wins, `include`s merged, JSONC accepted), the rest
+      from Godot Dark / Light — all 9 themes installed here convert, not yet seen on screen
+- [ ] Import Godot editor theme settings (text editor colors)
 - [x] Follow the OS light/dark mode ("Theme: Follow the OS Light/Dark Mode"): switches between a dark and a
       light theme (Godot Dark / Godot Light until another is picked: while following, picking a theme makes
       it the one for its kind); read at start and on every OS change; not while the theme editor is open —

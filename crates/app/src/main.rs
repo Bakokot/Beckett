@@ -132,6 +132,10 @@ pub enum Message {
     FocusOtherSide,
     Save,
     ThemeSelected(String),
+    /// List the VS Code themes installed here, to import one.
+    ChooseVsCodeTheme,
+    /// Import this VS Code theme file.
+    ImportThemeFile(PathBuf),
     /// The OS is (or went) dark or light.
     SystemTheme(iced::theme::Mode),
     /// Turn following the OS light/dark mode on or off.
@@ -1202,6 +1206,8 @@ impl App {
                 }
             }
             Message::Save => self.save_active(),
+            Message::ChooseVsCodeTheme => return self.choose_vscode_theme(),
+            Message::ImportThemeFile(path) => self.import_theme_file(&path),
             Message::SystemTheme(mode) => {
                 self.os_theme = match mode {
                     iced::theme::Mode::Dark => Some(theme::ThemeKind::Dark),
@@ -1661,7 +1667,9 @@ impl App {
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_title("Import theme")
+                            .add_filter("Beckett or VS Code theme", &["toml", "json", "jsonc"])
                             .add_filter("Beckett theme", &["toml"])
+                            .add_filter("VS Code theme", &["json", "jsonc"])
                             .pick_file()
                             .await
                             .map(|f| f.path().to_path_buf())
@@ -1758,10 +1766,38 @@ impl App {
         }
     }
 
+    /// Lists the themes of the VS Code installed here in the palette.
+    fn choose_vscode_theme(&mut self) -> Task<Message> {
+        let installed = theme::vscode::installed();
+        if installed.is_empty() {
+            self.status = Some("No VS Code themes found (VS Code's extensions folder): import a theme .json file instead".to_string());
+            return Task::none();
+        }
+        let choices = installed
+            .into_iter()
+            .map(|found| palette::Choice {
+                detail: found.path.display().to_string(),
+                message: Message::ImportThemeFile(found.path),
+                label: found.label,
+            })
+            .collect();
+        let mut palette = Palette::choose("Import which VS Code theme?", choices);
+        palette.refresh(&[]);
+        self.palette = Some(palette);
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        iced::widget::operation::focus(palette::INPUT)
+    }
+
     fn import_theme_file(&mut self, path: &Path) {
-        let result = std::fs::read_to_string(path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| theme::Theme::from_toml(&text).map_err(|e| e.to_string()));
+        let vscode = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("jsonc"));
+        let result = if vscode {
+            theme::vscode::import(path)
+        } else {
+            std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|text| theme::Theme::from_toml(&text).map_err(|e| e.to_string()))
+        };
         match result {
             Ok(theme) => self.install_theme(theme, &path.display().to_string()),
             Err(error) => self.status = Some(format!("Cannot import theme: {error}")),
@@ -1950,6 +1986,7 @@ impl App {
                 Message::ToggleFollowOsTheme,
             ),
             ("Theme: Import File...", "", Message::ThemeEditor(ThemeMessage::Import)),
+            ("Theme: Import from VS Code...", "", Message::ChooseVsCodeTheme),
             ("Theme: Export File...", "", Message::ThemeEditor(ThemeMessage::Export)),
             ("Theme: Copy Share Code", "", Message::ThemeEditor(ThemeMessage::CopyCode)),
             ("Theme: Paste Share Code", "", Message::ThemeEditor(ThemeMessage::PasteCode)),

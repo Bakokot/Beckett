@@ -3,6 +3,7 @@
 mod color;
 mod share;
 mod slots;
+pub mod vscode;
 
 pub use color::{Color, ParseColorError};
 pub use share::{from_share_code, to_share_code};
