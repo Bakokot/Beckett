@@ -241,7 +241,9 @@ crates/
 - [ ] DAP debugger: breakpoints, stepping, call stack, variables
 
 **Terminal**
-- [ ] Multiple terminal tabs / splits
+- [x] Multiple terminal tabs: + in the panel header (or "Terminal: New Terminal"), one chip per shell with
+      its title, × or middle-click ends one, "kill" ends the active one, the last one closes the panel —
+      not yet seen on screen (splits not done)
 - [x] Clickable paths and URLs: Ctrl+click (Ctrl+hover underlines) `res://`, absolute and relative paths
       with `:line:column` or `(line,column)`, and http(s) URLs; files open at the line, folders in the file
       manager, URLs in the browser — detection unit-tested, not yet seen on screen

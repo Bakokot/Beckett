@@ -147,7 +147,12 @@ pub enum Message {
     ToggleTerminal,
     KillTerminal,
     FocusTerminal,
-    Terminal(TerminalEvent),
+    /// An event of the shell of this terminal tab.
+    Terminal(u64, TerminalEvent),
+    /// Start another shell in a new terminal tab.
+    NewTerminal,
+    SelectTerminal(u64),
+    CloseTerminal(u64),
     ShowPanel(Panel),
     ShowSidebar(SidebarView),
     /// List every use of this word in the project (whole word, case
@@ -287,12 +292,50 @@ pub enum Panel {
     Changes,
 }
 
+/// The shells of the terminal panel, one per tab.
 #[derive(Default)]
-struct TerminalState {
+struct Terminals {
+    tabs: Vec<TerminalTab>,
+    /// Index of the tab shown.
+    active: usize,
+    /// Ids are never reused: each one keys its shell's subscription.
+    next_id: u64,
+}
+
+struct TerminalTab {
+    id: u64,
+    /// `None` until the shell has started.
     session: Option<std::sync::Arc<terminal::Terminal>>,
+    /// Set by the shell (the running program or folder).
     title: Option<String>,
-    /// Bumped to start a new shell.
-    generation: u64,
+}
+
+impl Terminals {
+    /// Starts a new shell in a new tab and shows it.
+    fn add(&mut self) {
+        self.next_id += 1;
+        self.tabs.push(TerminalTab { id: self.next_id, session: None, title: None });
+        self.active = self.tabs.len() - 1;
+    }
+
+    fn active(&self) -> Option<&TerminalTab> {
+        self.tabs.get(self.active)
+    }
+
+    fn get_mut(&mut self, id: u64) -> Option<&mut TerminalTab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Ends the shell of tab `id` (dropping its subscription stops it).
+    fn remove(&mut self, id: u64) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        self.tabs.remove(index);
+        if self.active > index || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+    }
 }
 
 const MAX_OUTPUT_LINES: usize = 5000;
@@ -454,7 +497,7 @@ struct App {
     /// The Godot executable chosen for this project (`None`: the best
     /// installed match for its version). Kept in the session.
     godot_choice: Option<PathBuf>,
-    terminal: TerminalState,
+    terminals: Terminals,
     focus: Focus,
 }
 
@@ -637,7 +680,7 @@ impl App {
             uid_cache: HashMap::new(),
             scene_choice: HashMap::new(),
             godot_choice: None,
-            terminal: TerminalState::default(),
+            terminals: Terminals::default(),
             focus: Focus::Editor,
         };
         // Without a folder to open, pick up where the last session left off.
@@ -717,17 +760,20 @@ impl App {
             })
             .unwrap_or_else(Subscription::none);
 
-        // The shell keeps running while its panel is hidden.
-        let terminal = self
-            .project
-            .as_ref()
-            .filter(|_| self.panel == Some(Panel::Terminal) || self.terminal.session.is_some())
-            .map(|project| {
+        // One shell per terminal tab; they keep running while the panel is
+        // hidden. Each is keyed by its tab's id.
+        let terminal = match &self.project {
+            Some(project) => {
                 let version = project.godot.as_ref().and_then(GodotProject::godot_version);
-                terminal_panel::spawn(self.terminal.generation, project.root.clone(), version, self.godot_choice.clone())
-                    .map(Message::Terminal)
-            })
-            .unwrap_or_else(Subscription::none);
+                Subscription::batch(self.terminals.tabs.iter().map(|tab| {
+                    let id = tab.id;
+                    terminal_panel::spawn(id, project.root.clone(), version.clone(), self.godot_choice.clone())
+                        .with(id)
+                        .map(|(id, event)| Message::Terminal(id, event))
+                }))
+            }
+            None => Subscription::none(),
+        };
 
         let run = self
             .run
@@ -1301,20 +1347,43 @@ impl App {
                     self.jump_to(path, line.saturating_sub(1), 0);
                 }
             }
-            Message::KillTerminal => self.reset_terminal(),
+            Message::KillTerminal => {
+                if let Some(id) = self.terminals.active().map(|t| t.id) {
+                    self.close_terminal(id);
+                }
+            }
+            Message::NewTerminal => {
+                self.terminals.add();
+                self.show_panel(Panel::Terminal);
+            }
+            Message::SelectTerminal(id) => {
+                if let Some(index) = self.terminals.tabs.iter().position(|t| t.id == id) {
+                    self.terminals.active = index;
+                    self.focus = Focus::Terminal;
+                }
+            }
+            Message::CloseTerminal(id) => self.close_terminal(id),
             Message::FocusTerminal => {
                 self.focus = Focus::Terminal;
                 self.dismiss_popups();
             }
-            Message::Terminal(event) => match event {
-                TerminalEvent::Ready(session) => self.terminal.session = Some(session),
+            Message::Terminal(id, event) => match event {
+                TerminalEvent::Ready(session) => {
+                    if let Some(tab) = self.terminals.get_mut(id) {
+                        tab.session = Some(session);
+                    }
+                }
                 // Nothing to update: the view redraws from the live grid.
                 TerminalEvent::Wakeup => {}
-                TerminalEvent::Title(title) => self.terminal.title = Some(title),
-                TerminalEvent::Exit => self.reset_terminal(),
+                TerminalEvent::Title(title) => {
+                    if let Some(tab) = self.terminals.get_mut(id) {
+                        tab.title = Some(title);
+                    }
+                }
+                TerminalEvent::Exit => self.close_terminal(id),
                 TerminalEvent::Failed(error) => {
                     self.status = Some(format!("Cannot start terminal: {error}"));
-                    self.reset_terminal();
+                    self.close_terminal(id);
                 }
             },
         }
@@ -1323,6 +1392,10 @@ impl App {
 
     fn show_panel(&mut self, panel: Panel) {
         self.panel = Some(panel);
+        // Showing the terminal starts a shell when there is none.
+        if panel == Panel::Terminal && self.terminals.tabs.is_empty() && self.project.is_some() {
+            self.terminals.add();
+        }
         self.focus = match panel {
             Panel::Terminal => Focus::Terminal,
             Panel::Search => Focus::Input,
@@ -1718,6 +1791,7 @@ impl App {
             ("View: Project (Autoloads, Input Map)", "", Message::ShowSidebar(SidebarView::Project)),
             ("File: New Script...", "", Message::OpenNewScript(None)),
             ("Git: Show Changes", "", Message::ShowChanges(None)),
+            ("Terminal: New Terminal", "", Message::NewTerminal),
             ("Git: Add Godot .gitignore and .gitattributes", "", Message::AddGodotIgnores),
             ("Git: Show Changes in This File", "", Message::ShowChanges(self.active_tab().map(|t| t.path.clone()))),
             ("Go to Definition", "go.definition", Message::GotoDefinition),
@@ -2219,11 +2293,20 @@ impl App {
         self.run.handle.is_some()
     }
 
-    /// Ends the shell (if any) and hides its panel; the next toggle starts
-    /// a fresh one.
+    /// Ends one shell; when none is left, hides the panel (the next toggle
+    /// starts a fresh one).
+    fn close_terminal(&mut self, id: u64) {
+        self.terminals.remove(id);
+        if self.terminals.tabs.is_empty() {
+            self.reset_terminal();
+        }
+    }
+
+    /// Ends every shell and hides their panel; the next toggle starts a
+    /// fresh one.
     fn reset_terminal(&mut self) {
-        let generation = self.terminal.generation + 1;
-        self.terminal = TerminalState { generation, ..TerminalState::default() };
+        self.terminals.tabs.clear();
+        self.terminals.active = 0;
         if self.panel == Some(Panel::Terminal) {
             self.panel = None;
         }
@@ -4549,14 +4632,13 @@ impl App {
 
         let mut header = Row::with_children(tabs).spacing(4).align_y(Alignment::Center);
         if panel == Panel::Terminal {
-            let title = self.terminal.title.as_deref().unwrap_or("");
-            header = header.push(text(title).size(12).color(muted));
+            header = header.push(self.terminal_tabs());
         }
         header = header.push(space::horizontal());
         match panel {
             Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun, "Stop the game (F8)")),
             Panel::Output => header = header.push(action("clear", Message::ClearOutput, "Clear the output")),
-            Panel::Terminal => header = header.push(action("kill", Message::KillTerminal, "End the shell; the next toggle starts a new one")),
+            Panel::Terminal => header = header.push(action("kill", Message::KillTerminal, "End this shell (the last one closes the panel)")),
             Panel::Changes => {
                 if let Some(path) = &self.changes_focus {
                     header = header.push(text(self.display_path(path)).size(12).color(muted));
@@ -4573,7 +4655,7 @@ impl App {
             Panel::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),
             Panel::Output => self.output_view(),
             Panel::Changes => self.changes_view(),
-            Panel::Terminal => match &self.terminal.session {
+            Panel::Terminal => match self.terminals.active().and_then(|t| t.session.as_ref()) {
                 Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
                     .font(code_editor::CodeFont::from_settings(&theme.font))
                     .passthrough(self.terminal_passthrough())
@@ -4636,6 +4718,39 @@ impl App {
             .filter(|f| !(f.status == git::FileStatus::Modified && f.new.is_some() && f.hunks.is_empty()))
             .collect();
         changes::view(files, &look, ui)
+    }
+
+    /// The terminal tabs in the panel header: one per shell (with its title,
+    /// and × to end it), then + for another.
+    fn terminal_tabs(&self) -> Element<'_, Message> {
+        let ui = &self.current_theme().ui;
+        let muted = style::to_color(ui.text_muted);
+        let single = self.terminals.tabs.len() == 1;
+        let mut tabs = Row::new().spacing(2).align_y(Alignment::Center);
+        for (index, tab) in self.terminals.tabs.iter().enumerate() {
+            let title = tab.title.as_deref().unwrap_or("shell");
+            // Long titles (full paths) are cut from the left: the end says most.
+            let short: String = match title.chars().count() {
+                n if n > 28 => format!("…{}", title.chars().skip(n - 27).collect::<String>()),
+                _ => title.to_string(),
+            };
+            if single {
+                // One shell: just its title, as before tabs existed.
+                tabs = tabs.push(text(short).size(12).color(muted));
+                continue;
+            }
+            let style: fn(&iced::Theme, button::Status) -> button::Style =
+                if index == self.terminals.active { button::secondary } else { button::text };
+            let select = button(text(format!("{} {short}", index + 1)).size(12))
+                .on_press(Message::SelectTerminal(tab.id))
+                .style(style)
+                .padding([2, 6]);
+            let close = button(text("×").size(12)).on_press(Message::CloseTerminal(tab.id)).style(button::text).padding([2, 4]);
+            let chip = row![select, style::tip(close, "End this shell", tooltip::Position::Top, ui)];
+            tabs = tabs.push(mouse_area(chip).on_middle_release(Message::CloseTerminal(tab.id)));
+        }
+        let add = button(text("+").size(12)).on_press(Message::NewTerminal).style(button::text).padding([2, 6]);
+        tabs.push(style::tip(add, "Another shell, in a new tab", tooltip::Position::Top, ui)).into()
     }
 
     fn output_view(&self) -> Element<'_, Message> {
@@ -5024,5 +5139,35 @@ fn completion_row(item: &lsp_client::CompletionItem, snippet: bool, colors: &cod
         label: item.label.clone(),
         tag,
         color,
+    }
+}
+
+#[cfg(test)]
+mod terminal_tab_tests {
+    use super::Terminals;
+
+    fn ids(terminals: &Terminals) -> Vec<u64> {
+        terminals.tabs.iter().map(|t| t.id).collect()
+    }
+
+    #[test]
+    fn closing_a_tab_keeps_a_sensible_one_active() {
+        let mut terminals = Terminals::default();
+        for _ in 0..3 {
+            terminals.add();
+        }
+        assert_eq!((ids(&terminals), terminals.active), (vec![1, 2, 3], 2));
+        // Closing one before the active tab keeps showing the same shell.
+        terminals.active = 2;
+        terminals.remove(1);
+        assert_eq!(terminals.active().map(|t| t.id), Some(3));
+        // Closing the active last tab shows the one before it.
+        terminals.remove(3);
+        assert_eq!(terminals.active().map(|t| t.id), Some(2));
+        terminals.remove(2);
+        assert!(terminals.active().is_none());
+        // Ids are never reused.
+        terminals.add();
+        assert_eq!(ids(&terminals), [4]);
     }
 }
