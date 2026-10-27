@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use iced::futures::channel::mpsc;
 use iced::futures::{SinkExt, StreamExt};
 use iced::widget::tooltip::Position;
-use iced::widget::{button, column, container, row, scrollable, text, Column};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Column};
 use iced::{Alignment, Background, Color, Element, Font, Length, Subscription};
 use lsp_client::dap::{self, DapClient, DapMessage, Scope, StackFrame, Variable};
+use editor_core::Pos;
 use serde_json::Value;
 
 use crate::style;
@@ -34,6 +35,11 @@ pub enum DebugMessage {
     /// `continue`, `next`, `stepIn`, `stepOut` or `pause`.
     Step(&'static str),
     Stop,
+    /// The text of the watch being typed.
+    WatchInput(String),
+    /// Add the typed watch.
+    AddWatch,
+    RemoveWatch(usize),
 }
 
 /// Identifies a connection: a new session gets a new generation.
@@ -88,12 +94,16 @@ pub enum Effect {
     Retry(i64, u32),
     /// The session is over (with why, if it failed).
     Ended(Option<String>),
+    /// The value of the expression hovered at this position.
+    HoverValue(Pos, String, String),
 }
 
 enum Request {
     StackTrace,
     Scopes,
     Variables { reference: i64, attempt: u32 },
+    Watch(String),
+    Hover(Pos, String),
 }
 
 /// Tries for a frame's variables before giving up (about a second).
@@ -116,10 +126,16 @@ pub struct Session {
     /// Expanded tree paths; kept from one pause to the next.
     expanded: HashSet<String>,
     pending: HashMap<i64, Request>,
+    /// Watch expressions (the app keeps them in the session), their
+    /// values at this pause (text and variables reference), and the one
+    /// being typed.
+    pub watches: Vec<String>,
+    watch_values: HashMap<String, (String, i64)>,
+    pub watch_input: String,
 }
 
 impl Session {
-    pub fn new(generation: u64, port: u16, scene: Option<String>) -> Self {
+    pub fn new(generation: u64, port: u16, scene: Option<String>, watches: Vec<String>) -> Self {
         Self {
             generation,
             port,
@@ -133,6 +149,9 @@ impl Session {
             paths: HashMap::new(),
             expanded: ["Locals", "Members"].into_iter().map(String::from).collect(),
             pending: HashMap::new(),
+            watches,
+            watch_values: HashMap::new(),
+            watch_input: String::new(),
         }
     }
 
@@ -227,6 +246,24 @@ impl Session {
                 }
                 Vec::new()
             }
+            Request::Watch(expression) => {
+                let value = match (success, body["result"].as_str()) {
+                    (true, Some(result)) => (result.to_string(), body["variablesReference"].as_i64().unwrap_or_default()),
+                    _ => ("(can't evaluate)".to_string(), 0),
+                };
+                if value.1 != 0 {
+                    self.paths.insert(value.1, format!("Watch/{expression}"));
+                    if self.expanded.contains(&format!("Watch/{expression}")) {
+                        self.request_variables(value.1, 0);
+                    }
+                }
+                self.watch_values.insert(expression, value);
+                Vec::new()
+            }
+            Request::Hover(pos, expression) => match (success, body["result"].as_str()) {
+                (true, Some(result)) => vec![Effect::HoverValue(pos, expression, result.to_string())],
+                _ => Vec::new(),
+            },
             Request::Variables { reference, attempt } if !success => {
                 if attempt + 1 < MAX_ATTEMPTS && self.paused() {
                     vec![Effect::Retry(reference, attempt + 1)]
@@ -264,6 +301,7 @@ impl Session {
     }
 
     fn clear_frames(&mut self) {
+        self.watch_values.clear();
         self.frames.clear();
         self.frame = 0;
         self.scopes.clear();
@@ -285,7 +323,33 @@ impl Session {
         if let Some(sent) = sent {
             self.send(Request::Scopes, sent);
         }
+        self.watch_values.clear();
+        for expression in self.watches.clone() {
+            self.evaluate_watch(expression);
+        }
         jump.into_iter().collect()
+    }
+
+    /// Evaluates a watch in the frame shown (when paused).
+    pub fn evaluate_watch(&mut self, expression: String) {
+        let Some(frame) = self.frames.get(self.frame).map(|f| f.id) else {
+            return;
+        };
+        let sent = self.client.as_ref().map(|c| c.evaluate(&expression, frame, "watch"));
+        if let Some(sent) = sent {
+            self.send(Request::Watch(expression), sent);
+        }
+    }
+
+    /// Asks for the value of `expression`, hovered at `pos` (when paused).
+    pub fn hover(&mut self, pos: Pos, expression: String) {
+        let Some(frame) = self.frames.get(self.frame).map(|f| f.id) else {
+            return;
+        };
+        let sent = self.client.as_ref().map(|c| c.evaluate(&expression, frame, "hover"));
+        if let Some(sent) = sent {
+            self.send(Request::Hover(pos, expression), sent);
+        }
     }
 
     pub fn toggle(&mut self, path: String, reference: i64) {
@@ -310,6 +374,44 @@ impl Session {
             let _ = client.disconnect();
         }
     }
+}
+
+/// What hovering `column` of `line` should evaluate while paused: the name
+/// there with the `a.b.` chain before it (`data.hp`, `self.speed`). Never
+/// a call: evaluating `f()` would run it in the game.
+pub fn hover_expression(line: &str, column: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let is_name = |c: char| c.is_alphanumeric() || c == '_';
+    if !chars.get(column).copied().is_some_and(is_name) {
+        return None;
+    }
+    let mut end = column;
+    while end < chars.len() && is_name(chars[end]) {
+        end += 1;
+    }
+    // Calling it (`name(`): not a value.
+    if chars[end..].iter().find(|c| !c.is_whitespace()) == Some(&'(') {
+        return None;
+    }
+    let mut start = column;
+    loop {
+        while start > 0 && is_name(chars[start - 1]) {
+            start -= 1;
+        }
+        // `a.b`: take `a.` too. A member of a call or index (`f().b`) can't
+        // be evaluated without the call: nothing (`b` alone would be self's).
+        if start >= 1 && chars[start - 1] == '.' {
+            if start >= 2 && is_name(chars[start - 2]) {
+                start -= 1;
+                continue;
+            }
+            return None;
+        }
+        break;
+    }
+    let expression: String = chars[start..end].iter().collect();
+    let first = expression.chars().next()?;
+    (!first.is_ascii_digit()).then_some(expression)
 }
 
 /// Sends every file's breakpoints (one-based lines), including files whose
@@ -367,9 +469,26 @@ impl Session {
             frames.push(text("Loading...").size(12).color(look.muted).into());
         }
 
-        let mut variables: Vec<Element<'a, DebugMessage>> = vec![text("VARIABLES").size(11).color(look.muted).into()];
+        let mut variables: Vec<Element<'a, DebugMessage>> = vec![text("WATCH").size(11).color(look.muted).into()];
+        for (index, expression) in self.watches.iter().enumerate() {
+            let (value, reference) = match self.watch_values.get(expression) {
+                Some((value, reference)) => (Some(value.as_str()), *reference),
+                None => (self.paused().then_some("..."), 0),
+            };
+            let path = format!("Watch/{expression}");
+            self.push_node(&mut variables, path, expression, value, reference, 0, look, Some(DebugMessage::RemoveWatch(index)));
+        }
+        variables.push(
+            text_input("Add a watch expression (e.g. velocity.length())", &self.watch_input)
+                .on_input(DebugMessage::WatchInput)
+                .on_submit(DebugMessage::AddWatch)
+                .size(12)
+                .padding([2, 6])
+                .into(),
+        );
+        variables.push(text("VARIABLES").size(11).color(look.muted).into());
         for scope in &self.scopes {
-            self.push_node(&mut variables, scope.name.clone(), &scope.name, None, scope.reference, 0, look);
+            self.push_node(&mut variables, scope.name.clone(), &scope.name, None, scope.reference, 0, look, None);
         }
         if !self.paused() {
             variables.push(text("Shown while paused (breakpoint, step, error)").size(12).color(look.muted).into());
@@ -391,6 +510,7 @@ impl Session {
         reference: i64,
         depth: usize,
         look: &Look,
+        remove: Option<DebugMessage>,
     ) {
         let expandable = reference != 0;
         let open = expandable && self.expanded.contains(&path);
@@ -407,7 +527,15 @@ impl Session {
         }
         let padding = iced::Padding { left: 4.0 + 14.0 * depth as f32, right: 4.0, top: 0.0, bottom: 0.0 };
         let row_button = button(content).width(Length::Fill).padding(padding).style(button::text);
-        rows.push(if expandable { row_button.on_press(DebugMessage::Toggle(path.clone(), reference)).into() } else { row_button.into() });
+        let row_button: Element<'a, DebugMessage> =
+            if expandable { row_button.on_press(DebugMessage::Toggle(path.clone(), reference)).into() } else { row_button.into() };
+        rows.push(match remove {
+            Some(remove) => {
+                let close = button(text("×").size(12)).on_press(remove).style(button::text).padding([0, 6]);
+                row![row_button, close].align_y(Alignment::Center).into()
+            }
+            None => row_button,
+        });
         if !open {
             return;
         }
@@ -418,7 +546,7 @@ impl Session {
             Some(children) => {
                 for child in children {
                     let child_path = format!("{path}/{}", child.name);
-                    self.push_node(rows, child_path, &child.name, Some(&child.value), child.reference, depth + 1, look);
+                    self.push_node(rows, child_path, &child.name, Some(&child.value), child.reference, depth + 1, look, None);
                 }
             }
             None => {
@@ -467,8 +595,25 @@ mod tests {
     }
 
     #[test]
+    fn hovering_evaluates_names_and_member_chains_never_calls() {
+        let at = |text: &str| {
+            let column = text.find('|').unwrap();
+            hover_expression(&text.replace('|', ""), column)
+        };
+        assert_eq!(at("\tcounter += |i").as_deref(), Some("i"));
+        assert_eq!(at("\tprint(data.h|p)").as_deref(), Some("data.hp"));
+        assert_eq!(at("\tself.spe|ed = 2").as_deref(), Some("self.speed"));
+        assert_eq!(at("\tse|lf.speed = 2").as_deref(), Some("self"));
+        assert_eq!(at("\tvar v = position.normalized|()"), None);
+        assert_eq!(at("\tget_node(\"x\").vis|ible"), None);
+        assert_eq!(at("\titems[0].na|me"), None);
+        assert_eq!(at("\tx = 4|2"), None);
+        assert_eq!(at("\tx = |+ 1"), None);
+    }
+
+    #[test]
     fn a_pause_loads_the_stack_then_the_expanded_variables() {
-        let mut session = Session::new(1, 0, None);
+        let mut session = Session::new(1, 0, None, Vec::new());
         // Without a client nothing is sent: fake the requests' bookkeeping.
         let stopped = DapMessage::Event { event: "stopped".into(), body: json!({ "description": "Breakpoint" }) };
         assert!(session.on_message(stopped).is_empty());
@@ -496,11 +641,21 @@ mod tests {
         assert_eq!(session.children[&1].len(), 1);
         assert_eq!(session.paths.get(&4).map(String::as_str), Some("Locals/self"));
 
+        // Watches and hovers are evaluated in the paused frame.
+        session.pending.insert(5, Request::Watch("counter".into()));
+        session.on_message(response(5, true, json!({ "result": "3", "variablesReference": 0 })));
+        assert_eq!(session.watch_values.get("counter"), Some(&("3".to_string(), 0)));
+        let pos = Pos { line: 8, column: 2 };
+        session.pending.insert(6, Request::Hover(pos, "data.hp".into()));
+        let hover = session.on_message(response(6, true, json!({ "result": "10", "variablesReference": 0 })));
+        assert_eq!(hover, [Effect::HoverValue(pos, "data.hp".into(), "10".into())]);
+
         // Expanding is remembered by path; continuing clears the frame.
         session.toggle("Locals/self".into(), 4);
         assert!(session.expanded.contains("Locals/self"));
         session.on_message(DapMessage::Event { event: "continued".into(), body: json!({}) });
         assert!(session.frames.is_empty() && session.children.is_empty() && session.expanded.contains("Locals/self"));
+        assert!(session.watch_values.is_empty());
         let ended = session.on_message(DapMessage::Event { event: "terminated".into(), body: Value::Null });
         assert_eq!(ended, [Effect::Ended(None)]);
     }

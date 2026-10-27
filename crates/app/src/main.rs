@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use editor_core::diff::{self, Hunk, LineChange};
+use editor_core::gdscript::TokenKind;
 use editor_core::{snippet, Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
 use iced::widget::{
@@ -516,6 +517,8 @@ struct App {
     debug: Option<debugger::Session>,
     /// Bumped for each session, so a finished one's events are ignored.
     debug_generation: u64,
+    /// Watch expressions, evaluated at each pause; kept in the session.
+    watches: Vec<String>,
     focus: Focus,
 }
 
@@ -702,6 +705,7 @@ impl App {
             breakpoints: std::collections::BTreeMap::new(),
             debug: None,
             debug_generation: 0,
+            watches: Vec::new(),
             focus: Focus::Editor,
         };
         // Without a folder to open, pick up where the last session left off.
@@ -2221,7 +2225,7 @@ impl App {
         let what = scene.clone().unwrap_or_else(|| "the main scene".to_string());
         self.push_output(OutputLine::info(format!("> Debugging {what}")));
         self.debug_generation += 1;
-        self.debug = Some(debugger::Session::new(self.debug_generation, port, scene));
+        self.debug = Some(debugger::Session::new(self.debug_generation, port, scene, self.watches.clone()));
         self.show_panel(Panel::Debug);
     }
 
@@ -2254,6 +2258,26 @@ impl App {
             }
             debugger::DebugMessage::Step(command) => {
                 session.step(command);
+                Vec::new()
+            }
+            debugger::DebugMessage::WatchInput(text) => {
+                session.watch_input = text;
+                Vec::new()
+            }
+            debugger::DebugMessage::AddWatch => {
+                let expression = std::mem::take(&mut session.watch_input).trim().to_string();
+                if !expression.is_empty() && !session.watches.contains(&expression) {
+                    session.watches.push(expression.clone());
+                    session.evaluate_watch(expression);
+                    self.watches = session.watches.clone();
+                }
+                Vec::new()
+            }
+            debugger::DebugMessage::RemoveWatch(index) => {
+                if index < session.watches.len() {
+                    session.watches.remove(index);
+                    self.watches = session.watches.clone();
+                }
                 Vec::new()
             }
             debugger::DebugMessage::Stop if session.client.is_none() => vec![debugger::Effect::Ended(None)],
@@ -2296,6 +2320,10 @@ impl App {
                     tasks.push(Task::perform(sleep(std::time::Duration::from_millis(100)), move |()| {
                         Message::DebugRetry(generation, reference, attempt)
                     }));
+                }
+                debugger::Effect::HoverValue(pos, expression, value) => {
+                    let text = format!("`{expression}` = `{}`", value.replace('`', "'"));
+                    self.hover = Some((pos, Doc::from_markdown(&text)));
                 }
                 debugger::Effect::Ended(reason) => {
                     self.debug = None;
@@ -3128,6 +3156,23 @@ impl App {
         };
         // No docs for words in comments and strings.
         if paths::in_prose(&tab.buffer, tab.buffer.pos_to_char(pos)) {
+            return;
+        }
+        // Paused in the debugger: the value of what is hovered instead.
+        if self.debug.as_ref().is_some_and(debugger::Session::paused) {
+            // Keywords and literals have no value to show (`self` does).
+            let index = tab.buffer.pos_to_char(pos);
+            let (start, end) = tab.buffer.word_range(index);
+            let word = tab.buffer.slice(start, end);
+            let kind = paths::token_at(&tab.buffer, index);
+            if word != "self" && matches!(kind, Some(TokenKind::Keyword | TokenKind::ControlFlow | TokenKind::Annotation | TokenKind::Number)) {
+                return;
+            }
+            let line = tab.buffer.line_text(pos.line);
+            let expression = debugger::hover_expression(line.trim_end(), pos.column);
+            if let (Some(expression), Some(session)) = (expression, self.debug.as_mut()) {
+                session.hover(pos, expression);
+            }
             return;
         }
         if let Ok(id) = client.hover(&tab.path, to_lsp(pos)) {
@@ -4421,7 +4466,14 @@ impl App {
             .filter(|(_, lines)| !lines.is_empty())
             .map(|(path, lines)| (path.clone(), lines.iter().copied().collect()))
             .collect();
-        session::Session { tabs, active: self.active, split_ratio, godot: self.godot_choice.clone(), breakpoints }
+        session::Session {
+            tabs,
+            active: self.active,
+            split_ratio,
+            godot: self.godot_choice.clone(),
+            breakpoints,
+            watches: self.watches.clone(),
+        }
     }
 
     /// Saves the project's session if it changed since the last save.
@@ -4447,6 +4499,7 @@ impl App {
         let saved = session::load(&project.root);
         self.split_ratio = saved.split_ratio.unwrap_or(0.5).clamp(0.0, 1.0);
         self.godot_choice = saved.godot.clone();
+        self.watches = saved.watches.clone();
         self.breakpoints = saved.breakpoints.iter().map(|(path, lines)| (path.clone(), lines.iter().copied().collect())).collect();
         for state in &saved.tabs {
             if self.tabs.iter().any(|t| uri::same_path(&t.path, &state.path)) {
@@ -4988,7 +5041,7 @@ impl App {
         let ui = &theme.ui;
         let Some(session) = &self.debug else {
             let note = format!(
-                "{} toggles a breakpoint on the cursor's line (or click a line number). {} debugs the main scene, {} the current one; F5 continues, {} / {} / {} step over / into / out. Runtime errors stop at their line too.",
+                "{} toggles a breakpoint on the cursor's line (or click a line number). {} debugs the main scene, {} the current one; F5 continues, {} / {} / {} step over / into / out. Runtime errors stop at their line too. While paused, hover a name for its value; watch expressions are added in this panel.",
                 self.keymap.label("debug.toggleBreakpoint"),
                 self.keymap.label("debug.start"),
                 self.keymap.label("debug.startScene"),

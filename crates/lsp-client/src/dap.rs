@@ -125,6 +125,12 @@ impl DapClient {
         self.request("variables", json!({ "variablesReference": reference }))
     }
 
+    /// Evaluates a GDScript expression in a paused frame (`context`:
+    /// "hover" or "watch"). Godot answers `<null>` for unknown names.
+    pub fn evaluate(&self, expression: &str, frame: i64, context: &str) -> io::Result<i64> {
+        self.request("evaluate", json!({ "expression": expression, "frameId": frame, "context": context }))
+    }
+
     /// `continue`, `next` (step over), `stepIn`, `stepOut` or `pause`.
     pub fn step(&self, command: &str) -> io::Result<i64> {
         self.request(command, json!({ "threadId": 1 }))

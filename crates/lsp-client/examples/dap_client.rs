@@ -81,8 +81,19 @@ fn main() {
                     client.variables(1).unwrap();
                     continue;
                 }
+                if command == "evaluate" {
+                    println!("  evaluate -> ok={success} {}", body);
+                    continue;
+                }
                 if command == "variables" {
                     println!("  variables: {:?}", dap::variables(&body));
+                    if let Ok(list) = std::env::var("EVALUATE") {
+                        for expression in list.split(';') {
+                            println!("  evaluating {expression:?}");
+                            client.request("evaluate", serde_json::json!({ "expression": expression, "frameId": 0, "context": "hover" })).unwrap();
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
                     if stops >= 2 {
                         client.disconnect().unwrap();
                     } else {

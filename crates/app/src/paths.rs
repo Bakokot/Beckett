@@ -67,13 +67,16 @@ pub fn string_at(buffer: &Buffer, index: usize) -> Option<StringAt> {
 /// where a word like `a` isn't a symbol (the language server would still
 /// match it to some engine member). StringNames and NodePaths count as code.
 pub fn in_prose(buffer: &Buffer, index: usize) -> bool {
+    matches!(token_at(buffer, index), Some(TokenKind::Comment | TokenKind::String))
+}
+
+/// What the lexer made of the char at `index` (`None`: a plain name or
+/// punctuation).
+pub fn token_at(buffer: &Buffer, index: usize) -> Option<TokenKind> {
     let pos = buffer.char_to_pos(index);
     let line = buffer.line_text(pos.line);
     let byte = line.char_indices().nth(pos.column).map_or(line.len(), |(b, _)| b);
-    buffer
-        .tokens(pos.line)
-        .iter()
-        .any(|t| matches!(t.kind, TokenKind::Comment | TokenKind::String) && t.range.start <= byte && byte < t.range.end)
+    buffer.tokens(pos.line).into_iter().find(|t| t.range.start <= byte && byte < t.range.end).map(|t| t.kind)
 }
 
 /// The `res://` or `uid://` path in the string under `index`, without a

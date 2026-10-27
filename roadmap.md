@@ -244,9 +244,11 @@ crates/
       highlighted and shown, F5 continue, F10 / F11 / Shift+F11 step over / into / out, Shift+F5 stop; a
       DEBUG panel with the call stack (click a frame) and expandable variables (Locals / Members / Globals,
       expanded rows kept from one pause to the next); runtime errors pause at their line with the message;
-      game prints go to Output. Protocol checked live against Godot 4.7.1 (examples `dap_probe`,
+      game prints go to Output. Stage two: while paused, hovering a name (or `a.b` chain, never a call)
+      shows its value; watch expressions (re-evaluated at each pause, expandable, kept in the session).
+      Protocol checked live against Godot 4.7.1 (examples `dap_probe`,
       `dap_client`); UI not yet seen on screen. Not yet: push_error / warnings in Output while debugging
-      (Godot's adapter doesn't forward them), watch expressions, hover values, conditional breakpoints
+      (Godot's adapter doesn't forward them), conditional breakpoints, editing values
 
 **Terminal**
 - [x] Multiple terminal tabs: + in the panel header (or "Terminal: New Terminal"), one chip per shell with
