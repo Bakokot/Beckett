@@ -64,6 +64,8 @@ impl Lsp {
 struct Connection {
     root: PathBuf,
     wanted_version: Option<String>,
+    /// The Godot chosen for the project (`None`: the best match found).
+    godot: Option<PathBuf>,
     generation: u64,
     /// Attach to a Godot editor that is starting up, never spawn one.
     wait_for_editor: bool,
@@ -76,17 +78,17 @@ const EDITOR_STARTUP: Duration = Duration::from_secs(180);
 pub fn connect(
     root: PathBuf,
     wanted_version: Option<String>,
+    chosen: Option<PathBuf>,
     generation: u64,
     wait_for_editor: bool,
 ) -> Subscription<(u64, LspEvent)> {
-    let connection = Connection { root, wanted_version, generation, wait_for_editor };
+    let connection = Connection { root, wanted_version, godot: chosen, generation, wait_for_editor };
     Subscription::run_with(connection, |connection| {
-        let Connection { root, wanted_version, generation, wait_for_editor } = connection.clone();
+        let Connection { root, wanted_version, godot: chosen, generation, wait_for_editor } = connection.clone();
         iced::stream::channel(64, async move |mut output| {
             let (tx, mut rx) = mpsc::unbounded();
             std::thread::spawn(move || {
-                let installs = godot::discover();
-                let install = godot::pick(&installs, wanted_version.as_deref()).cloned();
+                let install = godot::resolve(chosen.as_deref(), wanted_version.as_deref());
                 let options = StartOptions {
                     godot: install.as_ref().map(|i| i.path.clone()),
                     wait_for_editor: wait_for_editor.then_some(EDITOR_STARTUP),

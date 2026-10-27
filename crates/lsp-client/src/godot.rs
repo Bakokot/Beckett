@@ -16,6 +16,12 @@ pub struct GodotInstall {
 }
 
 impl GodotInstall {
+    /// The install at `path`, its version read from the file name.
+    pub fn from_path(path: PathBuf) -> Self {
+        let version = path.file_name().and_then(|n| version_from_name(&n.to_string_lossy()));
+        Self { path, version }
+    }
+
     pub fn version_string(&self) -> Option<String> {
         self.version.map(|(major, minor, patch)| {
             if patch == 0 {
@@ -65,11 +71,33 @@ pub fn discover() -> Vec<GodotInstall> {
     candidates
         .into_iter()
         .filter(|path| path.is_file() && seen.insert(path_key(path)))
-        .map(|path| GodotInstall {
-            version: path.file_name().and_then(|n| version_from_name(&n.to_string_lossy())),
-            path,
-        })
+        .map(GodotInstall::from_path)
         .collect()
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    #[test]
+    fn a_chosen_install_wins_while_it_exists() {
+        let exe = env::temp_dir().join(format!("Godot_v4.2.2-stable_win64-{}.exe", std::process::id()));
+        std::fs::write(&exe, "").unwrap();
+        let chosen = resolve(Some(&exe), Some("4.5")).unwrap();
+        assert_eq!(chosen.path, exe);
+        std::fs::remove_file(&exe).unwrap();
+        // Gone: back to whatever is installed (if anything), never the old file.
+        assert!(resolve(Some(&exe), Some("4.5")).is_none_or(|i| i.path != exe));
+    }
+}
+
+/// The install a project uses: the one chosen for it, while that file is
+/// still there, else the best match for `wanted` among those found.
+pub fn resolve(chosen: Option<&Path>, wanted: Option<&str>) -> Option<GodotInstall> {
+    if let Some(path) = chosen.filter(|p| p.is_file()) {
+        return Some(GodotInstall::from_path(path.to_path_buf()));
+    }
+    pick(&discover(), wanted).cloned()
 }
 
 /// Picks the best install for a project saved with `wanted` (e.g. "4.5"):

@@ -14,6 +14,9 @@ pub struct Session {
     /// Share of the width the left side of the split view takes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_ratio: Option<f32>,
+    /// The Godot executable chosen for the project.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub godot: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,12 +120,13 @@ mod tests {
             ],
             active: Some(1),
             split_ratio: Some(0.25),
+            godot: Some("C:/Godot/Godot_v4.5.1-stable_win64.exe".into()),
         };
         let text = serde_json::to_string(&session).unwrap();
         assert!(!text.contains("\"folds\":[]"), "{text}");
         assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), session);
         let old: Session = serde_json::from_str(r#"{"tabs": [{"path": "C:/game/a.gd"}]}"#).unwrap();
-        assert_eq!((old.tabs[0].line, old.active, old.split_ratio), (0, None, None));
+        assert_eq!((old.tabs[0].line, old.active, old.split_ratio, old.godot), (0, None, None, None));
     }
 
     #[test]

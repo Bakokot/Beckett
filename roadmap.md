@@ -232,7 +232,10 @@ crates/
       `script_templates/<Base>/` and `Object/` ones with `# meta-name/default/space-indent` and
       `_BASE_` / `_CLASS_` / `_CLASS_SNAKE_CASE_` / `_TS_`); creates missing folders, opens the file —
       unit-tested, not yet seen on screen
-- [ ] Godot version picker (choose among installed versions per project)
+- [x] Godot version picker: click "Godot x.y" in the status bar (or "Godot: Choose Version..."): Automatic
+      or any installed Godot, each marked as matching / newer / older than the project; kept in the
+      project's session; used by the language server (restarted), Run, Open in Godot and new terminals —
+      not yet seen on screen
 
 **Debug**
 - [ ] DAP debugger: breakpoints, stepping, call stack, variables

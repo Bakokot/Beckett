@@ -164,6 +164,10 @@ pub enum Message {
     RunProject,
     /// Run the scene of the active tab (F6).
     RunScene,
+    /// Pick which installed Godot the project uses.
+    ChooseGodot,
+    /// Use this Godot for the project (`None`: the best match found).
+    GodotChosen(Option<PathBuf>),
     /// Pick which scene F6 runs for the current script.
     ChooseScene,
     /// Run this scene for this script, and remember the choice.
@@ -442,6 +446,9 @@ struct App {
     uid_cache: HashMap<String, Option<PathBuf>>,
     /// Scene F6 runs for a script used by several scenes, once picked.
     scene_choice: HashMap<PathBuf, String>,
+    /// The Godot executable chosen for this project (`None`: the best
+    /// installed match for its version). Kept in the session.
+    godot_choice: Option<PathBuf>,
     terminal: TerminalState,
     focus: Focus,
 }
@@ -624,6 +631,7 @@ impl App {
             link_probe: None,
             uid_cache: HashMap::new(),
             scene_choice: HashMap::new(),
+            godot_choice: None,
             terminal: TerminalState::default(),
             focus: Focus::Editor,
         };
@@ -696,6 +704,7 @@ impl App {
                 let connection = lsp::connect(
                     project.root.clone(),
                     godot.godot_version(),
+                    self.godot_choice.clone(),
                     self.lsp_generation,
                     self.lsp_wait_editor,
                 );
@@ -710,7 +719,7 @@ impl App {
             .filter(|_| self.panel == Some(Panel::Terminal) || self.terminal.session.is_some())
             .map(|project| {
                 let version = project.godot.as_ref().and_then(GodotProject::godot_version);
-                terminal_panel::spawn(self.terminal.generation, project.root.clone(), version)
+                terminal_panel::spawn(self.terminal.generation, project.root.clone(), version, self.godot_choice.clone())
                     .map(Message::Terminal)
             })
             .unwrap_or_else(Subscription::none);
@@ -1236,6 +1245,8 @@ impl App {
             Message::OpenInGodot => self.open_in_godot(),
             Message::RunScene => return self.run_scene(false),
             Message::ChooseScene => return self.run_scene(true),
+            Message::ChooseGodot => return self.choose_godot(),
+            Message::GodotChosen(path) => self.set_godot(path),
             Message::RunChosenScene(script, scene) => {
                 self.scene_choice.insert(script, scene.clone());
                 self.start_run(Some(scene));
@@ -1702,6 +1713,7 @@ impl App {
             ("Run: Project", "run.project", Message::RunProject),
             ("Run: Current Scene", "run.scene", Message::RunScene),
             ("Run: Choose Scene for This Script...", "", Message::ChooseScene),
+            ("Godot: Choose Version...", "", Message::ChooseGodot),
             ("Run: Stop", "run.stop", Message::StopRun),
             ("Godot: Open in Editor", "", Message::OpenInGodot),
             ("View: Toggle Terminal", "view.terminal", Message::ToggleTerminal),
@@ -1998,8 +2010,7 @@ impl App {
         }
         let version = godot.godot_version();
         let root = project.root.clone();
-        let installs = lsp_client::godot::discover();
-        let Some(install) = lsp_client::godot::pick(&installs, version.as_deref()).cloned() else {
+        let Some(install) = lsp_client::godot::resolve(self.godot_choice.as_deref(), version.as_deref()) else {
             self.status = Some("No Godot executable found (set GODOT_BIN)".to_string());
             return;
         };
@@ -2044,9 +2055,8 @@ impl App {
             return;
         };
         if self.run.godot.is_none() {
-            let installs = lsp_client::godot::discover();
             let wanted = godot.godot_version();
-            self.run.godot = lsp_client::godot::pick(&installs, wanted.as_deref())
+            self.run.godot = lsp_client::godot::resolve(self.godot_choice.as_deref(), wanted.as_deref())
                 .map(|install| lsp_client::godot::console_variant(&install.path));
         }
         let Some(exe) = self.run.godot.clone() else {
@@ -2971,6 +2981,78 @@ impl App {
         Task::perform(sleep(std::time::Duration::from_secs(seconds)), move |()| {
             Message::ReconnectLsp(generation)
         })
+    }
+
+    /// Lists the installed Godots in the palette to pick the project's.
+    fn choose_godot(&mut self) -> Task<Message> {
+        let Some(godot) = self.project.as_ref().and_then(|p| p.godot.as_ref()) else {
+            self.status = Some("Not a Godot project (no project.godot)".to_string());
+            return Task::none();
+        };
+        let wanted = godot.godot_version();
+        let mut installs = lsp_client::godot::discover();
+        // A chosen file outside the usual folders is listed too.
+        if let Some(chosen) = self.godot_choice.as_ref().filter(|p| p.is_file()) {
+            if !installs.iter().any(|i| uri::same_path(&i.path, chosen)) {
+                installs.push(lsp_client::godot::GodotInstall::from_path(chosen.clone()));
+            }
+        }
+        installs.sort_by(|a, b| b.version.cmp(&a.version));
+        let best = lsp_client::godot::pick(&installs, wanted.as_deref()).map(|i| i.path.clone());
+        let project = wanted.as_deref().unwrap_or("?");
+        let automatic = palette::Choice {
+            label: "Automatic".to_string(),
+            detail: match &best {
+                Some(path) => format!("newest install matching the project ({project}): {}", path.display()),
+                None => "no Godot found (set GODOT_BIN)".to_string(),
+            },
+            message: Message::GodotChosen(None),
+        };
+        let choices = std::iter::once(automatic)
+            .chain(installs.into_iter().map(|install| {
+                let fit = if lsp_client::godot::older_than(&install, wanted.as_deref()) {
+                    "older than the project: opening it there would convert it"
+                } else if lsp_client::godot::matches(&install, wanted.as_deref()) {
+                    "matches the project"
+                } else {
+                    "newer than the project"
+                };
+                let chosen = self.godot_choice.as_ref().is_some_and(|p| uri::same_path(p, &install.path));
+                palette::Choice {
+                    label: format!(
+                        "Godot {}{}",
+                        install.version_string().unwrap_or_else(|| "(unknown version)".to_string()),
+                        if chosen { "  (in use)" } else { "" }
+                    ),
+                    detail: format!("{fit} - {}", install.path.display()),
+                    message: Message::GodotChosen(Some(install.path)),
+                }
+            }))
+            .collect();
+        let mut palette = Palette::choose("Which Godot does this project use?", choices);
+        palette.refresh(&[]);
+        self.palette = Some(palette);
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        iced::widget::operation::focus(palette::INPUT)
+    }
+
+    /// Uses `path` (or the best match) for the language server, Run, Open
+    /// in Godot and new terminals.
+    fn set_godot(&mut self, path: Option<PathBuf>) {
+        if self.godot_choice == path {
+            return;
+        }
+        self.godot_choice = path;
+        self.run.godot = None;
+        self.save_session();
+        self.status = Some(match &self.godot_choice {
+            Some(path) => format!("Using {} (new terminals too)", path.display()),
+            None => "Using the newest Godot matching the project".to_string(),
+        });
+        // The connection is keyed by the choice: restart it with the new one.
+        self.lsp_retries = 0;
+        self.reset_lsp(Lsp::Starting);
     }
 
     /// Drops the current connection (stopping a spawned Godot) and lets the
@@ -3929,7 +4011,7 @@ impl App {
             })
             .collect();
         let split_ratio = Some(self.split_ratio).filter(|&r| r != 0.5);
-        session::Session { tabs, active: self.active, split_ratio }
+        session::Session { tabs, active: self.active, split_ratio, godot: self.godot_choice.clone() }
     }
 
     /// Saves the project's session if it changed since the last save.
@@ -3954,6 +4036,7 @@ impl App {
         };
         let saved = session::load(&project.root);
         self.split_ratio = saved.split_ratio.unwrap_or(0.5).clamp(0.0, 1.0);
+        self.godot_choice = saved.godot.clone();
         for state in &saved.tabs {
             if self.tabs.iter().any(|t| uri::same_path(&t.path, &state.path)) {
                 continue;
@@ -4612,7 +4695,15 @@ impl App {
         if let Some(project) = &self.project {
             left.push(text(self.project_name(project)).size(12).into());
             if let Some(version) = project.godot.as_ref().and_then(GodotProject::godot_version) {
-                left.push(text(format!("Godot {version}")).size(12).into());
+                let label = button(text(format!("Godot {version}")).size(12))
+                    .on_press(Message::ChooseGodot)
+                    .style(button::text)
+                    .padding([0, 4]);
+                let tip = match &self.godot_choice {
+                    Some(path) => format!("Saved with Godot {version}; using {}. Click to choose another", path.display()),
+                    None => format!("Saved with Godot {version}. Click to choose which installed Godot to use"),
+                };
+                left.push(style::tip(label, tip, tooltip::Position::Top, ui));
             }
             if project.godot.is_some() {
                 let (errors, warnings) = self.problems.counts();

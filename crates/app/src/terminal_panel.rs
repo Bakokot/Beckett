@@ -23,15 +23,24 @@ pub enum TerminalEvent {
 }
 
 /// Identifies one shell session; a new `generation` starts a fresh one.
-#[derive(Debug, Clone, Hash)]
+#[derive(Debug, Clone)]
 struct Session {
     generation: u64,
     cwd: PathBuf,
     wanted_version: Option<String>,
+    /// The Godot chosen for the project. Not part of the identity: choosing
+    /// another doesn't end the running shell; the next one uses it.
+    godot: Option<PathBuf>,
 }
 
-pub fn spawn(generation: u64, cwd: PathBuf, wanted_version: Option<String>) -> Subscription<TerminalEvent> {
-    let session = Session { generation, cwd, wanted_version };
+impl std::hash::Hash for Session {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.generation, &self.cwd, &self.wanted_version).hash(state);
+    }
+}
+
+pub fn spawn(generation: u64, cwd: PathBuf, wanted_version: Option<String>, godot: Option<PathBuf>) -> Subscription<TerminalEvent> {
+    let session = Session { generation, cwd, wanted_version, godot };
     Subscription::run_with(session, |session| {
         let session = session.clone();
         iced::stream::channel(64, async move |mut output| {
@@ -88,8 +97,7 @@ pub fn palette(theme: &theme::Theme) -> Palette {
 
 fn shell_options(session: &Session) -> Options {
     let mut env_vars = HashMap::new();
-    let installs = godot::discover();
-    if let Some(install) = godot::pick(&installs, session.wanted_version.as_deref()) {
+    if let Some(install) = godot::resolve(session.godot.as_deref(), session.wanted_version.as_deref()) {
         let exe = godot::console_variant(&install.path);
         env_vars.insert("GODOT".to_string(), exe.display().to_string());
         if let Some(dir) = write_shim(&exe) {
