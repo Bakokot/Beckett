@@ -33,6 +33,7 @@ mod shortcuts;
 mod split;
 mod splitter;
 mod style;
+mod terminal_links;
 mod terminal_panel;
 mod terminal_view;
 mod theme_editor;
@@ -230,6 +231,8 @@ pub enum Message {
     FileOp(FileOpMessage),
     /// Show a file or folder in the system file manager.
     Reveal(PathBuf),
+    /// Ctrl+click on a path or URL in the terminal.
+    TerminalLink(terminal_links::TermLink),
     /// Close every tab but this file (`None`: but the class reference).
     CloseOtherTabs(Option<usize>),
     /// Move this file (`None`: the class reference) to the other side.
@@ -1217,6 +1220,7 @@ impl App {
                 return iced::clipboard::write(text);
             }
             Message::FileDrag(path) => self.file_drag = path,
+            Message::TerminalLink(link) => self.open_terminal_link(link),
             Message::OpenNewScript(path) => return self.open_new_script(path),
             Message::NewScript(message) => self.on_new_script(message),
             Message::OpenFileOp(op) => return self.open_file_op(op),
@@ -3115,6 +3119,44 @@ impl App {
         }
     }
 
+    /// Opens a Ctrl+clicked terminal link: a URL in the browser; a file at
+    /// its line (relative paths from the project folder, where the shell
+    /// starts); a folder in the file manager.
+    fn open_terminal_link(&mut self, link: terminal_links::TermLink) {
+        let (path, line, column) = match link {
+            terminal_links::TermLink::Url(url) => {
+                if let Err(error) = open_external(Path::new(&url)) {
+                    self.status = Some(format!("Cannot open {url}: {error}"));
+                }
+                return;
+            }
+            terminal_links::TermLink::Path { path, line, column } => (path, line, column),
+        };
+        let Some(project) = &self.project else {
+            return;
+        };
+        let target = if path.starts_with("res://") {
+            project.godot.as_ref().and_then(|g| g.resolve(&path))
+        } else {
+            let given = PathBuf::from(&path);
+            Some(if given.is_absolute() { given } else { project.root.join(given) })
+        };
+        match target {
+            Some(target) if target.is_file() => {
+                self.dismiss_popups();
+                self.focus = Focus::Editor;
+                let line = line.map_or(0, |l| l.saturating_sub(1));
+                self.jump_to(target, line, column.map_or(0, |c| c.saturating_sub(1)));
+            }
+            Some(target) if target.is_dir() => {
+                if let Err(error) = reveal_in_file_manager(&target) {
+                    self.status = Some(format!("Cannot show {path}: {error}"));
+                }
+            }
+            _ => self.status = Some(format!("{path} not found (relative paths are read from the project folder)")),
+        }
+    }
+
     /// Opens the New Script bar for `path`'s folder (or the active file's,
     /// or the project root), with the file name selected.
     fn open_new_script(&mut self, path: Option<PathBuf>) -> Task<Message> {
@@ -4537,6 +4579,7 @@ impl App {
                     .passthrough(self.terminal_passthrough())
                     .focused(self.focus == Focus::Terminal)
                     .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
+                    .on_link(style::to_color(ui.accent), Message::TerminalLink)
                     .into(),
                 None => center(text("Starting shell...").size(12).color(muted)).into(),
             },

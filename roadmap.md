@@ -242,7 +242,9 @@ crates/
 
 **Terminal**
 - [ ] Multiple terminal tabs / splits
-- [ ] Clickable paths and URLs
+- [x] Clickable paths and URLs: Ctrl+click (Ctrl+hover underlines) `res://`, absolute and relative paths
+      with `:line:column` or `(line,column)`, and http(s) URLs; files open at the line, folders in the file
+      manager, URLs in the browser — detection unit-tested, not yet seen on screen
 
 **Theming**
 - [x] Shareable copy-paste theme codes (`GDTHEME1:` + compressed TOML, ~1 KB)

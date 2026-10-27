@@ -68,6 +68,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Double-click / Triple-click", "Select word / line"),
             ("Shift+Drag", "Select text while a program uses the mouse"),
             ("Mouse wheel", "Scroll back through the output"),
+            ("Ctrl+Click", "Open the path (at its :line) or URL under the mouse; holding Ctrl underlines it"),
         ],
     ),
     (

@@ -20,6 +20,7 @@ use terminal::{
 
 use crate::code_editor::{measure, CodeFont, Metrics};
 use crate::keymap::Chord;
+use crate::terminal_links::{self, TermLink};
 
 const PADDING: f32 = 6.0;
 
@@ -31,6 +32,9 @@ pub struct TerminalView<'a, Message> {
     on_focus: Message,
     font: CodeFont,
     passthrough: Vec<Chord>,
+    /// Ctrl+click on a link (path or URL) in the output.
+    on_link: Option<Box<dyn Fn(TermLink) -> Message + 'a>>,
+    link_color: Color,
 }
 
 impl<'a, Message: Clone> TerminalView<'a, Message> {
@@ -43,7 +47,16 @@ impl<'a, Message: Clone> TerminalView<'a, Message> {
             on_focus,
             font: CodeFont::default(),
             passthrough: Vec::new(),
+            on_link: None,
+            link_color: Color::from_rgb8(0x47, 0x8c, 0xbf),
         }
+    }
+
+    /// Links under Ctrl+click, underlined in `color` while Ctrl is held.
+    pub fn on_link(mut self, color: Color, on_link: impl Fn(TermLink) -> Message + 'a) -> Self {
+        self.link_color = color;
+        self.on_link = Some(Box::new(on_link));
+        self
     }
 
     /// Key presses left to the app instead of sent to the shell.
@@ -84,6 +97,10 @@ struct State {
     /// Cursor blink phase starts here (reset on focus and on typing).
     blink_from: Option<Instant>,
     now: Option<Instant>,
+    /// Where the mouse is over the terminal.
+    mouse: Option<Point>,
+    /// The link under the mouse while Ctrl is held: row and columns.
+    link: Option<(usize, std::ops::Range<usize>)>,
 }
 
 const BLINK_MILLIS: u128 = 500;
@@ -107,6 +124,41 @@ fn to_mouse_button(button: mouse::Button) -> Option<MouseButton> {
         mouse::Button::Middle => Some(MouseButton::Middle),
         mouse::Button::Right => Some(MouseButton::Right),
         _ => None,
+    }
+}
+
+impl<'a, Message> TerminalView<'a, Message> {
+    /// The link at `point` (row, columns, link), when links are wanted.
+    fn link_at(&self, bounds: Rectangle, metrics: Metrics, point: Point) -> Option<(usize, std::ops::Range<usize>, TermLink)> {
+        self.on_link.as_ref()?;
+        let (row, column) = cell_at(bounds, metrics, point);
+        let snapshot = self.terminal.snapshot(&self.palette);
+        let cells = snapshot.rows.get(row)?;
+        // One char per column; a wide char's second column ends a word.
+        let mut line = vec![' '; snapshot.columns];
+        for (index, cell) in cells {
+            if let Some(slot) = line.get_mut(*index) {
+                *slot = if cell.c == '\0' { ' ' } else { cell.c };
+            }
+            if cell.wide {
+                if let Some(slot) = line.get_mut(index + 1) {
+                    *slot = '\0';
+                }
+            }
+        }
+        let (span, link) = terminal_links::link_at(&line, column)?;
+        Some((row, span, link))
+    }
+
+    /// Recomputes the underlined link: the one under the mouse with Ctrl held.
+    fn update_link(&self, state: &mut State, bounds: Rectangle, metrics: Metrics) -> bool {
+        let link = match state.mouse {
+            Some(point) if state.modifiers.command() => self.link_at(bounds, metrics, point).map(|(row, span, _)| (row, span)),
+            _ => None,
+        };
+        let changed = link != state.link;
+        state.link = link;
+        changed
     }
 }
 
@@ -238,6 +290,9 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
+                if self.update_link(state, bounds, metrics) {
+                    shell.request_redraw();
+                }
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) if tracking => {
                 let (Some(point), Some(button)) = (cursor.position_over(bounds), to_mouse_button(*button)) else {
@@ -291,6 +346,14 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
                 let Some(point) = cursor.position_over(bounds) else {
                     return;
                 };
+                // Ctrl+click on a link opens it instead of selecting.
+                if state.modifiers.command() {
+                    if let (Some((_, _, link)), Some(on_link)) = (self.link_at(bounds, metrics, point), &self.on_link) {
+                        shell.publish(on_link(link));
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 if !self.focused {
                     shell.publish(self.on_focus.clone());
                 }
@@ -329,8 +392,21 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
                     mouse::ScrollDelta::Pixels { y, .. } => y / metrics.line_height,
                 };
                 self.terminal.scroll(lines.round() as i32);
+                self.update_link(state, bounds, metrics);
                 shell.request_redraw();
                 shell.capture_event();
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                state.mouse = cursor.position_over(bounds);
+                if self.update_link(state, bounds, metrics) {
+                    shell.request_redraw();
+                }
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                state.mouse = None;
+                if self.update_link(state, bounds, metrics) {
+                    shell.request_redraw();
+                }
             }
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, text, .. })
                 if self.focused =>
@@ -459,6 +535,12 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
                 flush(r, &mut run, run_start, run_style);
             }
 
+            // The link Ctrl+click would open.
+            if let Some((row, span)) = &state.link {
+                let rect = cell_rect(*row, span.start, span.len());
+                fill(r, Rectangle { y: rect.y + lh - 1.5, height: 1.0, ..rect }, self.link_color);
+            }
+
             // Cursor: a blinking block when focused, an outline otherwise.
             if let Some((row, column)) = snapshot.cursor {
                 let rect = cell_rect(row, column, 1);
@@ -486,14 +568,16 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         let tracking = self.terminal.input_modes().mouse != MouseTracking::Off;
-        if cursor.is_over(layout.bounds()) && tracking {
+        if cursor.is_over(layout.bounds()) && tree.state.downcast_ref::<State>().link.is_some() {
+            mouse::Interaction::Pointer
+        } else if cursor.is_over(layout.bounds()) && tracking {
             mouse::Interaction::Idle
         } else if cursor.is_over(layout.bounds()) {
             mouse::Interaction::Text
