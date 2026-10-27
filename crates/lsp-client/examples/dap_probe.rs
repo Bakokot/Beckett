@@ -75,7 +75,7 @@ fn main() {
     reader.get_ref().set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     let mut seq = 0;
 
-    send(&mut writer, &mut seq, "initialize", json!({ "clientID": "godot-ide", "adapterID": "godot", "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path" }));
+    send(&mut writer, &mut seq, "initialize", json!({ "clientID": "beckett", "adapterID": "godot", "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path" }));
     send(&mut writer, &mut seq, "launch", json!({ "project": root, "noDebug": false }));
     let mut stops = 0;
     while let Some(message) = read(&mut reader) {

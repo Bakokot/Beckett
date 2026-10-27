@@ -202,13 +202,28 @@ pub fn builtin() -> Vec<Theme> {
         .collect()
 }
 
-/// The IDE's config folder: `GODOT_IDE_CONFIG_DIR` when set (a portable
-/// install, or tests that must not touch the user's settings), else
-/// `godot-ide` in the platform config folder.
+/// The IDE's config folder: `BECKETT_CONFIG_DIR` (or the older
+/// `GODOT_IDE_CONFIG_DIR`) when set (a portable install, or tests that must
+/// not touch the user's settings), else `beckett` in the platform config
+/// folder.
 pub fn config_dir() -> Option<PathBuf> {
-    match std::env::var_os("GODOT_IDE_CONFIG_DIR") {
-        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
-        _ => Some(dirs::config_dir()?.join("godot-ide")),
+    for var in ["BECKETT_CONFIG_DIR", "GODOT_IDE_CONFIG_DIR"] {
+        if let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    let base = dirs::config_dir()?;
+    Some(migrated(&base.join("godot-ide"), &base.join("beckett")))
+}
+
+/// The folder to use after the rename from Godot IDE to Beckett: `new`,
+/// once the old folder (settings, themes, sessions…) has been moved there;
+/// the old one if it can't be moved.
+fn migrated(old: &Path, new: &Path) -> PathBuf {
+    if new.exists() || !old.is_dir() || std::fs::rename(old, new).is_ok() {
+        new.to_path_buf()
+    } else {
+        old.to_path_buf()
     }
 }
 
@@ -272,6 +287,21 @@ pub fn load_dir(dir: &Path) -> (Vec<(PathBuf, Theme)>, Vec<LoadError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_old_config_folder_moves_to_the_new_name() {
+        let base = std::env::temp_dir().join(format!("beckett-migrate-{}", std::process::id()));
+        let (old, new) = (base.join("godot-ide"), base.join("beckett"));
+        std::fs::create_dir_all(old.join("themes")).unwrap();
+        std::fs::write(old.join("settings.json"), "{}").unwrap();
+        assert_eq!(migrated(&old, &new), new);
+        assert!(new.join("settings.json").is_file() && new.join("themes").is_dir() && !old.exists());
+        // Once moved (or for a new user), nothing more happens.
+        assert_eq!(migrated(&old, &new), new);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(migrated(&old, &new), new);
+        assert!(!new.exists());
+    }
 
     #[test]
     fn font_section_is_optional_and_sanitized() {

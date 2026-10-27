@@ -720,7 +720,7 @@ impl App {
         if let Some(project) = &self.project {
             parts.push(self.project_name(project));
         }
-        parts.push("Godot IDE".to_string());
+        parts.push("Beckett".to_string());
         parts.join(" — ")
     }
 
@@ -1604,7 +1604,7 @@ impl App {
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_title("Import theme")
-                            .add_filter("Godot IDE theme", &["toml"])
+                            .add_filter("Beckett theme", &["toml"])
                             .pick_file()
                             .await
                             .map(|f| f.path().to_path_buf())
@@ -1618,7 +1618,7 @@ impl App {
                     async move {
                         rfd::AsyncFileDialog::new()
                             .set_title("Export theme")
-                            .add_filter("Godot IDE theme", &["toml"])
+                            .add_filter("Beckett theme", &["toml"])
                             .set_file_name(name)
                             .save_file()
                             .await
@@ -4695,7 +4695,8 @@ impl App {
         let ui = &self.current_theme().ui;
         let muted = style::to_color(ui.text_muted);
         let mut content = column![
-            text("Godot IDE").size(28),
+            text("Beckett").size(28),
+            text("An IDE for Godot").color(muted),
             text("Open a folder containing project.godot").color(muted),
             button(text("Open Folder…")).on_press(Message::OpenFolderDialog),
         ]

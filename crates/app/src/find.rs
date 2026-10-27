@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn replacements_cover_disk_files_and_open_buffers() {
-        let root = std::env::temp_dir().join(format!("godot-ide-replace-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("beckett-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".godot")).unwrap();
         std::fs::write(root.join("a.gd"), "var hp = 1\nhp += max_hp\n").unwrap();

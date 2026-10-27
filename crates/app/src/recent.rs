@@ -1,5 +1,5 @@
 //! Recently opened projects, most recent first, kept in
-//! `<config>/godot-ide/recent-projects.txt` (one folder per line).
+//! `<config>/beckett/recent-projects.txt` (one folder per line).
 
 use std::path::{Path, PathBuf};
 

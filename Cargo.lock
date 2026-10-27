@@ -335,6 +335,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "beckett"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "editor-core",
+ "godot-project",
+ "iced",
+ "lsp-client",
+ "notify",
+ "rfd",
+ "serde",
+ "serde_json",
+ "terminal",
+ "theme",
+ "trash",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1257,24 +1275,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c4ee00b289aba7a9e5306d57c2d05499b2e5dc427f84ac708bd2c090212cf3e"
 dependencies = [
  "gl_generator",
-]
-
-[[package]]
-name = "godot-ide"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "editor-core",
- "godot-project",
- "iced",
- "lsp-client",
- "notify",
- "rfd",
- "serde",
- "serde_json",
- "terminal",
- "theme",
- "trash",
 ]
 
 [[package]]

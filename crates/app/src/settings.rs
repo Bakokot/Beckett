@@ -1,5 +1,5 @@
 //! Personal settings that are not part of a theme, kept in
-//! `<config>/godot-ide/settings.json`.
+//! `<config>/beckett/settings.json`.
 
 use std::path::PathBuf;
 

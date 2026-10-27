@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn validates_the_path() {
-        let root = std::env::temp_dir().join(format!("godot-ide-new-script-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("beckett-new-script-{}", std::process::id()));
         std::fs::create_dir_all(root.join("player")).unwrap();
         std::fs::write(root.join("player/taken.gd"), "extends Node\n").unwrap();
         let godot = GodotProject { root: root.clone(), settings: Default::default() };

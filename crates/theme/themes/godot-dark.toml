@@ -1,6 +1,6 @@
 # Matches the default Godot 4 editor theme.
 name = "Godot Dark"
-author = "Godot IDE"
+author = "Beckett"
 kind = "dark"
 
 [ui]

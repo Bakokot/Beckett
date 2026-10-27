@@ -468,7 +468,7 @@ fn handshake(
                 "processId": std::process::id(),
                 "rootUri": path_to_uri(root),
                 "rootPath": root.to_string_lossy(),
-                "clientInfo": { "name": "Godot IDE", "version": env!("CARGO_PKG_VERSION") },
+                "clientInfo": { "name": "Beckett", "version": env!("CARGO_PKG_VERSION") },
                 "capabilities": { "textDocument": {
                     "synchronization": { "didSave": true },
                     "publishDiagnostics": {},

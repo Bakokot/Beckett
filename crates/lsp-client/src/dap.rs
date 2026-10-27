@@ -89,7 +89,7 @@ impl DapClient {
     pub fn initialize(&self) -> io::Result<i64> {
         self.request(
             "initialize",
-            json!({ "clientID": "godot-ide", "clientName": "Godot IDE", "adapterID": "godot",
+            json!({ "clientID": "beckett", "clientName": "Beckett", "adapterID": "godot",
                     "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path" }),
         )
     }

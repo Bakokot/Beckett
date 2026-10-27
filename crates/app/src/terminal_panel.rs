@@ -131,7 +131,7 @@ fn default_shell() -> Option<(String, Vec<String>)> {
 /// Writes a `godot` launcher into the IDE's data folder and returns that
 /// folder, so `godot` works in the terminal whatever the binary is called.
 fn write_shim(exe: &Path) -> Option<PathBuf> {
-    let dir = dirs::data_local_dir()?.join("godot-ide").join("bin");
+    let dir = dirs::data_local_dir()?.join("beckett").join("bin");
     std::fs::create_dir_all(&dir).ok()?;
     if cfg!(windows) {
         let script = format!("@echo off\r\n\"{}\" %*\r\n", exe.display());

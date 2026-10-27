@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(with_lines("*.log\n.godot/", GODOT_IGNORE).unwrap(), "*.log\n.godot/\n\n# Godot 4+ specific ignores\n/android/\n");
         assert_eq!(with_lines("# mine\n.godot/\n/android/\n", GODOT_IGNORE), None);
 
-        let root = std::env::temp_dir().join(format!("godot-ide-gitignore-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("beckett-gitignore-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".gitignore"), "export/\n").unwrap();
         assert_eq!(add_godot_ignores(&root).unwrap(), [".gitignore", ".gitattributes"]);

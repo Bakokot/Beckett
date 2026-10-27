@@ -1,4 +1,4 @@
-# Godot IDE — Roadmap
+# Beckett — Roadmap
 
 A lightweight, native IDE built specifically for Godot, with integrated GDScript LSP,
 easily shareable themes, an integrated terminal — and the long-term goal of replacing
@@ -165,7 +165,7 @@ crates/
 - [x] Theme export/import: .toml file dialogs, drag & drop a .toml on the window
 - [x] Custom font family, size, line height and ligatures (theme `[font]` section, theme editor row)
 - [x] UI zoom (Ctrl+= / Ctrl+- / Ctrl+0, saved in settings.json); selected theme remembered;
-      `GODOT_IDE_CONFIG_DIR` overrides the config folder (verified: Cascadia Code, `>=` ligature, 125%)
+      `BECKETT_CONFIG_DIR` (formerly `GODOT_IDE_CONFIG_DIR`) overrides the config folder (verified: Cascadia Code, `>=` ligature, 125%)
 
 **Workspace**
 - [x] Command palette (Ctrl+Shift+P, or `>` in the box): ~35 commands incl. editor actions and themes
