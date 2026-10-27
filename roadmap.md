@@ -275,7 +275,8 @@ crates/
       green, 3 lines of context, unsaved edits of open tabs included), click a line to jump there, "revert"
       puts the staged lines back in the tab as one undo step (left unsaved) — revert unit-tested on the
       end-of-file newline cases, panel not yet seen on screen
-- [ ] Godot-aware `.gitignore` generator
+- [x] Godot-aware `.gitignore` / `.gitattributes` ("Git: Add Godot .gitignore and .gitattributes"): the lines
+      Godot 4 writes (`.godot/`, `/android/`, `* text=auto eol=lf`), appended only where missing
 
 ## Phase 3 — Godot editor replacement
 

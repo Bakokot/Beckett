@@ -102,6 +102,8 @@ pub enum Message {
     GitRefreshed(PathBuf, Option<Box<git::Snapshot>>),
     /// The window came to the front (git may have changed meanwhile).
     WindowFocused,
+    /// Add Godot's `.gitignore` / `.gitattributes` lines to the project.
+    AddGodotIgnores,
     /// Read the git status again now.
     RefreshGit,
     /// Open the CHANGES panel (at this file only, when given).
@@ -962,6 +964,15 @@ impl App {
             Message::CloseFolder => self.close_folder(),
             Message::GitRefreshed(repo, snapshot) => self.on_git_refreshed(repo, snapshot),
             Message::WindowFocused | Message::RefreshGit => self.git_refresh.wanted = true,
+            Message::AddGodotIgnores => {
+                if let Some(project) = &self.project {
+                    self.status = Some(match git::add_godot_ignores(&project.root) {
+                        Ok(files) if files.is_empty() => "The project already has Godot's .gitignore and .gitattributes lines".to_string(),
+                        Ok(files) => format!("Added Godot's lines to {}", files.join(" and ")),
+                        Err(error) => error,
+                    });
+                }
+            }
             Message::ShowChanges(path) => {
                 self.changes_focus = path;
                 self.git_refresh.wanted = true;
@@ -1703,6 +1714,7 @@ impl App {
             ("View: Project (Autoloads, Input Map)", "", Message::ShowSidebar(SidebarView::Project)),
             ("File: New Script...", "", Message::OpenNewScript(None)),
             ("Git: Show Changes", "", Message::ShowChanges(None)),
+            ("Git: Add Godot .gitignore and .gitattributes", "", Message::AddGodotIgnores),
             ("Git: Show Changes in This File", "", Message::ShowChanges(self.active_tab().map(|t| t.path.clone()))),
             ("Go to Definition", "go.definition", Message::GotoDefinition),
             ("Find All References", "go.references", Message::FindReferences),

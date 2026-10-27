@@ -148,6 +148,50 @@ pub fn snapshot(repo: &Path, open: &[PathBuf]) -> Option<Snapshot> {
     Some(Snapshot { status, bases, files })
 }
 
+/// What Godot 4 writes into a new project's `.gitignore` and
+/// `.gitattributes`.
+const GODOT_IGNORE: &[&str] = &["# Godot 4+ specific ignores", ".godot/", "/android/"];
+const GODOT_ATTRIBUTES: &[&str] = &["# Normalize EOL for all files that Git considers text files.", "* text=auto eol=lf"];
+
+/// Adds Godot's `.gitignore` and `.gitattributes` lines to the project
+/// folder, keeping what is there and skipping lines already present.
+/// Returns the files changed.
+pub fn add_godot_ignores(root: &Path) -> Result<Vec<&'static str>, String> {
+    let mut changed = Vec::new();
+    for (name, lines) in [(".gitignore", GODOT_IGNORE), (".gitattributes", GODOT_ATTRIBUTES)] {
+        let path = root.join(name);
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let Some(text) = with_lines(&existing, lines) else {
+            continue;
+        };
+        std::fs::write(&path, text).map_err(|e| format!("Cannot write {name}: {e}"))?;
+        changed.push(name);
+    }
+    Ok(changed)
+}
+
+/// `existing` with the rule lines of `lines` it lacks appended (comments
+/// only come along with them); `None` when nothing is missing.
+fn with_lines(existing: &str, lines: &[&str]) -> Option<String> {
+    let present = |line: &str| existing.lines().any(|l| l.trim() == line);
+    let missing: Vec<&str> = lines.iter().copied().filter(|l| !l.starts_with('#') && !present(l)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let mut text = existing.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    for line in lines.iter().filter(|l| l.starts_with('#') || missing.contains(l)) {
+        text.push_str(line);
+        text.push('\n');
+    }
+    Some(text)
+}
+
 pub fn status(repo: &Path) -> Option<Status> {
     let out = git(repo, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
     Some(parse_status(repo, &out))
@@ -227,6 +271,21 @@ mod tests {
         let names: Vec<PathBuf> = s.changed().into_iter().map(|(p, _)| p).collect();
         assert_eq!(names.len(), 5);
         assert!(names.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn appends_only_missing_ignore_lines() {
+        assert_eq!(with_lines("", GODOT_IGNORE).unwrap(), "# Godot 4+ specific ignores\n.godot/\n/android/\n");
+        assert_eq!(with_lines("*.log\n.godot/", GODOT_IGNORE).unwrap(), "*.log\n.godot/\n\n# Godot 4+ specific ignores\n/android/\n");
+        assert_eq!(with_lines("# mine\n.godot/\n/android/\n", GODOT_IGNORE), None);
+
+        let root = std::env::temp_dir().join(format!("godot-ide-gitignore-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".gitignore"), "export/\n").unwrap();
+        assert_eq!(add_godot_ignores(&root).unwrap(), [".gitignore", ".gitattributes"]);
+        assert!(std::fs::read_to_string(root.join(".gitignore")).unwrap().starts_with("export/\n\n# Godot"));
+        assert!(add_godot_ignores(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
