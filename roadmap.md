@@ -261,7 +261,10 @@ crates/
 **Theming**
 - [x] Shareable copy-paste theme codes (`GDTHEME1:` + compressed TOML, ~1 KB)
 - [ ] Import VS Code themes and Godot editor theme settings
-- [ ] Light/dark variants, follow OS
+- [x] Follow the OS light/dark mode ("Theme: Follow the OS Light/Dark Mode"): switches between a dark and a
+      light theme (Godot Dark / Godot Light until another is picked: while following, picking a theme makes
+      it the one for its kind); read at start and on every OS change; not while the theme editor is open —
+      not yet seen on screen
 
 **Workspace**
 - [ ] Dockable / resizable panels

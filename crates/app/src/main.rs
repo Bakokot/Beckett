@@ -132,6 +132,10 @@ pub enum Message {
     FocusOtherSide,
     Save,
     ThemeSelected(String),
+    /// The OS is (or went) dark or light.
+    SystemTheme(iced::theme::Mode),
+    /// Turn following the OS light/dark mode on or off.
+    ToggleFollowOsTheme,
     /// An event of the language server connection of this generation.
     Lsp(u64, LspEvent),
     RestartLsp,
@@ -432,6 +436,8 @@ struct App {
     active: Option<usize>,
     themes: Vec<theme::Theme>,
     theme_index: usize,
+    /// Whether the OS is in dark or light mode, once known.
+    os_theme: Option<theme::ThemeKind>,
     iced_theme: iced::Theme,
     /// Dirty tab the user already tried to close once; a second close discards it.
     pending_close: Option<PathBuf>,
@@ -654,6 +660,7 @@ impl App {
             active: None,
             themes,
             theme_index,
+            os_theme: None,
             iced_theme,
             pending_close: None,
             status,
@@ -713,7 +720,7 @@ impl App {
         if let Some(path) = initial.or(last) {
             app.open_path(path);
         }
-        (app, autosave_later())
+        (app, Task::batch([autosave_later(), iced::system::theme().map(Message::SystemTheme)]))
     }
 
     fn title(&self) -> String {
@@ -755,6 +762,23 @@ impl App {
     }
 
     /// Re-applies the current theme after it changed.
+    /// Following the OS: shows the theme chosen for its mode (not while a
+    /// theme is being edited).
+    fn apply_os_theme(&mut self) {
+        let (true, Some(kind), None) = (self.settings.follow_os_theme, self.os_theme, &self.theme_editor) else {
+            return;
+        };
+        let chosen = match kind {
+            theme::ThemeKind::Dark => self.settings.dark_theme.as_deref(),
+            theme::ThemeKind::Light => self.settings.light_theme.as_deref(),
+        };
+        let index = theme_for_mode(&self.themes, kind, chosen);
+        if let Some(index) = index.filter(|&i| i != self.theme_index) {
+            self.theme_index = index;
+            self.apply_theme();
+        }
+    }
+
     fn apply_theme(&mut self) {
         self.iced_theme = style::iced_theme(self.current_theme());
         self.refresh_marks();
@@ -821,6 +845,7 @@ impl App {
         });
 
         let close = iced::window::close_requests().map(Message::CloseRequested);
+        let os_theme = iced::system::theme_changes().map(Message::SystemTheme);
 
         let debug = match &self.debug {
             Some(session) => debugger::connect(session.generation, session.port)
@@ -828,7 +853,7 @@ impl App {
             None => Subscription::none(),
         };
 
-        Subscription::batch([keys, lsp, terminal, run, files, dropped, close, debug])
+        Subscription::batch([keys, lsp, terminal, run, files, dropped, close, debug, os_theme])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -1177,8 +1202,34 @@ impl App {
                 }
             }
             Message::Save => self.save_active(),
+            Message::SystemTheme(mode) => {
+                self.os_theme = match mode {
+                    iced::theme::Mode::Dark => Some(theme::ThemeKind::Dark),
+                    iced::theme::Mode::Light => Some(theme::ThemeKind::Light),
+                    iced::theme::Mode::None => None,
+                };
+                self.apply_os_theme();
+            }
+            Message::ToggleFollowOsTheme => {
+                self.settings.follow_os_theme = !self.settings.follow_os_theme;
+                let _ = self.settings.save();
+                self.status = Some(if self.settings.follow_os_theme {
+                    "The theme now follows the OS light/dark mode (picking a theme sets the one for its mode)".to_string()
+                } else {
+                    "The theme no longer follows the OS".to_string()
+                });
+                self.apply_os_theme();
+            }
             Message::ThemeSelected(name) => {
                 if let Some(index) = self.themes.iter().position(|t| t.name == name) {
+                    // Following the OS: the picked theme becomes the one for its mode.
+                    if self.settings.follow_os_theme {
+                        match self.themes[index].kind {
+                            theme::ThemeKind::Dark => self.settings.dark_theme = Some(name.clone()),
+                            theme::ThemeKind::Light => self.settings.light_theme = Some(name.clone()),
+                        }
+                        let _ = self.settings.save();
+                    }
                     self.theme_index = index;
                     // While editing, picking a theme starts editing that one.
                     let builtin = self.theme_paths[index].is_none();
@@ -1602,6 +1653,8 @@ impl App {
                 self.theme_editor = None;
                 self.focus = Focus::Editor;
                 self.apply_theme();
+                // The OS may have changed mode while editing.
+                self.apply_os_theme();
             }
             ThemeMessage::Import => {
                 return Task::perform(
@@ -1891,6 +1944,11 @@ impl App {
             ("Help: Keyboard Shortcuts", "view.shortcuts", Message::OpenShortcuts),
             ("Help: Class Reference", "help.classReference", Message::OpenClassRef(None, None)),
             ("Theme: Edit Colors", "", Message::OpenThemeEditor),
+            (
+                if self.settings.follow_os_theme { "Theme: Stop Following the OS Light/Dark Mode" } else { "Theme: Follow the OS Light/Dark Mode" },
+                "",
+                Message::ToggleFollowOsTheme,
+            ),
             ("Theme: Import File...", "", Message::ThemeEditor(ThemeMessage::Import)),
             ("Theme: Export File...", "", Message::ThemeEditor(ThemeMessage::Export)),
             ("Theme: Copy Share Code", "", Message::ThemeEditor(ThemeMessage::CopyCode)),
@@ -5562,5 +5620,40 @@ mod terminal_tab_tests {
         // Ids are never reused.
         terminals.add();
         assert_eq!(ids(&terminals), [4]);
+    }
+}
+
+/// The theme to show with the OS in `kind` mode: the one chosen for it,
+/// else Godot Dark / Godot Light, else any theme of that kind.
+fn theme_for_mode(themes: &[theme::Theme], kind: theme::ThemeKind, chosen: Option<&str>) -> Option<usize> {
+    let default = match kind {
+        theme::ThemeKind::Dark => "Godot Dark",
+        theme::ThemeKind::Light => "Godot Light",
+    };
+    let named = |name: &str| themes.iter().position(|t| t.name == name);
+    chosen.and_then(named).or_else(|| named(default)).or_else(|| themes.iter().position(|t| t.kind == kind))
+}
+
+#[cfg(test)]
+mod os_theme_tests {
+    use super::theme_for_mode;
+    use theme::ThemeKind;
+
+    #[test]
+    fn the_chosen_theme_wins_then_the_builtin_of_that_mode() {
+        let mut themes = theme::builtin();
+        let mut mine = themes[0].clone();
+        mine.name = "Mine".to_string();
+        mine.kind = ThemeKind::Light;
+        themes.push(mine);
+        let name = |index: Option<usize>| index.map(|i| themes[i].name.clone());
+        assert_eq!(name(theme_for_mode(&themes, ThemeKind::Light, Some("Mine"))).as_deref(), Some("Mine"));
+        assert_eq!(name(theme_for_mode(&themes, ThemeKind::Light, None)).as_deref(), Some("Godot Light"));
+        // A chosen theme that was deleted: back to the built-in one.
+        assert_eq!(name(theme_for_mode(&themes, ThemeKind::Dark, Some("Gone"))).as_deref(), Some("Godot Dark"));
+        // Without the built-in: any theme of that kind.
+        themes.retain(|t| t.name != "Godot Light");
+        let found = theme_for_mode(&themes, ThemeKind::Light, None).map(|i| themes[i].name.as_str());
+        assert_eq!(found, Some("Mine"));
     }
 }

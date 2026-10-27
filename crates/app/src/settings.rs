@@ -22,11 +22,28 @@ pub struct Settings {
     /// Name of the theme in use, restored at startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Switch between `dark_theme` and `light_theme` as the OS goes dark or
+    /// light.
+    pub follow_os_theme: bool,
+    /// The themes used with the OS in dark and light mode (default: Godot
+    /// Dark / Godot Light).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dark_theme: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub light_theme: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { ui_scale: 1.0, format_on_save: false, sidebar: SidebarView::Files, theme: None }
+        Self {
+            ui_scale: 1.0,
+            format_on_save: false,
+            sidebar: SidebarView::Files,
+            theme: None,
+            follow_os_theme: false,
+            dark_theme: None,
+            light_theme: None,
+        }
     }
 }
 
