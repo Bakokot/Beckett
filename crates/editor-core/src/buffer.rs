@@ -343,6 +343,12 @@ impl Buffer {
         self.language
     }
 
+    /// Changes how the text is highlighted (the file was renamed).
+    pub fn set_language(&mut self, language: Language) {
+        self.language = language;
+        *self.line_states.borrow_mut() = vec![LexState::initial(language)];
+    }
+
     /// Bumped on every content change.
     pub fn version(&self) -> u64 {
         self.version

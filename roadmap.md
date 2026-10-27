@@ -65,7 +65,7 @@ crates/
 
 **Deferred from Phase 0 → Phase 1**
 - Tree-sitter — for folding/outline; the lexer stays as the fast highlighter
-- Explorer create / rename / delete / reveal in OS
+- ~~Explorer create / rename / delete / reveal in OS~~ — done in Phase 2 (Workspace)
 
 ## Phase 1 — MVP
 
@@ -251,6 +251,10 @@ crates/
 - [x] Remappable keybindings: click a shortcut on the F1 page and press the new keys (Backspace
       unbinds, "reset" restores); overrides in `keybindings.json`; menus and palette show the
       current keys; terminal passthrough follows the bindings
+- [x] Explorer: New Folder, Rename (Godot's `.uid` / `.import` companions follow, so `uid://` paths
+      keep working; open tabs follow; files still using the old `res://` path are listed in SEARCH) and
+      Delete (to the Recycle Bin with its companions, after a confirmation bar; its tabs close) —
+      unit-tested, not yet seen on screen
 - [x] Middle-click a tab to close it (the class reference tab too; unsaved tabs ask once, like ×)
 - [x] Keybinding presets: Default, VS Code and Godot (buttons on the F1 page, or the palette);
       changes are kept on top of the preset in `keybindings.json`, picking a preset resets them

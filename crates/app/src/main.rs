@@ -8,6 +8,7 @@ mod drag;
 mod docs;
 mod explorer;
 mod file_icons;
+mod file_ops;
 mod find;
 mod format;
 mod keymap;
@@ -62,6 +63,7 @@ use palette::{CommandEntry, Palette, PaletteMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
 use project_panel::ProjectInfo;
+use file_ops::{FileOp, FileOpBar, FileOpMessage};
 use new_script::{NewScript, NewScriptMessage};
 use rename::{Rename, RenameMessage};
 use class_ref::{ClassRef, ClassRefMessage};
@@ -201,6 +203,9 @@ pub enum Message {
     /// the active file's folder).
     OpenNewScript(Option<PathBuf>),
     NewScript(NewScriptMessage),
+    /// Open the bar for a new folder, rename or delete in the explorer.
+    OpenFileOp(FileOp),
+    FileOp(FileOpMessage),
     /// Show a file or folder in the system file manager.
     Reveal(PathBuf),
     /// Close every tab but this file (`None`: but the class reference).
@@ -371,6 +376,8 @@ struct App {
     file_drag: Option<PathBuf>,
     /// The New Script bar, and why its last submit failed.
     new_script: Option<(NewScript, Option<String>)>,
+    /// The new folder / rename / delete bar.
+    file_op: Option<FileOpBar>,
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
@@ -499,6 +506,7 @@ impl App {
             context_menu: None,
             file_drag: None,
             new_script: None,
+            file_op: None,
             run: RunState::default(),
             find: None,
             rename: None,
@@ -1050,6 +1058,8 @@ impl App {
             Message::FileDrag(path) => self.file_drag = path,
             Message::OpenNewScript(path) => return self.open_new_script(path),
             Message::NewScript(message) => self.on_new_script(message),
+            Message::OpenFileOp(op) => return self.open_file_op(op),
+            Message::FileOp(message) => return self.on_file_op(message),
             Message::Reveal(path) => {
                 if let Err(error) = reveal_in_file_manager(&path) {
                     self.status = Some(format!("Cannot show {}: {error}", path.display()));
@@ -2878,6 +2888,7 @@ impl App {
         let end = script.path.chars().count() - ".gd".len();
         let start = end - new_script::DEFAULT_NAME.len();
         self.new_script = Some((script, None));
+        self.file_op = None;
         self.focus = Focus::Input;
         Task::batch([
             iced::widget::operation::focus(new_script::PATH_INPUT),
@@ -2929,6 +2940,146 @@ impl App {
                 *error = None;
             }
         }
+    }
+
+    /// Opens the new folder / rename / delete bar, with the name selected.
+    fn open_file_op(&mut self, op: FileOp) -> Task<Message> {
+        let Some(project) = &self.project else {
+            return Task::none();
+        };
+        let target = match &op {
+            FileOp::NewFolder(path) | FileOp::Rename(path) | FileOp::Delete(path) => path,
+        };
+        let label = project
+            .godot
+            .as_ref()
+            .and_then(|g| g.to_res_path(target))
+            .unwrap_or_else(|| target.display().to_string());
+        let bar = FileOpBar::new(op, label);
+        let (start, end) = bar.initial_selection();
+        let typed = !matches!(bar.op, FileOp::Delete(_));
+        self.file_op = Some(bar);
+        self.new_script = None;
+        if !typed {
+            return Task::none();
+        }
+        self.focus = Focus::Input;
+        Task::batch([
+            iced::widget::operation::focus(file_ops::INPUT),
+            iced::widget::operation::select_range(file_ops::INPUT, start, end),
+        ])
+    }
+
+    fn on_file_op(&mut self, message: FileOpMessage) -> Task<Message> {
+        let Some(bar) = &mut self.file_op else {
+            return Task::none();
+        };
+        match message {
+            FileOpMessage::Input(name) => {
+                bar.name = name;
+                bar.error = None;
+            }
+            FileOpMessage::Close => {
+                self.file_op = None;
+                self.focus = Focus::Editor;
+            }
+            FileOpMessage::Submit => {
+                let op = bar.op.clone();
+                let result = match &op {
+                    FileOp::NewFolder(parent) => file_ops::validate_name(&bar.name).and_then(|n| file_ops::new_folder(parent, n)),
+                    FileOp::Rename(path) => file_ops::validate_name(&bar.name).and_then(|n| file_ops::rename(path, n)),
+                    FileOp::Delete(path) => file_ops::delete(path).map(|()| path.clone()),
+                };
+                let done = match result {
+                    Ok(done) => done,
+                    Err(error) => {
+                        bar.error = Some(error);
+                        return Task::none();
+                    }
+                };
+                self.file_op = None;
+                self.focus = Focus::Editor;
+                return match op {
+                    FileOp::NewFolder(parent) => {
+                        if let Some(project) = &mut self.project {
+                            project.explorer.refresh(&parent);
+                        }
+                        self.status = Some(format!("Created {}", done.display()));
+                        Task::none()
+                    }
+                    FileOp::Rename(from) => self.after_rename(&from, &done),
+                    FileOp::Delete(path) => self.after_delete(&path),
+                };
+            }
+        }
+        Task::none()
+    }
+
+    /// Open tabs follow a renamed file or folder; files still using its old
+    /// `res://` path are listed in the SEARCH tab.
+    fn after_rename(&mut self, from: &Path, to: &Path) -> Task<Message> {
+        let client = self.lsp.client().cloned();
+        for tab in &mut self.tabs {
+            let Some(path) = file_ops::moved(&tab.path, from, to) else {
+                continue;
+            };
+            if let (Language::GDScript, Some(client)) = (tab.language, &client) {
+                let _ = client.did_close(&tab.path);
+            }
+            let language = Language::from_path(&path);
+            if language != tab.language {
+                tab.language = language;
+                tab.buffer.set_language(language);
+            }
+            tab.path = path;
+            if let (Language::GDScript, Some(client)) = (tab.language, &client) {
+                let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
+            }
+        }
+        let Some(project) = &mut self.project else {
+            return Task::none();
+        };
+        if let Some(parent) = to.parent() {
+            project.explorer.refresh(parent);
+        }
+        let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.status = Some(format!("Renamed to {name}"));
+        let Some(godot) = &project.godot else {
+            return Task::none();
+        };
+        let Some(mut old) = godot.to_res_path(from) else {
+            return Task::none();
+        };
+        if to.is_dir() {
+            old.push('/');
+        }
+        let users = file_ops::files_mentioning(&godot.resource_files(), &old);
+        if users == 0 {
+            return Task::none();
+        }
+        let files = if users == 1 { "1 file still uses".to_string() } else { format!("{users} files still use") };
+        self.status = Some(format!("Renamed to {name}. {files} {old}: listed in SEARCH"));
+        self.update(Message::SearchProject(old))
+    }
+
+    /// Tabs of a deleted file (or of files in a deleted folder) close.
+    fn after_delete(&mut self, path: &Path) -> Task<Message> {
+        for index in (0..self.tabs.len()).rev() {
+            if file_ops::moved(&self.tabs[index].path, path, path).is_some() {
+                self.pending_close = Some(self.tabs[index].path.clone());
+                self.close_tab(index);
+            }
+        }
+        self.sync_groups();
+        let Some(project) = &mut self.project else {
+            return Task::none();
+        };
+        if let Some(parent) = path.parent() {
+            project.explorer.refresh(parent);
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.status = Some(format!("Moved {name} to the Recycle Bin"));
+        Task::none()
     }
 
     /// Inserts a file dragged from the explorer where it was dropped in the
@@ -3427,13 +3578,22 @@ impl App {
                     Entry::Separator,
                     Entry::item("New Script Here...", pick(Message::OpenNewScript(Some(path.clone())))),
                     Entry::Separator,
+                    Entry::item("Rename...", pick(Message::OpenFileOp(FileOp::Rename(path.clone())))),
+                    Entry::item("Delete", pick(Message::OpenFileOp(FileOp::Delete(path.clone())))),
+                    Entry::Separator,
                 ];
                 entries.extend(paths(path));
                 entries
             }
             ContextTarget::Folder(path) => {
-                let mut entries =
-                    vec![Entry::item("New Script...", pick(Message::OpenNewScript(Some(path.clone())))), Entry::Separator];
+                let mut entries = vec![
+                    Entry::item("New Script...", pick(Message::OpenNewScript(Some(path.clone())))),
+                    Entry::item("New Folder...", pick(Message::OpenFileOp(FileOp::NewFolder(path.clone())))),
+                    Entry::Separator,
+                    Entry::item("Rename...", pick(Message::OpenFileOp(FileOp::Rename(path.clone())))),
+                    Entry::item("Delete", pick(Message::OpenFileOp(FileOp::Delete(path.clone())))),
+                    Entry::Separator,
+                ];
                 entries.extend(paths(path));
                 entries
             }
@@ -3749,6 +3909,10 @@ impl App {
                 if let Some((script, error)) = &self.new_script {
                     let bar = script.view(&self.current_theme().ui, error.as_deref()).map(Message::NewScript);
                     main = main.push(on_escape::on_escape(bar, Message::NewScript(NewScriptMessage::Close)));
+                }
+                if let Some(bar) = &self.file_op {
+                    let bar = bar.view(&self.current_theme().ui).map(Message::FileOp);
+                    main = main.push(on_escape::on_escape(bar, Message::FileOp(FileOpMessage::Close)));
                 }
                 main = main.push(self.editor_area());
                 if let Some(panel) = self.panel {
