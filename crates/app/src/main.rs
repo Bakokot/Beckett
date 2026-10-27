@@ -4631,9 +4631,6 @@ impl App {
         });
 
         let mut header = Row::with_children(tabs).spacing(4).align_y(Alignment::Center);
-        if panel == Panel::Terminal {
-            header = header.push(self.terminal_tabs());
-        }
         header = header.push(space::horizontal());
         match panel {
             Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun, "Stop the game (F8)")),
@@ -4667,7 +4664,12 @@ impl App {
             },
         };
 
-        container(column![header.padding([4, 8]), body])
+        let mut content = column![header.padding([4, 8])];
+        // The shells' tabs, on their own row under the panel's tabs.
+        if panel == Panel::Terminal {
+            content = content.push(container(self.terminal_tabs()).padding(iced::Padding { top: 0.0, bottom: 4.0, left: 8.0, right: 8.0 }));
+        }
+        container(content.push(body))
             .width(Length::Fill)
             .height(self.panel_height())
             .style(style::surface(ui))
