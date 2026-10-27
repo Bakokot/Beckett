@@ -5,10 +5,12 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use editor_core::buffer::{display_width, TAB_WIDTH};
 use editor_core::gdscript::{Token, TokenKind};
 use editor_core::folding::LineMap;
+use editor_core::diff::{ChangeKind, LineChange};
 use editor_core::{Buffer, Command, Motion, Pos};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
@@ -136,6 +138,10 @@ pub struct Colors {
     pub find_match: Color,
     pub find_current: Color,
     pub indent_guide: Color,
+    /// Gutter markers of lines changed since the staged text.
+    pub git_added: Color,
+    pub git_modified: Color,
+    pub git_deleted: Color,
     pub syntax: theme::SyntaxColors,
 }
 
@@ -160,6 +166,9 @@ impl Colors {
             find_match: to_color(ui.warning).scale_alpha(0.22),
             find_current: to_color(ui.warning),
             indent_guide: text.scale_alpha(0.12),
+            git_added: to_color(ui.success),
+            git_modified: accent,
+            git_deleted: to_color(ui.danger),
             syntax: theme.syntax,
         }
     }
@@ -205,6 +214,8 @@ pub struct CodeEditor<'a, Message> {
     link: Option<(usize, usize)>,
     /// A file being dragged over the app, which can be dropped here.
     dropping: Option<&'a Path>,
+    /// Lines changed since the staged text, marked in the gutter.
+    git_changes: Rc<Vec<LineChange>>,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
@@ -229,7 +240,13 @@ impl<'a, Message> CodeEditor<'a, Message> {
             keymap: None,
             link: None,
             dropping: None,
+            git_changes: Rc::default(),
         }
+    }
+
+    pub fn git_changes(mut self, changes: Rc<Vec<LineChange>>) -> Self {
+        self.git_changes = changes;
+        self
     }
 
     pub fn dropping(mut self, path: Option<&'a Path>) -> Self {
@@ -1109,6 +1126,35 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     draw_text(r, ">".to_string(), Point::new(fold_x, y), colors.accent, metrics, g.bounds);
                 } else if mouse_in_gutter && buffer.fold_range_at(line).is_some() {
                     draw_text(r, "v".to_string(), Point::new(fold_x, y), colors.gutter, metrics, g.bounds);
+                }
+            }
+
+            // Git change markers, at the gutter's right edge: a bar beside
+            // added or modified lines, a wedge where lines were removed.
+            let bar_x = g.text_area.x - cw * 0.45;
+            for change in self.git_changes.iter() {
+                match change.kind {
+                    ChangeKind::Added | ChangeKind::Modified => {
+                        let color = if change.kind == ChangeKind::Added { colors.git_added } else { colors.git_modified };
+                        let lines = change.lines.start.max(first)..change.lines.end.min(last);
+                        for line in lines.filter(|&l| shown(l)) {
+                            let y = g.line_y(line, scroll);
+                            fill(r, Rectangle::new(Point::new(bar_x, y), Size::new(3.0, lh)), color);
+                        }
+                    }
+                    ChangeKind::Deleted => {
+                        // Between the line before and `lines.start` (past the
+                        // end: below the last line).
+                        let at = change.lines.start;
+                        let y = if at < buffer.len_lines() {
+                            g.line_y(at, scroll)
+                        } else {
+                            g.line_y(buffer.len_lines().saturating_sub(1), scroll) + lh
+                        };
+                        if (first..=last).contains(&at) && (at >= buffer.len_lines() || shown(at)) {
+                            fill(r, Rectangle::new(Point::new(bar_x - 2.0, y - 2.0), Size::new(7.0, 4.0)), colors.git_deleted);
+                        }
+                    }
                 }
             }
         });

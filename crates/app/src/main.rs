@@ -11,6 +11,7 @@ mod file_icons;
 mod file_ops;
 mod find;
 mod format;
+mod git;
 mod keymap;
 mod lsp;
 mod new_script;
@@ -36,10 +37,13 @@ mod terminal_view;
 mod theme_editor;
 mod watcher;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
+use editor_core::diff::{self, LineChange};
 use editor_core::{snippet, Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
 use iced::widget::{
@@ -92,6 +96,10 @@ pub enum Message {
     CloseFolder,
     /// Periodic session save, so a crash loses little.
     AutosaveSession,
+    /// Git status of this repository, and the staged text of open files.
+    GitRefreshed(PathBuf, Option<git::Status>, Vec<(PathBuf, Option<String>)>),
+    /// The window came to the front (git may have changed meanwhile).
+    WindowFocused,
     /// The window is closing: save the session, then close.
     CloseRequested(iced::window::Id),
     FolderPicked(Option<PathBuf>),
@@ -378,6 +386,7 @@ struct App {
     new_script: Option<(NewScript, Option<String>)>,
     /// The new folder / rename / delete bar.
     file_op: Option<FileOpBar>,
+    git_refresh: GitRefresh,
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
@@ -430,6 +439,9 @@ struct Project {
     godot: Option<GodotProject>,
     /// Autoloads and Input Map, read from `project.godot` with `godot`.
     info: ProjectInfo,
+    /// The git repository holding the project, if any.
+    repo: Option<PathBuf>,
+    git_status: git::Status,
     explorer: Explorer,
 }
 
@@ -446,6 +458,52 @@ struct Tab {
     disk_changed: bool,
     /// Side of the split it is on: 0 left, 1 right.
     group: usize,
+    /// Change markers against the file's staged text.
+    git: GitMarks,
+}
+
+/// Reading git status and staged texts runs in the background, one run at
+/// a time; asking again during a run starts another after it.
+#[derive(Default)]
+struct GitRefresh {
+    wanted: bool,
+    running: bool,
+}
+
+/// A tab's lines changed since the text staged in git, recomputed when the
+/// buffer or the staged text changes.
+#[derive(Default)]
+struct GitMarks {
+    /// The staged text; `None` outside a repository or for untracked files.
+    base: Option<String>,
+    /// Bumped when `base` changes.
+    base_id: u64,
+    /// (buffer version, base id) the changes were computed for.
+    cache: RefCell<Option<(u64, u64, Rc<Vec<LineChange>>)>>,
+}
+
+impl GitMarks {
+    fn set_base(&mut self, base: Option<String>) {
+        if self.base != base {
+            self.base = base;
+            self.base_id += 1;
+        }
+    }
+
+    fn changes(&self, buffer: &Buffer) -> Rc<Vec<LineChange>> {
+        let Some(base) = &self.base else {
+            return Rc::default();
+        };
+        let key = (buffer.version(), self.base_id);
+        if let Some((version, base_id, changes)) = &*self.cache.borrow() {
+            if (*version, *base_id) == key {
+                return Rc::clone(changes);
+            }
+        }
+        let changes = Rc::new(diff::line_changes(base, &buffer.text()));
+        *self.cache.borrow_mut() = Some((key.0, key.1, Rc::clone(&changes)));
+        changes
+    }
 }
 
 impl Tab {
@@ -507,6 +565,7 @@ impl App {
             file_drag: None,
             new_script: None,
             file_op: None,
+            git_refresh: GitRefresh::default(),
             run: RunState::default(),
             find: None,
             rename: None,
@@ -640,6 +699,7 @@ impl App {
         let dropped = iced::event::listen_with(|event, _status, _window| match event {
             iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FileDropped(path)),
             iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::WindowResized(size)),
+            iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocused),
             _ => None,
         });
 
@@ -657,7 +717,48 @@ impl App {
         }
         self.sync_groups();
         self.refresh_outline();
-        task
+        match self.start_git_refresh() {
+            Some(git) => Task::batch([task, git]),
+            None => task,
+        }
+    }
+
+    /// Reads the git status and the staged text of every open file in the
+    /// background, when asked for and none is running.
+    fn start_git_refresh(&mut self) -> Option<Task<Message>> {
+        let refresh = &mut self.git_refresh;
+        if !refresh.wanted || refresh.running {
+            return None;
+        }
+        refresh.wanted = false;
+        let repo = self.project.as_ref()?.repo.clone()?;
+        refresh.running = true;
+        let paths: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        let task = Task::perform(
+            {
+                let repo = repo.clone();
+                async move {
+                    let status = git::status(&repo);
+                    let bases = paths.into_iter().map(|p| (git::staged_text(&repo, &p), p)).map(|(b, p)| (p, b)).collect();
+                    (status, bases)
+                }
+            },
+            move |(status, bases)| Message::GitRefreshed(repo.clone(), status, bases),
+        );
+        Some(task)
+    }
+
+    fn on_git_refreshed(&mut self, repo: PathBuf, status: Option<git::Status>, bases: Vec<(PathBuf, Option<String>)>) {
+        self.git_refresh.running = false;
+        let Some(project) = self.project.as_mut().filter(|p| p.repo.as_ref() == Some(&repo)) else {
+            return;
+        };
+        project.git_status = status.unwrap_or_default();
+        for (path, base) in bases {
+            for tab in self.tabs.iter_mut().filter(|t| t.path == path) {
+                tab.git.set_base(base.clone());
+            }
+        }
     }
 
     /// Keeps the split consistent after any change: the active tab decides
@@ -820,7 +921,11 @@ impl App {
             Message::FolderPicked(Some(path)) => self.open_path(path),
             Message::FolderPicked(None) => {}
             Message::CloseFolder => self.close_folder(),
+            Message::GitRefreshed(repo, status, bases) => self.on_git_refreshed(repo, status, bases),
+            Message::WindowFocused => self.git_refresh.wanted = true,
             Message::AutosaveSession => {
+                // Also catches commits made in the terminal.
+                self.git_refresh.wanted = true;
                 self.save_session();
                 return autosave_later();
             }
@@ -1961,6 +2066,8 @@ impl App {
     }
 
     fn on_files_changed(&mut self, paths: &[PathBuf]) {
+        // Our own saves come back here too: the markers and statuses follow.
+        self.git_refresh.wanted = true;
         // Files appeared or vanished: refresh their folders in the explorer.
         if let Some(project) = &mut self.project {
             let dirs: std::collections::BTreeSet<&Path> = paths.iter().filter_map(|p| p.parent()).collect();
@@ -3356,6 +3463,8 @@ impl App {
         self.project = Some(Project {
             explorer: Explorer::new(root.clone()),
             info: ProjectInfo::read(godot.as_ref()),
+            repo: git::repo_root(&root),
+            git_status: git::Status::default(),
             root,
             godot,
         });
@@ -3367,6 +3476,7 @@ impl App {
         self.run = RunState::default();
         self.panel = None;
         self.restore_session();
+        self.git_refresh.wanted = true;
         if let Some(file) = file {
             self.open_file(file);
         }
@@ -3707,7 +3817,9 @@ impl App {
             marks: Vec::new(),
             disk_changed: false,
             group: self.focused_group,
+            git: GitMarks::default(),
         };
+        self.git_refresh.wanted = true;
         if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
             let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
         }
@@ -4073,7 +4185,14 @@ impl App {
                 let active = self.active_tab().map(|t| t.path.as_path());
                 // Right-click below or between the rows: the project root's menu.
                 let root = project.root.clone();
-                let files = scrollable(project.explorer.view(active)).height(Length::Fill);
+                let ui = &self.current_theme().ui;
+                let git = explorer::GitLook {
+                    status: &project.git_status,
+                    modified: style::to_color(ui.warning),
+                    added: style::to_color(ui.success),
+                    conflicted: style::to_color(ui.danger),
+                };
+                let files = scrollable(project.explorer.view(active, &git)).height(Length::Fill);
                 fallback_context_area(files, move |point| Message::ContextMenu(ContextTarget::Folder(root.clone()), point)).into()
             }
             SidebarView::Outline => {
@@ -4142,7 +4261,8 @@ impl App {
             .keymap(&self.keymap)
             .marks(&tab.marks)
             .focused(focused && self.focus == Focus::Editor)
-            .dropping(self.file_drag.as_deref());
+            .dropping(self.file_drag.as_deref())
+            .git_changes(tab.git.changes(&tab.buffer));
         let mut area = column![self.tab_bar(group)];
         if !focused {
             return area.push(editor).into();

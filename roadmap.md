@@ -24,7 +24,7 @@ the Godot editor.
 | File watching | `notify` |
 | Fuzzy finder | `nucleo` |
 | Themes / settings | `serde` + TOML |
-| Git | `gix` |
+| Git | the `git` command (status, staged text); own Myers line diff in `editor-core` |
 | `.tscn` / `.tres` | Custom parser/writer |
 
 ### Workspace layout
@@ -263,7 +263,10 @@ crates/
       launch; "File: Close Folder" goes back to the welcome screen
 
 **Git**
-- [ ] Explorer status + gutter change markers
+- [x] Gutter change markers against the staged text (added / modified bars, removed-lines wedge; theme
+      success / accent / danger), live while typing; explorer names colored (changed, new, conflict, and
+      folders holding changes). Refreshed after saves, file changes, window focus and every 30 s — through
+      the `git` command (no git or no repository: nothing shown); unit-tested on this repo, not yet seen on screen
 - [ ] Diff view
 - [ ] Godot-aware `.gitignore` generator
 

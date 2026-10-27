@@ -3,11 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use iced::widget::{button, row, svg, text, Column, Space};
-use iced::{Element, Length};
+use iced::{Color, Element, Length};
 
 use crate::context_menu::context_area;
 use crate::drag::drag_source;
 use crate::file_icons::Icon;
+use crate::git::{self, FileStatus};
 use crate::{ContextTarget, Message};
 
 pub struct Explorer {
@@ -61,12 +62,34 @@ impl Explorer {
         }
     }
 
-    pub fn view(&self, active: Option<&Path>) -> Element<'_, Message> {
+    pub fn view<'a>(&'a self, active: Option<&Path>, git: &GitLook<'_>) -> Element<'a, Message> {
         let mut rows = Vec::new();
         for child in self.root.children.iter().flatten() {
-            push_rows(child, 0, active, &mut rows);
+            push_rows(child, 0, active, git, &mut rows);
         }
         Column::with_children(rows).width(Length::Fill).into()
+    }
+}
+
+/// How names show their git status: changed files and the folders holding
+/// them, new files, conflicts.
+pub struct GitLook<'a> {
+    pub status: &'a git::Status,
+    pub modified: Color,
+    pub added: Color,
+    pub conflicted: Color,
+}
+
+impl GitLook<'_> {
+    fn color(&self, path: &Path, is_dir: bool) -> Option<Color> {
+        if is_dir {
+            return self.status.folder_changed(path).then(|| self.modified.scale_alpha(0.75));
+        }
+        self.status.file(path).map(|status| match status {
+            FileStatus::Modified => self.modified,
+            FileStatus::Added => self.added,
+            FileStatus::Conflicted => self.conflicted,
+        })
     }
 }
 
@@ -122,6 +145,7 @@ fn push_rows<'a>(
     node: &'a Node,
     depth: u16,
     active: Option<&Path>,
+    git: &GitLook<'_>,
     rows: &mut Vec<Element<'a, Message>>,
 ) {
     // Folders get an expand arrow; files leave its space empty so names line up.
@@ -144,12 +168,16 @@ fn push_rows<'a>(
             button::text
         };
 
+    let mut name = text(&node.name).size(13);
+    if let Some(color) = git.color(&node.path, node.is_dir) {
+        name = name.color(color);
+    }
     let row_button = button(
         row![
             Space::new().width(f32::from(depth) * 14.0),
             arrow,
             svg(icon).width(16).height(16),
-            text(&node.name).size(13),
+            name,
         ]
         .spacing(4)
         .align_y(iced::Alignment::Center),
@@ -170,7 +198,7 @@ fn push_rows<'a>(
 
     if node.expanded {
         for child in node.children.iter().flatten() {
-            push_rows(child, depth + 1, active, rows);
+            push_rows(child, depth + 1, active, git, rows);
         }
     }
 }
