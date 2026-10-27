@@ -4,6 +4,7 @@ mod class_ref;
 mod code_editor;
 mod completion;
 mod context_menu;
+mod drag;
 mod docs;
 mod explorer;
 mod file_icons;
@@ -192,6 +193,8 @@ pub enum Message {
     /// Open a file on the other side of the split view.
     OpenToSide(PathBuf),
     CopyText(String),
+    /// A file is being dragged from the explorer (`None`: the drag ended).
+    FileDrag(Option<PathBuf>),
     /// Show a file or folder in the system file manager.
     Reveal(PathBuf),
     /// Close every tab but this file (`None`: but the class reference).
@@ -358,6 +361,8 @@ struct App {
     window_width: f32,
     /// The open right-click menu.
     context_menu: Option<context_menu::Menu<Message>>,
+    /// File being dragged from the explorer, droppable into code.
+    file_drag: Option<PathBuf>,
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
@@ -484,6 +489,7 @@ impl App {
             window_height: WINDOW_SIZE.1,
             window_width: WINDOW_SIZE.0,
             context_menu: None,
+            file_drag: None,
             run: RunState::default(),
             find: None,
             rename: None,
@@ -1032,6 +1038,7 @@ impl App {
                 self.status = Some(format!("Copied {text}"));
                 return iced::clipboard::write(text);
             }
+            Message::FileDrag(path) => self.file_drag = path,
             Message::Reveal(path) => {
                 if let Err(error) = reveal_in_file_manager(&path) {
                     self.status = Some(format!("Cannot show {}: {error}", path.display()));
@@ -2095,6 +2102,7 @@ impl App {
                     self.goto_tab_stop(index);
                 }
             }
+            EditorEvent::DropFile { path, pos, ctrl } => self.drop_file(&path, pos, ctrl),
             EditorEvent::Hover(pos) => self.request_hover(pos),
             EditorEvent::HoverEnd => self.hover = None,
             EditorEvent::Focused => {
@@ -2840,6 +2848,23 @@ impl App {
                 })
                 .collect();
         }
+    }
+
+    /// Inserts a file dragged from the explorer where it was dropped in the
+    /// active tab: `preload("res://…")`, or the bare path in a string.
+    fn drop_file(&mut self, path: &Path, pos: Pos, ctrl: bool) {
+        self.file_drag = None;
+        let Some(res_path) = self.project.as_ref().and_then(|p| p.godot.as_ref()).and_then(|g| g.to_res_path(path)) else {
+            return;
+        };
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let text = paths::drop_text(&tab.buffer, tab.buffer.pos_to_char(pos), &res_path, ctrl);
+        self.dismiss_popups();
+        self.focus = Focus::Editor;
+        self.apply_command(Command::Click { pos, extend: false });
+        self.apply_command(Command::Insert(text));
     }
 
     fn goto_definition(&mut self) {
@@ -3851,7 +3876,8 @@ impl App {
             .font(code_editor::CodeFont::from_settings(&self.current_theme().font))
             .keymap(&self.keymap)
             .marks(&tab.marks)
-            .focused(focused && self.focus == Focus::Editor);
+            .focused(focused && self.focus == Focus::Editor)
+            .dropping(self.file_drag.as_deref());
         let mut area = column![self.tab_bar(group)];
         if !focused {
             return area.push(editor).into();

@@ -44,6 +44,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl (hold)", "Underline what Ctrl+Click can open under the mouse"),
             ("Right-click", "Menu of the file, tab or code under the mouse"),
             ("Middle-click a tab", "Close it"),
+            ("Drag a file into code", "Insert preload(\"res://…\") (Ctrl: a const holding it; in a string: the path)"),
             ("Click the gutter", "Fold or unfold the block (indentation or #region)"),
             ("Mouse rest", "Documentation of the word under the mouse"),
             ("Escape", "Back to a single cursor"),

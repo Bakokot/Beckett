@@ -4,6 +4,7 @@
 //! hover timing).
 
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 use editor_core::buffer::{display_width, TAB_WIDTH};
 use editor_core::gdscript::{Token, TokenKind};
@@ -60,6 +61,9 @@ pub enum EditorEvent {
     /// Tab / Shift+Tab while a snippet is being filled in.
     NextTabStop,
     PreviousTabStop,
+    /// A file dragged from the explorer was dropped at this position (with
+    /// Ctrl held or not).
+    DropFile { path: PathBuf, pos: Pos, ctrl: bool },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -199,6 +203,8 @@ pub struct CodeEditor<'a, Message> {
     tab_stops: bool,
     /// Char range underlined while Ctrl is held: a Ctrl+click target.
     link: Option<(usize, usize)>,
+    /// A file being dragged over the app, which can be dropped here.
+    dropping: Option<&'a Path>,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
@@ -222,7 +228,13 @@ impl<'a, Message> CodeEditor<'a, Message> {
             tab_stops: false,
             keymap: None,
             link: None,
+            dropping: None,
         }
+    }
+
+    pub fn dropping(mut self, path: Option<&'a Path>) -> Self {
+        self.dropping = path;
+        self
     }
 
     /// Key shortcuts the editor turns into `Shortcut` events (none: the
@@ -920,6 +932,9 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     let pos = self.pos_at(&geometry, state.scroll, *position);
                     self.emit(shell, EditorEvent::Command(Command::Drag(pos)));
                     shell.capture_event();
+                } else if self.dropping.is_some() {
+                    // The drop caret follows the mouse.
+                    shell.request_redraw();
                 } else {
                     self.update_hover(state, &geometry, shell, cursor.position_over(geometry.bounds));
                 }
@@ -947,6 +962,11 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if let (Some(path), Some(point)) = (self.dropping, cursor.position_over(geometry.text_area)) {
+                    let pos = self.pos_at(&geometry, state.scroll, point);
+                    let ctrl = state.modifiers.command();
+                    self.emit(shell, EditorEvent::DropFile { path: path.to_path_buf(), pos, ctrl });
+                }
                 state.dragging = false;
                 state.box_anchor = None;
                 state.box_dragged = false;
@@ -1045,7 +1065,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
         _theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_ref::<State>();
@@ -1230,6 +1250,13 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     fill(r, rect, colors.cursor);
                 }
             }
+
+            // Where a dragged file would be dropped.
+            if let (Some(_), Some(mouse)) = (self.dropping, cursor.position_over(g.text_area)) {
+                let point = self.screen_point(&g, scroll, self.pos_at(&g, scroll, mouse));
+                let rect = Rectangle::new(Point::new(point.x - 1.0, point.y), Size::new(2.0, lh));
+                fill(r, rect, colors.accent);
+            }
         });
 
         // Popups, on top of everything.
@@ -1301,6 +1328,9 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             return mouse::Interaction::None;
         };
         let geometry = Geometry::new(self.buffer, layout.bounds(), metrics);
+        if self.dropping.is_some() && cursor.is_over(geometry.text_area) {
+            return mouse::Interaction::Grabbing;
+        }
         if let Some(popup) = &self.completion {
             let layout = self.completion_layout(popup, &geometry, state.scroll, metrics);
             if cursor.is_over(layout.list) {

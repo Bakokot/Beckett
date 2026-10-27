@@ -82,6 +82,47 @@ pub fn path_completion_anchor(buffer: &Buffer, head: usize) -> Option<usize> {
     wanted.then_some(string.content_start)
 }
 
+/// What dropping the file at `res_path` at char `index` inserts: the bare
+/// path inside a string or outside GDScript, else `preload("…")`, and with
+/// Ctrl a constant holding it (as in the Godot editor).
+pub fn drop_text(buffer: &Buffer, index: usize, res_path: &str, ctrl: bool) -> String {
+    if buffer.language() != Language::GDScript || string_at(buffer, index).is_some() {
+        return res_path.to_string();
+    }
+    let preload = format!("preload(\"{res_path}\")");
+    if !ctrl {
+        return preload;
+    }
+    let file = res_path.rsplit('/').next().unwrap_or(res_path);
+    let stem = file.split('.').next().unwrap_or(file);
+    format!("const {} = {preload}", constant_case(stem))
+}
+
+/// `BigEnemy`, `big-enemy`, `big enemy` → `BIG_ENEMY`.
+fn constant_case(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        if !c.is_alphanumeric() {
+            previous = None;
+            continue;
+        }
+        let boundary = match previous {
+            None => !out.is_empty(),
+            Some(p) => c.is_uppercase() && (p.is_lowercase() || p.is_ascii_digit()),
+        };
+        if boundary {
+            out.push('_');
+        }
+        out.extend(c.to_uppercase());
+        previous = Some(c);
+    }
+    if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
 /// Ranks `res://` paths against what was typed in the string: fuzzy on the
 /// part after `res://`, best first, ties in path order.
 pub fn rank_paths(paths: &[String], typed: &str) -> Vec<usize> {
@@ -162,6 +203,25 @@ mod tests {
         assert!(path_completion_anchor(&b, i).is_some());
         let (b, i) = at("print(\"re|\")\n");
         assert_eq!(path_completion_anchor(&b, i), None);
+    }
+
+    #[test]
+    fn dropped_files_become_preloads() {
+        let (b, i) = at("var s = |\n");
+        assert_eq!(drop_text(&b, i, "res://enemies/BigEnemy.tscn", false), "preload(\"res://enemies/BigEnemy.tscn\")");
+        assert_eq!(
+            drop_text(&b, i, "res://enemies/BigEnemy.tscn", true),
+            "const BIG_ENEMY = preload(\"res://enemies/BigEnemy.tscn\")"
+        );
+        let (b, i) = at("var s = load(\"|\")\n");
+        assert_eq!(drop_text(&b, i, "res://a.png", true), "res://a.png");
+        let scene = Buffer::new("[node]\n", Language::Plain);
+        assert_eq!(drop_text(&scene, 0, "res://a.gd", false), "res://a.gd");
+
+        assert_eq!(constant_case("ui-theme"), "UI_THEME");
+        assert_eq!(constant_case("level2Boss"), "LEVEL2_BOSS");
+        assert_eq!(constant_case("3d model"), "_3D_MODEL");
+        assert_eq!(constant_case("player"), "PLAYER");
     }
 
     #[test]

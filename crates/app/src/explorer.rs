@@ -6,6 +6,7 @@ use iced::widget::{button, row, svg, text, Column, Space};
 use iced::{Element, Length};
 
 use crate::context_menu::context_area;
+use crate::drag::drag_source;
 use crate::file_icons::Icon;
 use crate::{ContextTarget, Message};
 
@@ -157,6 +158,12 @@ fn push_rows<'a>(
     .style(style)
     .width(Length::Fill)
     .padding([2, 8]);
+    // Files can be dragged into code.
+    let row_button: Element<'a, Message> = if node.is_dir {
+        row_button.into()
+    } else {
+        drag_source(row_button, Message::FileDrag(Some(node.path.clone())), Message::FileDrag(None)).into()
+    };
     // Right-click: the file or folder menu.
     let target = if node.is_dir { ContextTarget::Folder(node.path.clone()) } else { ContextTarget::File(node.path.clone()) };
     rows.push(context_area(row_button, move |point| Message::ContextMenu(target.clone(), point)).into());

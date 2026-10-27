@@ -224,7 +224,9 @@ crates/
       Action names complete in strings passed to `is_action_pressed(` / `get_axis(` / `get_vector(`…
       (project actions, then the built-in `ui_*` ones; events shown as docs). Parser checked on 3 real
       projects (quoted names with spaces, uids) — not yet seen on screen
-- [ ] Drag file into code → `preload("res://…")`
+- [x] Drag a file from the explorer into code: `preload("res://…")` at the drop caret, the bare path
+      inside a string or outside GDScript, Ctrl+drop gives `const BIG_ENEMY = preload(…)` (as in Godot);
+      either side of the split — unit-tested, not yet seen on screen
 - [ ] Script templates / "New Script" dialog
 - [ ] Godot version picker (choose among installed versions per project)
 
