@@ -3,6 +3,7 @@
 mod color;
 mod share;
 mod slots;
+pub mod godot_editor;
 pub mod vscode;
 
 pub use color::{Color, ParseColorError};

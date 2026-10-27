@@ -134,6 +134,8 @@ pub enum Message {
     ThemeSelected(String),
     /// List the VS Code themes installed here, to import one.
     ChooseVsCodeTheme,
+    /// List the Godot editor settings found here, to import their colors.
+    ChooseGodotEditorTheme,
     /// Import this VS Code theme file.
     ImportThemeFile(PathBuf),
     /// The OS is (or went) dark or light.
@@ -1207,6 +1209,7 @@ impl App {
             }
             Message::Save => self.save_active(),
             Message::ChooseVsCodeTheme => return self.choose_vscode_theme(),
+            Message::ChooseGodotEditorTheme => return self.choose_godot_editor_theme(),
             Message::ImportThemeFile(path) => self.import_theme_file(&path),
             Message::SystemTheme(mode) => {
                 self.os_theme = match mode {
@@ -1789,10 +1792,39 @@ impl App {
         iced::widget::operation::focus(palette::INPUT)
     }
 
+    /// Lists the Godot editor settings files (one per Godot version) to
+    /// import their text editor colors.
+    fn choose_godot_editor_theme(&mut self) -> Task<Message> {
+        let files = theme::godot_editor::settings_files();
+        if files.is_empty() {
+            self.status = Some("No Godot editor settings found (editor_settings-4.x.tres in Godot's config folder)".to_string());
+            return Task::none();
+        }
+        let choices = files
+            .into_iter()
+            .map(|path| palette::Choice {
+                label: match theme::godot_editor::version_of(&path) {
+                    Some((major, minor)) => format!("Godot {major}.{minor} editor colors"),
+                    None => "Godot editor colors".to_string(),
+                },
+                detail: path.display().to_string(),
+                message: Message::ImportThemeFile(path),
+            })
+            .collect();
+        let mut palette = Palette::choose("Import the colors of which Godot editor?", choices);
+        palette.refresh(&[]);
+        self.palette = Some(palette);
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        iced::widget::operation::focus(palette::INPUT)
+    }
+
     fn import_theme_file(&mut self, path: &Path) {
         let vscode = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("jsonc"));
         let result = if vscode {
             theme::vscode::import(path)
+        } else if theme::godot_editor::version_of(path).is_some() {
+            theme::godot_editor::import(path)
         } else {
             std::fs::read_to_string(path)
                 .map_err(|e| e.to_string())
@@ -1987,6 +2019,7 @@ impl App {
             ),
             ("Theme: Import File...", "", Message::ThemeEditor(ThemeMessage::Import)),
             ("Theme: Import from VS Code...", "", Message::ChooseVsCodeTheme),
+            ("Theme: Import from the Godot Editor...", "", Message::ChooseGodotEditorTheme),
             ("Theme: Export File...", "", Message::ThemeEditor(ThemeMessage::Export)),
             ("Theme: Copy Share Code", "", Message::ThemeEditor(ThemeMessage::CopyCode)),
             ("Theme: Paste Share Code", "", Message::ThemeEditor(ThemeMessage::PasteCode)),

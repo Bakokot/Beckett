@@ -264,7 +264,9 @@ crates/
       (built-in and extensions, by their labels), or Theme: Import File... takes a `.json`; UI, terminal and
       TextMate syntax colors mapped (most specific scope wins, `include`s merged, JSONC accepted), the rest
       from Godot Dark / Light — all 9 themes installed here convert, not yet seen on screen
-- [ ] Import Godot editor theme settings (text editor colors)
+- [x] Import the Godot editor's colors ("Theme: Import from the Godot Editor..."): text editor highlighting
+      and interface base / accent colors of `editor_settings-4.x.tres` (one per Godot version, read only) —
+      the 4 versions installed here convert, not yet seen on screen
 - [x] Follow the OS light/dark mode ("Theme: Follow the OS Light/Dark Mode"): switches between a dark and a
       light theme (Godot Dark / Godot Light until another is picked: while following, picking a theme makes
       it the one for its kind); read at start and on every OS change; not while the theme editor is open —
