@@ -4134,6 +4134,7 @@ impl App {
                     &self.current_theme().ui,
                 ),
             ];
+            let tab = container(tab).padding(1).style(style::tab_outline(&self.current_theme().ui, shown == Some(index)));
             // Middle click closes, as in browsers.
             let tab = mouse_area(tab).on_middle_release(Message::CloseTab(index));
             context_area(tab, move |point| Message::ContextMenu(ContextTarget::Tab(index), point)).into()
@@ -4161,11 +4162,14 @@ impl App {
                     &self.current_theme().ui,
                 ),
             ];
+            let tab = container(tab).padding(1).style(style::tab_outline(&self.current_theme().ui, class_ref_shown));
             let tab = mouse_area(tab).on_middle_release(Message::ClassRef(ClassRefMessage::Close));
             tabs.push(context_area(tab, |point| Message::ContextMenu(ContextTarget::ClassRef, point)).into());
         }
 
-        container(Row::with_children(tabs).spacing(2))
+        // Room around the tabs so their outlines aren't cut by the bar's edges.
+        container(Row::with_children(tabs).spacing(4))
+            .padding([3, 4])
             .width(Length::Fill)
             .style(style::surface(&self.current_theme().ui))
             .into()

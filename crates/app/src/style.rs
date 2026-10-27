@@ -43,6 +43,16 @@ pub fn tip<'a, Message: 'a>(
     tooltip(content, label, position).gap(4).delay(TOOLTIP_DELAY).into()
 }
 
+/// The outline around one editor tab: the border color, or the accent for
+/// the tab shown.
+pub fn tab_outline(ui: &theme::UiColors, selected: bool) -> impl Fn(&iced::Theme) -> container::Style {
+    let color = to_color(if selected { ui.accent } else { ui.border });
+    move |_| container::Style {
+        border: Border { color, width: 1.0, radius: 4.0.into() },
+        ..container::Style::default()
+    }
+}
+
 /// A panel filled with the theme's surface color (sidebar, bars).
 pub fn surface(ui: &theme::UiColors) -> impl Fn(&iced::Theme) -> container::Style {
     let background = to_color(ui.surface);
