@@ -20,11 +20,13 @@ Shortcuts: `Ctrl+O` open folder, `Ctrl+S` save, `Ctrl+W` close tab, `F12` go to 
 `Shift+F12` find references, `F2` rename symbol,
 `Ctrl+Space` completion, `Ctrl+J` (or `Ctrl+²`) toggle terminal, `F5` run project,
 `F6` run current scene, `F8` stop, `Ctrl+F` find, `Ctrl+H` replace, `Ctrl+Shift+F` search in project,
-`Ctrl+P` go to file, `Ctrl+Shift+P` command palette, `Ctrl+G` go to line.
+`Ctrl+P` go to file, `Ctrl+Shift+P` command palette, `Ctrl+G` go to line,
+`Ctrl+Shift+O` go to symbol in file, `Ctrl+T` go to symbol in project, `Shift+F1` class reference
+(`F12` on an engine class or method opens its page there).
 Press `F1` (or click `?` in the status bar) for the full list inside the IDE. Click a
 command's shortcut there and press new keys to change it; changes are saved to
 `keybindings.json` in the config folder (only the bindings that differ from the preset).
-The page also switches between the Default, VS Code and Godot presets (Godot: `Ctrl+L` go to
+The page also switches between the Default, VS Code and Godot presets (Godot: `F1` class reference, `Ctrl+L` go to
 line, `Ctrl+R` replace, `Shift+Alt+O` quick open, `Shift+Alt+Up/Down` add cursors, `Ctrl+Shift+D`
 duplicate line); picking one resets your changes.
 

@@ -280,16 +280,7 @@ pub fn workspace_edit(result: &Value) -> Vec<(PathBuf, Vec<TextEdit>)> {
 /// `DocumentSymbol[]`, or flat `SymbolInformation[]` (no nesting).
 pub fn document_symbols(result: &Value) -> Vec<Symbol> {
     fn symbol(v: &Value) -> Option<Symbol> {
-        let kind = match v.get("kind").and_then(Value::as_f64).map(|k| k as u64) {
-            Some(5 | 11 | 23) => SymbolKind::Class,
-            Some(6 | 9 | 12) => SymbolKind::Function,
-            Some(7 | 8 | 13) => SymbolKind::Variable,
-            Some(14) => SymbolKind::Constant,
-            Some(10) => SymbolKind::Enum,
-            Some(22) => SymbolKind::EnumMember,
-            Some(24) => SymbolKind::Signal,
-            _ => SymbolKind::Other,
-        };
+        let kind = symbol_kind(v);
         // SymbolInformation keeps its range in `location`.
         let whole = v.get("range").or_else(|| v.get("location")?.get("range")).and_then(range)?;
         let selection = v.get("selectionRange").and_then(range).unwrap_or(whole);
@@ -307,6 +298,72 @@ pub fn document_symbols(result: &Value) -> Vec<Symbol> {
         })
     }
     result.as_array().map(|items| items.iter().filter_map(symbol).collect()).unwrap_or_default()
+}
+
+fn symbol_kind(v: &Value) -> SymbolKind {
+    match v.get("kind").and_then(Value::as_f64).map(|k| k as u64) {
+        Some(5 | 11 | 23) => SymbolKind::Class,
+        Some(6 | 9 | 12) => SymbolKind::Function,
+        Some(7 | 8 | 13) => SymbolKind::Variable,
+        Some(14) => SymbolKind::Constant,
+        Some(10) => SymbolKind::Enum,
+        Some(22) => SymbolKind::EnumMember,
+        Some(24) => SymbolKind::Signal,
+        _ => SymbolKind::Other,
+    }
+}
+
+/// An engine class or one of its members, with its documentation (Godot's
+/// BBCode), from `textDocument/nativeSymbol`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NativeSymbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    /// E.g. `func Node2D.look_at(point: Vector2) -> void`.
+    pub detail: String,
+    pub documentation: String,
+    pub deprecated: bool,
+    /// A class's members (a method's children, its parameters, are dropped).
+    pub children: Vec<NativeSymbol>,
+}
+
+/// Decodes a `textDocument/nativeSymbol` answer.
+pub fn native_symbol(v: &Value) -> Option<NativeSymbol> {
+    let text = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let kind = symbol_kind(v);
+    let children = match kind {
+        SymbolKind::Class => v.get("children").and_then(Value::as_array).map(|c| c.iter().filter_map(native_symbol).collect()),
+        _ => None,
+    };
+    Some(NativeSymbol {
+        name: v.get("name")?.as_str()?.to_string(),
+        kind,
+        detail: text("detail"),
+        documentation: text("documentation"),
+        deprecated: v.get("deprecated").and_then(Value::as_bool).unwrap_or(false),
+        children: children.unwrap_or_default(),
+    })
+}
+
+/// An engine class from Godot's `gdscript/capabilities` notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeClass {
+    pub name: String,
+    /// Empty for classes without a parent (`Object`, built-in types).
+    pub inherits: String,
+}
+
+/// Decodes the class list of a `gdscript/capabilities` notification.
+pub fn native_classes(params: &Value) -> Vec<NativeClass> {
+    let classes = params.get("native_classes").and_then(Value::as_array).into_iter().flatten();
+    classes
+        .filter_map(|c| {
+            Some(NativeClass {
+                name: c.get("name")?.as_str()?.to_string(),
+                inherits: c.get("inherits").and_then(Value::as_str).unwrap_or_default().to_string(),
+            })
+        })
+        .collect()
 }
 
 pub fn range(v: &Value) -> Option<Range> {
@@ -450,5 +507,38 @@ mod tests {
 
         let vararg = json!({"activeParameter": 1, "signatures": [{"label": "func print(...) -> void", "parameters": []}]});
         assert_eq!(signature_help(&vararg).unwrap().active_parameter, None);
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Shapes captured from Godot 4.7.1.
+    #[test]
+    fn decodes_native_symbols_and_classes() {
+        let zero = json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}});
+        let answer = json!({
+            "name": "Node2D", "kind": 5, "detail": "<Native> class Node2D extends CanvasItem",
+            "documentation": "A 2D game object.", "deprecated": false, "native_class": "Node2D",
+            "range": zero, "selectionRange": zero,
+            "children": [
+                {"name": "look_at", "kind": 6, "detail": "func Node2D.look_at(point: Vector2) -> void",
+                 "documentation": "Rotates the node.", "deprecated": false, "native_class": "Node2D",
+                 "range": zero, "selectionRange": zero,
+                 "children": [{"name": "point", "kind": 13, "detail": "Vector2", "documentation": ""}]}
+            ]
+        });
+        let class = native_symbol(&answer).unwrap();
+        assert_eq!((class.name.as_str(), class.kind), ("Node2D", SymbolKind::Class));
+        assert_eq!(class.children.len(), 1);
+        assert_eq!(class.children[0].kind, SymbolKind::Function);
+        assert!(class.children[0].children.is_empty());
+
+        let caps = json!({"native_classes": [{"inherits": "RefCounted", "name": "AESContext"}, {"name": "Vector2"}]});
+        let classes = native_classes(&caps);
+        assert_eq!(classes[0], NativeClass { name: "AESContext".into(), inherits: "RefCounted".into() });
+        assert_eq!(classes[1].inherits, "");
     }
 }

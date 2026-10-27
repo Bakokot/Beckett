@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{button, row, text, Column, Space};
+use iced::widget::{button, row, svg, text, Column, Space};
 use iced::{Element, Length};
 
 use crate::context_menu::context_area;
+use crate::file_icons::Icon;
 use crate::{ContextTarget, Message};
 
 pub struct Explorer {
@@ -122,12 +123,14 @@ fn push_rows<'a>(
     active: Option<&Path>,
     rows: &mut Vec<Element<'a, Message>>,
 ) {
-    // ASCII until we bundle an icon font: the default font has no arrow glyphs.
-    let icon = match (node.is_dir, node.expanded) {
-        (true, true) => "v",
-        (true, false) => ">",
-        (false, _) => " ",
+    // Folders get an expand arrow; files leave its space empty so names line up.
+    let arrow: Element<'a, Message> = if node.is_dir {
+        let arrow = if node.expanded { Icon::ArrowDown } else { Icon::ArrowRight };
+        svg(arrow.handle()).width(12).height(12).into()
+    } else {
+        Space::new().width(12).into()
     };
+    let icon = if node.is_dir { Icon::for_folder(node.expanded) } else { Icon::for_file(&node.path) }.handle();
     let message = if node.is_dir {
         Message::ToggleDir(node.path.clone())
     } else {
@@ -143,10 +146,12 @@ fn push_rows<'a>(
     let row_button = button(
         row![
             Space::new().width(f32::from(depth) * 14.0),
-            text(icon).size(12).width(12),
+            arrow,
+            svg(icon).width(16).height(16),
             text(&node.name).size(13),
         ]
-        .spacing(4),
+        .spacing(4)
+        .align_y(iced::Alignment::Center),
     )
     .on_press(message)
     .style(style)

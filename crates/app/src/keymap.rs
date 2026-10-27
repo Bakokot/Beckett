@@ -163,6 +163,7 @@ pub const COMMANDS: &[CommandDef] = &[
     def("palette.commands", "Command Palette", &["Ctrl+Shift+P"]),
     def("go.line", "Go to Line", &["Ctrl+G"]),
     def("go.symbol", "Go to Symbol in File", &["Ctrl+Shift+O"]),
+    def("go.projectSymbol", "Go to Symbol in Project", &["Ctrl+T"]),
     def("go.definition", "Go to Definition", &["F12"]),
     def("go.references", "Find All References", &["Shift+F12"]),
     def("refactor.rename", "Rename Symbol", &["F2"]),
@@ -177,6 +178,7 @@ pub const COMMANDS: &[CommandDef] = &[
     def("view.terminal", "Toggle Terminal", &["Ctrl+J", "Ctrl+`", "Ctrl+²"]),
     def("view.split", "Split Editor (Move Tab to the Other Side)", &["Ctrl+\\"]),
     def("view.shortcuts", "Keyboard Shortcuts", &["F1"]),
+    def("help.classReference", "Class Reference", &["Shift+F1"]),
     def("view.zoomIn", "Zoom In", &["Ctrl+=", "Ctrl++"]),
     def("view.zoomOut", "Zoom Out", &["Ctrl+-"]),
     def("view.zoomReset", "Reset Zoom", &["Ctrl+0"]),
@@ -245,6 +247,9 @@ impl Preset {
                 ("run.stop", &["Shift+F5"]),
             ],
             Preset::Godot => &[
+                // F1 is Search Help in Godot; the shortcuts page stays on "?".
+                ("help.classReference", &["F1", "Shift+F1"]),
+                ("view.shortcuts", &[]),
                 ("file.quickOpen", &["Shift+Alt+O"]),
                 ("go.line", &["Ctrl+L"]),
                 ("find.replace", &["Ctrl+R"]),

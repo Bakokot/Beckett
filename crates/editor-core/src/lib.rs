@@ -7,6 +7,7 @@ pub mod gdscript;
 pub mod highlight;
 pub mod search;
 pub mod snippet;
+pub mod symbols;
 
 pub use buffer::{Buffer, Command, Motion, Pos, Selection};
 

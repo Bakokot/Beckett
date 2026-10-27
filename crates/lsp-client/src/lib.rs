@@ -12,8 +12,8 @@ mod types;
 pub mod uri;
 
 pub use types::{
-    completion_item, completion_items, document_symbols, hover_text, locations, range, signature_help,
-    workspace_edit, Symbol, SymbolKind,
+    completion_item, completion_items, document_symbols, hover_text, locations, native_classes, native_symbol, range,
+    signature_help, workspace_edit, NativeClass, NativeSymbol, Symbol, SymbolKind,
     CompletionItem, CompletionKind, Diagnostic, Location, Position, Range, Severity, SignatureHelp,
     TextEdit,
 };
@@ -84,6 +84,8 @@ pub enum Event {
         method: String,
         params: Value,
     },
+    /// The engine classes (sent once, after the handshake).
+    NativeClasses(Vec<NativeClass>),
     Disconnected(Option<String>),
 }
 
@@ -222,6 +224,12 @@ impl Client {
         )
     }
 
+    /// An engine class (`symbol` = `class`) or one of its members, with its
+    /// documentation. Decode the answer with [`native_symbol`].
+    pub fn native_symbol(&self, class: &str, symbol: &str) -> io::Result<u64> {
+        self.request("textDocument/nativeSymbol", json!({ "native_class": class, "symbol_name": symbol }))
+    }
+
     /// The file's symbols (functions, variables, signals…). Decode the
     /// answer with [`document_symbols`].
     pub fn document_symbols(&self, path: &Path) -> io::Result<u64> {
@@ -316,8 +324,8 @@ impl Reader {
                 let (path, diagnostics) = types::diagnostics(message.get("params")?)?;
                 Some(Event::Diagnostics { path, diagnostics })
             }
-            // Godot's full class list; large and unused for now.
-            (Some("gdscript/capabilities"), None) => None,
+            // Godot's full class list, for the class reference.
+            (Some("gdscript/capabilities"), None) => Some(Event::NativeClasses(types::native_classes(message.get("params")?))),
             (Some(method), None) => Some(Event::Notification {
                 method: method.to_string(),
                 params: message.get("params").cloned().unwrap_or(Value::Null),

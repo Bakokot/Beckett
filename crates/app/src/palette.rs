@@ -1,6 +1,7 @@
 //! Quick open (Ctrl+P), the command palette (`>`, Ctrl+Shift+P) and go to
-//! line (`:`, Ctrl+G), all in one box. The input's first character picks
-//! the mode, as in VS Code.
+//! line (`:`, Ctrl+G), symbols of the file (`@`, Ctrl+Shift+O) or of the
+//! project (`#`, Ctrl+T), all in one box. The input's first character
+//! picks the mode, as in VS Code.
 
 use std::path::{Path, PathBuf};
 
@@ -68,6 +69,8 @@ pub struct Palette<M> {
     choices: Option<(&'static str, Vec<Choice<M>>)>,
     /// Symbols of the current file, for the `@` mode.
     symbols: Vec<Choice<M>>,
+    /// Symbols of every script, for the `#` mode; loaded when first needed.
+    project_symbols: Option<Vec<Choice<M>>>,
     pub items: Vec<Item<M>>,
     pub selected: usize,
     /// First visible row; the wheel moves it independently of `selected`.
@@ -85,7 +88,7 @@ impl<M: Clone> Palette<M> {
         collect(root, root, &mut files);
         files.sort();
         let recent = open.iter().filter_map(|p| relative(root, p)).collect();
-        Self { input, choices: None, symbols: Vec::new(), items: Vec::new(), selected: 0, scroll: 0, files, root: root.to_path_buf(), recent }
+        Self { input, choices: None, symbols: Vec::new(), project_symbols: None, items: Vec::new(), selected: 0, scroll: 0, files, root: root.to_path_buf(), recent }
     }
 
     /// Asks to pick one of `choices`; typing filters them.
@@ -94,6 +97,7 @@ impl<M: Clone> Palette<M> {
             input: String::new(),
             choices: Some((prompt, choices)),
             symbols: Vec::new(),
+            project_symbols: None,
             items: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -108,6 +112,21 @@ impl<M: Clone> Palette<M> {
         self.symbols = symbols;
     }
 
+    /// Whether the `#` mode is on and its symbols still need loading
+    /// (see [`Self::scripts`] and [`Self::set_project_symbols`]).
+    pub fn wants_project_symbols(&self) -> bool {
+        self.choices.is_none() && self.input.starts_with('#') && self.project_symbols.is_none()
+    }
+
+    /// The project's GDScript files.
+    pub fn scripts(&self) -> Vec<PathBuf> {
+        self.files.iter().filter(|f| f.ends_with(".gd")).map(|f| self.root.join(f)).collect()
+    }
+
+    pub fn set_project_symbols(&mut self, symbols: Vec<Choice<M>>) {
+        self.project_symbols = Some(symbols);
+    }
+
     /// Rebuilds the list for the current input.
     pub fn refresh(&mut self, commands: &[CommandEntry<M>]) {
         self.selected = 0;
@@ -116,6 +135,8 @@ impl<M: Clone> Palette<M> {
             choice_items(self.input.trim(), choices)
         } else if let Some(query) = self.input.strip_prefix('@') {
             choice_items(query.trim(), &self.symbols)
+        } else if let Some(query) = self.input.strip_prefix('#') {
+            choice_items(query.trim(), self.project_symbols.as_deref().unwrap_or_default())
         } else if let Some(query) = self.input.strip_prefix('>') {
             command_items(query.trim(), commands)
         } else if let Some(target) = self.input.strip_prefix(':') {
@@ -155,7 +176,8 @@ impl<M: Clone> Palette<M> {
             Some('>') => "Type a command",
             Some(':') => "Line number, optionally :column",
             Some('@') => "Go to a function, variable or signal of this file",
-            _ => "Search files by name  (> commands, @ symbols, : go to line)",
+            Some('#') => "Go to a function, class, variable or signal of any script",
+            _ => "Search files by name  (> commands, @ symbols, # in project, : line)",
         }
     }
 
@@ -397,6 +419,7 @@ mod tests {
             input: String::new(),
             choices: None,
             symbols: Vec::new(),
+            project_symbols: None,
             items: Vec::new(),
             selected: 0,
             scroll: 0,
@@ -431,6 +454,21 @@ mod tests {
         assert_eq!(p.items.len(), 3);
         p.input = "@phys".into();
         p.refresh(&[]);
+        assert!(matches!(p.items[0].action, Action::Run(2)));
+    }
+
+    #[test]
+    fn hash_lists_the_project_symbols_once_loaded() {
+        let mut p = palette(&["a.gd", "b.tscn", "enemies/slime.gd"]);
+        p.input = "#".into();
+        assert!(p.wants_project_symbols());
+        assert_eq!(p.scripts(), [PathBuf::from("/game").join("a.gd"), PathBuf::from("/game").join("enemies/slime.gd")]);
+        let choice = |label: &str, message| Choice { label: label.into(), detail: String::new(), message };
+        p.set_project_symbols(vec![choice("take_damage", 1), choice("jump", 2)]);
+        assert!(!p.wants_project_symbols());
+        p.input = "#jmp".into();
+        p.refresh(&[]);
+        assert_eq!(p.items.len(), 1);
         assert!(matches!(p.items[0].action, Action::Run(2)));
     }
 

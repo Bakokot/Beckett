@@ -76,6 +76,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Escape / Click outside", "Close"),
             ("> prefix", "Search commands instead of files"),
             ("@ prefix", "Go to a symbol of this file"),
+            ("# prefix", "Go to a symbol of any script in the project"),
             (": prefix", "Go to line"),
         ],
     ),

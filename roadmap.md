@@ -63,9 +63,6 @@ crates/
 - [x] Theme file loading (TOML): 2 built-ins + user themes dir, switcher in status bar
 - [x] Open folder (dialog or CLI arg) + `project.godot` parsing (name, version, `res://`)
 
-**Known Phase 0 issues**
-- No bundled UI/icon font yet, so explorer arrows are ASCII
-
 **Deferred from Phase 0 → Phase 1**
 - Tree-sitter — for folding/outline; the lexer stays as the fast highlighter
 - Explorer create / rename / delete / reveal in OS
@@ -178,6 +175,9 @@ crates/
       section, with a filter; Escape closes
 - [x] Recent projects on the welcome screen (name, Godot version, path; missing folders flagged;
       × forgets one) and as "Open Recent" palette commands
+- [x] File icons in the explorer: one per kind (script, scene, resource, shader, image, audio, video,
+      3D model, font, JSON, text, config, C#, library, project.godot), open/closed folders, SVG
+      arrows — seen on screen (open folder icon not yet)
 
 ## Phase 2 — v1
 
@@ -188,6 +188,8 @@ crates/
 - [x] Split view: two sides with their own tabs; Ctrl+\ (or the palette) moves the current tab to
       the other side, a side left empty closes the split; click a side to focus it; sides kept in
       the session — seen on screen. (One file can't show on both sides: one buffer, one cursor)
+      Drag the bar between the sides to resize them (150 px minimum each; the share is kept in
+      the session) — seen on screen with a mouse drag
 - [x] Hot exit: unsaved edits kept in the session on close (and every 30 s), restored as unsaved;
       flagged "(changed on disk)" when the file changed meanwhile — seen on screen
 - [ ] Persistent undo
@@ -200,8 +202,21 @@ crates/
 **LSP / Godot**
 - [x] Outline panel (sidebar OUTLINE tab, nested, current symbol highlighted, remembered) and go to
       symbol in file (Ctrl+Shift+O / `@` in the palette) — seen on screen
-- [ ] Workspace symbols (go to any symbol in the project)
-- [ ] Offline class reference browser (generated via `godot --doctool`)
+- [x] Go to symbol in project (Ctrl+T / `#` in the palette): classes, functions, signals, constants,
+      variables and enums of every script, inner-class members included, open tabs read unsaved.
+      Godot 4.7.1 has no `workspace/symbol`, so declarations are scanned client-side
+      (`editor_core::symbols`); checked on a 26-script project — not yet tried on screen
+- [x] Class reference (Shift+F1, palette; F1 in the Godot preset), in a "Docs" tab beside the files of
+      its side (one at most; links reuse it; Ctrl+W closes it). It splits like a file tab: Ctrl+\,
+      right-click menu (Close, Close Others, Move to the Other Side), focus follows clicks, and a
+      side left with it alone stays open: every engine class, searchable, with
+      inheritance (both ways, clickable), description, properties, methods, signals and constants;
+      Godot's BBCode rendered, `[Class]` / `[method x]` references followed, Back, member filter;
+      F12 or Ctrl+click on an engine class or member opens it there, and holding Ctrl underlines it
+      (found from the hover signature). Comes from
+      the language server (`gdscript/capabilities` + `textDocument/nativeSymbol`), not `--doctool`,
+      whose XML has no descriptions in release builds — seen on screen (Node2D, Vector2.lerp);
+      F12 path unit-tested only
 - [ ] Autoloads / Input Map / project settings panel + completion for action names
 - [ ] Drag file into code → `preload("res://…")`
 - [ ] Script templates / "New Script" dialog

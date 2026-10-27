@@ -45,9 +45,31 @@ impl Split {
     }
 }
 
+/// Narrowest a side gets.
+const MIN_SIDE_WIDTH: f32 = 150.0;
+
+/// Width of the left side for a split `ratio` of `width` (the two sides
+/// together), leaving each side at least `MIN_SIDE_WIDTH` when it fits.
+pub fn left_width(ratio: f32, width: f32) -> f32 {
+    if width < 2.0 * MIN_SIDE_WIDTH {
+        return (width / 2.0).round();
+    }
+    (ratio * width).round().clamp(MIN_SIDE_WIDTH, width - MIN_SIDE_WIDTH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sides_keep_a_minimum_width() {
+        assert_eq!(left_width(0.5, 1000.0), 500.0);
+        assert_eq!(left_width(0.3, 1000.0), 300.0);
+        assert_eq!(left_width(0.0, 1000.0), 150.0);
+        assert_eq!(left_width(1.0, 1000.0), 850.0);
+        // Too narrow for both minimums: half each.
+        assert_eq!(left_width(0.1, 200.0), 100.0);
+    }
 
     #[test]
     fn active_tab_decides_the_focused_side() {

@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 pub struct Session {
     pub tabs: Vec<TabState>,
     pub active: Option<usize>,
+    /// Share of the width the left side of the split view takes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_ratio: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,12 +116,13 @@ mod tests {
                 },
             ],
             active: Some(1),
+            split_ratio: Some(0.25),
         };
         let text = serde_json::to_string(&session).unwrap();
         assert!(!text.contains("\"folds\":[]"), "{text}");
         assert_eq!(serde_json::from_str::<Session>(&text).unwrap(), session);
         let old: Session = serde_json::from_str(r#"{"tabs": [{"path": "C:/game/a.gd"}]}"#).unwrap();
-        assert_eq!((old.tabs[0].line, old.active), (0, None));
+        assert_eq!((old.tabs[0].line, old.active, old.split_ratio), (0, None, None));
     }
 
     #[test]

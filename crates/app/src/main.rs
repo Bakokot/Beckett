@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod class_ref;
 mod code_editor;
 mod completion;
 mod context_menu;
 mod docs;
 mod explorer;
+mod file_icons;
 mod find;
 mod format;
 mod keymap;
@@ -15,6 +17,7 @@ mod outline;
 mod palette;
 mod paths;
 mod problems;
+mod project_symbols;
 mod recent;
 mod rename;
 mod runner;
@@ -36,7 +39,8 @@ use std::path::{Path, PathBuf};
 use editor_core::{snippet, Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
 use iced::widget::{
-    button, center, column, container, mouse_area, pick_list, row, scrollable, space, text, tooltip, Row,
+    button, center, column, container, mouse_area, pick_list, responsive, row, scrollable, space, text, tooltip,
+    Row,
 };
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task};
 use lsp_client::{uri, CompletionKind, Event, Position, Severity};
@@ -55,6 +59,7 @@ use palette::{CommandEntry, Palette, PaletteMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
 use rename::{Rename, RenameMessage};
+use class_ref::{ClassRef, ClassRefMessage};
 use shortcuts::{Shortcuts, ShortcutsMessage};
 use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
 use terminal_panel::TerminalEvent;
@@ -122,6 +127,9 @@ pub enum Message {
     ClosePanel,
     /// The splitter above the bottom panel moved by this many pixels.
     ResizePanel(f32),
+    /// The bar between the two sides moved by this many pixels, in an
+    /// editor area this wide.
+    ResizeSplit(f32, f32),
     WindowResized(iced::Size),
     /// Zoom the interface in (positive) or out by this many steps.
     Zoom(i32),
@@ -160,6 +168,11 @@ pub enum Message {
     /// F1: the keyboard shortcuts page.
     OpenShortcuts,
     Shortcuts(ShortcutsMessage),
+    /// The class reference, at this class (and member) when given.
+    OpenClassRef(Option<String>, Option<String>),
+    /// Bring the class reference tab to the front.
+    ShowClassRef,
+    ClassRef(ClassRefMessage),
     ThemeEditor(ThemeMessage),
     ThemeImportPicked(Option<PathBuf>),
     ThemeExportPicked(Option<PathBuf>),
@@ -176,8 +189,10 @@ pub enum Message {
     CopyText(String),
     /// Show a file or folder in the system file manager.
     Reveal(PathBuf),
-    CloseOtherTabs(usize),
-    MoveTabToOtherSide(usize),
+    /// Close every tab but this file (`None`: but the class reference).
+    CloseOtherTabs(Option<usize>),
+    /// Move this file (`None`: the class reference) to the other side.
+    MoveTabToOtherSide(Option<usize>),
     EditorCopy,
     EditorCut,
     EditorPaste,
@@ -191,6 +206,8 @@ pub enum ContextTarget {
     Folder(PathBuf),
     /// A tab, by index.
     Tab(usize),
+    /// The class reference tab.
+    ClassRef,
     /// The code of the focused editor.
     Editor,
 }
@@ -255,6 +272,10 @@ struct RunState {
 enum Pending {
     Definition,
     Completion,
+    /// Hover asked after an empty definition: an engine symbol opens its docs.
+    NativeDefinition,
+    /// The docs of this engine class.
+    ClassDoc(String),
     /// Docs for `items[index]` of the current completion.
     Resolve(usize),
     Hover(Pos),
@@ -268,6 +289,9 @@ enum Pending {
     Outline(PathBuf, i32),
     /// Whether the word at this char range has a definition (Ctrl+hover).
     LinkProbe((usize, usize)),
+    /// The same word without a definition: whether its hover names an
+    /// engine symbol (Ctrl+click opens the class reference then).
+    NativeLinkProbe((usize, usize)),
 }
 
 /// A snippet being filled in: Tab / Shift+Tab move between its stops.
@@ -319,6 +343,8 @@ struct App {
     problems: Problems,
     /// Height of the bottom panel, set with the splitter above it.
     panel_height: f32,
+    /// Share of the editor area's width the left side takes when split.
+    split_ratio: f32,
     window_height: f32,
     window_width: f32,
     /// The open right-click menu.
@@ -337,6 +363,18 @@ struct App {
     theme_editor: Option<ThemeEditor>,
     /// The keyboard shortcuts page, shown in place of the editor.
     shortcuts: Option<Shortcuts>,
+    /// The class reference tab (one at most), on side `class_ref_side`.
+    class_ref: Option<ClassRef>,
+    class_ref_side: usize,
+    /// Whether that side shows it rather than one of its files.
+    class_ref_shown: bool,
+    /// Whether it is the active tab (shown, on the focused side); `active`
+    /// then keeps the file its side showed before, if any.
+    class_ref_focused: bool,
+    /// The class reference as it was closed, to reopen at the same class.
+    hidden_class_ref: Option<ClassRef>,
+    /// Engine classes, from the language server.
+    native_classes: Vec<lsp_client::NativeClass>,
     // Popups for the active tab.
     completion: Option<Completion>,
     hover: Option<(Pos, Doc)>,
@@ -431,6 +469,7 @@ impl App {
             problems: Problems::default(),
             panel: None,
             panel_height: DEFAULT_PANEL_HEIGHT,
+            split_ratio: 0.5,
             window_height: WINDOW_SIZE.1,
             window_width: WINDOW_SIZE.0,
             context_menu: None,
@@ -443,6 +482,12 @@ impl App {
             theme_paths,
             theme_editor: None,
             shortcuts: None,
+            class_ref: None,
+            class_ref_side: 0,
+            class_ref_shown: false,
+            class_ref_focused: false,
+            hidden_class_ref: None,
+            native_classes: Vec::new(),
             completion: None,
             hover: None,
             signature: None,
@@ -583,17 +628,57 @@ impl App {
 
     /// Keeps the split consistent after any change: the active tab decides
     /// which side has focus, each side shows one of its own tabs, and a side
-    /// left without tabs closes the split.
+    /// left without tabs closes the split. The class reference tab counts
+    /// as one more tab, after the files.
     fn sync_groups(&mut self) {
+        let docs = self.tabs.len();
         let mut groups: Vec<usize> = self.tabs.iter().map(|t| t.group).collect();
-        let mut split = split::Split { active: self.active, shown: self.group_active, focused: self.focused_group };
-        split.sync(&mut groups);
-        for (tab, group) in self.tabs.iter_mut().zip(groups) {
-            tab.group = group;
+        let mut shown = self.group_active;
+        let mut active = self.active;
+        if self.class_ref.is_some() {
+            groups.push(self.class_ref_side);
+            if self.class_ref_shown {
+                shown[self.class_ref_side] = Some(docs);
+            }
+            if self.class_ref_focused {
+                active = Some(docs);
+            }
         }
-        self.active = split.active;
-        self.group_active = split.shown;
+        let mut split = split::Split { active, shown, focused: self.focused_group };
+        split.sync(&mut groups);
+        for (tab, group) in self.tabs.iter_mut().zip(&groups) {
+            tab.group = *group;
+        }
+        for side in 0..2 {
+            self.group_active[side] = match split.shown[side] {
+                // Behind the class reference: keep the file shown before it.
+                Some(i) if i == docs => {
+                    let kept = self.group_active[side].filter(|&i| i < docs && groups[i] == side);
+                    kept.or_else(|| groups[..docs].iter().rposition(|&g| g == side))
+                }
+                other => other,
+            };
+        }
         self.focused_group = split.focused;
+        if self.class_ref.is_some() {
+            self.class_ref_side = groups[docs];
+            self.class_ref_shown = split.shown[self.class_ref_side] == Some(docs);
+            self.class_ref_focused = split.active == Some(docs);
+        }
+        self.active = match split.active {
+            Some(i) if i == docs => self.group_active[self.focused_group],
+            other => other,
+        };
+    }
+
+    /// Makes a file tab the active one (in front of the class reference
+    /// when that was active).
+    fn focus_tab(&mut self, index: usize) {
+        self.active = Some(index);
+        if self.class_ref_focused {
+            self.class_ref_focused = false;
+            self.focus = Focus::Editor;
+        }
     }
 
     /// An event from the editor on one side: clicking or typing there moves
@@ -609,7 +694,7 @@ impl App {
             self.dismiss_popups();
             self.find = None;
             self.rename = None;
-            self.active = Some(index);
+            self.focus_tab(index);
             self.sync_groups();
         }
         self.on_editor(event)
@@ -618,20 +703,29 @@ impl App {
     /// Moves the current tab to the other side, splitting the view (or
     /// closing the split when its side is left empty).
     fn split_move(&mut self) {
-        let Some(active) = self.active else {
-            return;
+        let docs = self.class_ref_active();
+        let from = match self.active {
+            _ if docs => self.class_ref_side,
+            Some(active) => self.tabs[active].group,
+            None => return,
         };
-        let from = self.tabs[active].group;
         let to = 1 - from;
-        let alone = self.tabs.iter().filter(|t| t.group == from).count() == 1;
-        if alone && !self.tabs.iter().any(|t| t.group == to) {
-            self.status = Some("Split moves the current tab to the other side: open a second file first".to_string());
+        let count = |side: usize| {
+            let docs = self.class_ref.is_some() && self.class_ref_side == side;
+            self.tabs.iter().filter(|t| t.group == side).count() + usize::from(docs)
+        };
+        if count(from) == 1 && count(to) == 0 {
+            self.status = Some("Split moves the current tab to the other side: open a second tab first".to_string());
             return;
         }
         self.dismiss_popups();
         self.find = None;
         self.rename = None;
-        self.tabs[active].group = to;
+        match self.active {
+            _ if docs => self.class_ref_side = to,
+            Some(active) => self.tabs[active].group = to,
+            None => {}
+        }
     }
 
     /// Asks for the active file's outline while it is shown (sidebar or the
@@ -721,10 +815,16 @@ impl App {
             Message::SelectTab(index) => {
                 if index < self.tabs.len() {
                     self.dismiss_popups();
-                    self.active = Some(index);
+                    self.focus_tab(index);
                     self.shortcuts = None;
+                    if self.tabs[index].group == self.class_ref_side {
+                        self.class_ref_shown = false;
+                    }
                 }
             }
+            Message::OpenClassRef(class, member) => return self.open_class_ref(class, member),
+            Message::ShowClassRef => self.show_class_ref(),
+            Message::ClassRef(message) => return self.on_class_ref(message),
             Message::OpenShortcuts => {
                 // Keep the filter when it is already open.
                 self.shortcuts.get_or_insert_with(Shortcuts::default);
@@ -782,7 +882,9 @@ impl App {
                 self.close_tab(index);
             }
             Message::CloseActiveTab => {
-                if let Some(index) = self.active {
+                if self.class_ref_active() {
+                    self.close_class_ref();
+                } else if let Some(index) = self.active {
                     self.dismiss_popups();
                     self.close_tab(index);
                 }
@@ -792,9 +894,11 @@ impl App {
             Message::SplitMove => self.split_move(),
             Message::FocusOtherSide => {
                 let other = 1 - self.focused_group;
-                if let Some(index) = self.group_active[other] {
+                if self.class_ref.is_some() && self.class_ref_shown && self.class_ref_side == other {
+                    self.show_class_ref();
+                } else if let Some(index) = self.group_active[other].filter(|_| self.is_split()) {
                     self.dismiss_popups();
-                    self.active = Some(index);
+                    self.focus_tab(index);
                 }
             }
             Message::Save => self.save_active(),
@@ -882,6 +986,10 @@ impl App {
             }
             // Dragging the splitter up makes the panel taller.
             Message::ResizePanel(delta) => self.panel_height = (self.panel_height() - delta).max(MIN_PANEL_HEIGHT),
+            Message::ResizeSplit(delta, width) => {
+                let left = split::left_width(self.split_ratio, width) + delta;
+                self.split_ratio = (left / width).clamp(0.0, 1.0);
+            }
             Message::WindowResized(size) => {
                 self.window_height = size.height;
                 self.window_width = size.width;
@@ -907,9 +1015,16 @@ impl App {
                 }
             }
             Message::CloseOtherTabs(keep) => self.close_other_tabs(keep),
-            Message::MoveTabToOtherSide(index) => {
+            Message::MoveTabToOtherSide(Some(index)) => {
                 if index < self.tabs.len() {
-                    self.active = Some(index);
+                    self.focus_tab(index);
+                    self.sync_groups();
+                    self.split_move();
+                }
+            }
+            Message::MoveTabToOtherSide(None) => {
+                if self.class_ref.is_some() {
+                    self.show_class_ref();
                     self.sync_groups();
                     self.split_move();
                 }
@@ -945,7 +1060,7 @@ impl App {
                 self.on_files_changed(&paths);
             }
             Message::ReloadActive => {
-                if let Some(index) = self.active {
+                if let Some(index) = self.active_index() {
                     self.reload_tab(index);
                 }
             }
@@ -1288,14 +1403,38 @@ impl App {
         let open: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
         let mut palette = Palette::new(&project.root, &open, input);
         palette.set_symbols(self.symbol_choices());
-        palette.refresh(&self.commands());
         self.palette = Some(palette);
+        self.load_project_symbols();
+        let commands = self.commands();
+        if let Some(palette) = &mut self.palette {
+            palette.refresh(&commands);
+        }
         self.focus = Focus::Input;
         self.dismiss_popups();
         Task::batch([
             iced::widget::operation::focus(palette::INPUT),
             iced::widget::operation::move_cursor_to_end(palette::INPUT),
         ])
+    }
+
+    /// Reads the symbols of every script once the palette's `#` mode needs them.
+    fn load_project_symbols(&mut self) {
+        let (Some(project), Some(palette)) = (&self.project, &self.palette) else {
+            return;
+        };
+        if !palette.wants_project_symbols() {
+            return;
+        }
+        let open: Vec<(PathBuf, String)> = self
+            .tabs
+            .iter()
+            .filter(|t| t.path.extension().is_some_and(|e| e == "gd"))
+            .map(|t| (t.path.clone(), t.buffer.text()))
+            .collect();
+        let symbols = project_symbols::choices(&project.root, &palette.scripts(), &open, &self.current_theme().syntax);
+        if let Some(palette) = &mut self.palette {
+            palette.set_project_symbols(symbols);
+        }
     }
 
     fn on_palette(&mut self, message: PaletteMessage) -> Task<Message> {
@@ -1306,7 +1445,10 @@ impl App {
         let item = match message {
             PaletteMessage::Input(input) => {
                 palette.input = input;
-                palette.refresh(&commands);
+                self.load_project_symbols();
+                if let Some(palette) = &mut self.palette {
+                    palette.refresh(&commands);
+                }
                 return Task::none();
             }
             PaletteMessage::Move(delta) => {
@@ -1352,6 +1494,7 @@ impl App {
             ("Go to File", "file.quickOpen", Message::OpenPalette(String::new())),
             ("Go to Line", "go.line", Message::OpenPalette(":".to_string())),
             ("Go to Symbol in File", "go.symbol", Message::OpenPalette("@".to_string())),
+            ("Go to Symbol in Project", "go.projectSymbol", Message::OpenPalette("#".to_string())),
             ("View: Outline", "", Message::ShowSidebar(SidebarView::Outline)),
             ("View: Files", "", Message::ShowSidebar(SidebarView::Files)),
             ("Go to Definition", "go.definition", Message::GotoDefinition),
@@ -1397,6 +1540,7 @@ impl App {
             ("Edit: Add Cursor Below", "edit.cursorBelow", edit(Command::AddCursorBelow)),
             ("Edit: Trigger Completion", "edit.completion", Message::Edit(EditorEvent::TriggerCompletion)),
             ("Help: Keyboard Shortcuts", "view.shortcuts", Message::OpenShortcuts),
+            ("Help: Class Reference", "help.classReference", Message::OpenClassRef(None, None)),
             ("Theme: Edit Colors", "", Message::OpenThemeEditor),
             ("Theme: Import File...", "", Message::ThemeEditor(ThemeMessage::Import)),
             ("Theme: Export File...", "", Message::ThemeEditor(ThemeMessage::Export)),
@@ -1854,6 +1998,10 @@ impl App {
     }
 
     fn on_editor(&mut self, event: EditorEvent) -> Task<Message> {
+        // Keys meant for a file do nothing while the class reference is in front.
+        if self.class_ref_active() {
+            return Task::none();
+        }
         match event {
             EditorEvent::Command(command) => {
                 let typed = match &command {
@@ -2424,6 +2572,17 @@ impl App {
                     self.link_probe = None;
                     if !lsp_client::locations(&value).is_empty() {
                         self.link = Some(range);
+                    } else {
+                        self.probe_native_link(range);
+                    }
+                }
+            }
+            Pending::NativeLinkProbe(range) => {
+                if self.link_probe == Some(id) {
+                    self.link_probe = None;
+                    let hover = lsp_client::hover_text(&value);
+                    if hover.is_some_and(|h| class_ref::hover_target(&h, &self.native_classes).is_some()) {
+                        self.link = Some(range);
                     }
                 }
             }
@@ -2445,8 +2604,24 @@ impl App {
                     self.dismiss_popups();
                     self.jump_to(location.path, start.line, start.character);
                 }
-                None => self.status = Some("No definition found".to_string()),
+                // Engine symbols have no file: their docs, found from the hover.
+                None => self.request_native_definition(),
             },
+            Pending::NativeDefinition => {
+                let target = lsp_client::hover_text(&value).and_then(|hover| class_ref::hover_target(&hover, &self.native_classes));
+                match target {
+                    Some((class, member)) => return self.open_class_ref(Some(class), member),
+                    None => self.status = Some("No definition found".to_string()),
+                }
+            }
+            Pending::ClassDoc(class) => {
+                let page = self.class_ref.as_mut().filter(|p| p.loading.as_deref() == Some(class.as_str()));
+                if let (Some(page), Some(symbol)) = (page, lsp_client::native_symbol(&value)) {
+                    page.loading = None;
+                    page.page = Some(class_ref::Page::new(symbol));
+                    return iced::widget::operation::snap_to(class_ref::PAGE, iced::widget::scrollable::RelativeOffset::START);
+                }
+            }
             Pending::Completion => {
                 if let Some(c) = &mut self.completion {
                     if c.request == Some(id) {
@@ -2528,6 +2703,12 @@ impl App {
                     (Err(error), Pending::Definition) => self.status = Some(format!("Go to definition failed: {error}")),
                     (Err(error), Pending::References(_)) => self.status = Some(format!("Find references failed: {error}")),
                     (Err(error), Pending::Rename { .. }) => self.status = Some(format!("Rename failed: {error}")),
+                    (Err(error), Pending::ClassDoc(class)) => {
+                        if let Some(page) = self.class_ref.as_mut().filter(|p| p.loading.as_deref() == Some(class.as_str())) {
+                            page.loading = None;
+                        }
+                        self.status = Some(format!("No documentation for {class}: {error}"));
+                    }
                     (Err(_), _) => {}
                 }
             }
@@ -2541,6 +2722,10 @@ impl App {
                 return self.schedule_reconnect();
             }
             LspEvent::Event(Event::Notification { .. }) => {}
+            LspEvent::Event(Event::NativeClasses(mut classes)) => {
+                classes.sort_by(|a, b| a.name.cmp(&b.name));
+                self.native_classes = classes;
+            }
         }
         Task::none()
     }
@@ -2632,6 +2817,124 @@ impl App {
         }
     }
 
+    /// After an empty definition: asks for the hover, whose signature names
+    /// the engine class of a built-in symbol.
+    fn request_native_definition(&mut self) {
+        let Some((client, tab, pos)) = self.lsp_target() else {
+            return;
+        };
+        match client.hover(&tab.path, to_lsp(pos)) {
+            Ok(id) => {
+                self.pending.insert(id, Pending::NativeDefinition);
+            }
+            Err(_) => self.status = Some("No definition found".to_string()),
+        }
+    }
+
+    /// Shows the class reference (as it was left), at `class` and filtered
+    /// to `member` when given.
+    fn open_class_ref(&mut self, class: Option<String>, member: Option<String>) -> Task<Message> {
+        self.shortcuts = None;
+        self.palette = None;
+        self.dismiss_popups();
+        self.focus = Focus::Input;
+        if self.class_ref.is_none() {
+            self.class_ref = Some(self.hidden_class_ref.take().unwrap_or_default());
+            self.class_ref_side = self.focused_group;
+        }
+        self.show_class_ref();
+        let Some(page) = &mut self.class_ref else {
+            return Task::none();
+        };
+        let Some(class) = class else {
+            return Task::batch([
+                iced::widget::operation::focus(class_ref::FILTER),
+                iced::widget::operation::select_all(class_ref::FILTER),
+            ]);
+        };
+        page.member_filter = member.unwrap_or_default();
+        if page.page.as_ref().is_some_and(|p| p.name == class) && page.loading.is_none() {
+            return Task::none();
+        }
+        self.load_class(class, true)
+    }
+
+    /// Asks for a class's docs; `remember` puts the current class in the
+    /// Back history.
+    fn load_class(&mut self, class: String, remember: bool) -> Task<Message> {
+        let Some(client) = self.lsp.client().cloned() else {
+            self.status = Some("The class reference needs the language server".to_string());
+            return Task::none();
+        };
+        match client.native_symbol(&class, &class) {
+            Ok(id) => {
+                self.pending.insert(id, Pending::ClassDoc(class.clone()));
+                if let Some(page) = &mut self.class_ref {
+                    if let Some(current) = page.page.as_ref().filter(|_| remember) {
+                        page.history.push(current.name.clone());
+                    }
+                    page.loading = Some(class);
+                }
+            }
+            Err(error) => self.status = Some(format!("Cannot load {class}: {error}")),
+        }
+        Task::none()
+    }
+
+    fn on_class_ref(&mut self, message: ClassRefMessage) -> Task<Message> {
+        // Using the page (typing in its filters too) makes it the active tab.
+        if !matches!(message, ClassRefMessage::Close) && !self.class_ref_focused {
+            self.show_class_ref();
+        }
+        let Some(page) = &mut self.class_ref else {
+            return Task::none();
+        };
+        match message {
+            ClassRefMessage::Filter(filter) => page.filter = filter,
+            ClassRefMessage::MemberFilter(filter) => page.member_filter = filter,
+            ClassRefMessage::Open(class_ref::Link::Class(class)) => return self.open_class_ref(Some(class), None),
+            ClassRefMessage::Open(class_ref::Link::Member(class, member)) => return self.open_class_ref(Some(class), Some(member)),
+            ClassRefMessage::Back => {
+                if let Some(previous) = page.history.pop() {
+                    page.member_filter.clear();
+                    return self.load_class(previous, false);
+                }
+            }
+            ClassRefMessage::Close => self.close_class_ref(),
+        }
+        Task::none()
+    }
+
+    /// Closes the class reference tab, keeping its state to reopen as it was.
+    fn close_class_ref(&mut self) {
+        if let Some(page) = self.class_ref.take() {
+            self.hidden_class_ref = Some(page);
+        }
+        self.class_ref_shown = false;
+        self.class_ref_focused = false;
+        self.focus = Focus::Editor;
+    }
+
+    /// Makes the class reference the active tab: in front of its side, and
+    /// that side focused.
+    fn show_class_ref(&mut self) {
+        if self.class_ref.is_none() {
+            return;
+        }
+        self.class_ref_shown = true;
+        self.class_ref_focused = true;
+        self.dismiss_popups();
+        self.find = None;
+        self.rename = None;
+        self.focus = Focus::Input;
+    }
+
+    /// Whether the class reference is the active tab: file commands (save,
+    /// edits) then have no target.
+    fn class_ref_active(&self) -> bool {
+        self.class_ref.is_some() && self.class_ref_focused
+    }
+
     /// The existing file a `res://` or `uid://` path points to.
     fn resolve_link(&mut self, link: &str) -> Option<PathBuf> {
         let godot = self.project.as_ref()?.godot.as_ref()?;
@@ -2675,6 +2978,19 @@ impl App {
         let pos = tab.buffer.char_to_pos(index);
         if let Ok(id) = client.definition(&tab.path, to_lsp(pos)) {
             self.pending.insert(id, Pending::LinkProbe((start, end)));
+            self.link_probe = Some(id);
+        }
+    }
+
+    /// Asks for the hover of the word at `range` (which has no definition),
+    /// to underline it when it is an engine symbol.
+    fn probe_native_link(&mut self, range: (usize, usize)) {
+        let Some((client, tab, _)) = self.lsp_target() else {
+            return;
+        };
+        let pos = tab.buffer.char_to_pos(range.0);
+        if let Ok(id) = client.hover(&tab.path, to_lsp(pos)) {
+            self.pending.insert(id, Pending::NativeLinkProbe(range));
             self.link_probe = Some(id);
         }
     }
@@ -2749,7 +3065,7 @@ impl App {
     }
 
     fn format_active(&mut self) {
-        let Some(index) = self.active else {
+        let Some(index) = self.active_index() else {
             return;
         };
         self.status = Some(match self.format_tab(index) {
@@ -2899,20 +3215,34 @@ impl App {
         self.sync_groups();
     }
 
-    fn close_other_tabs(&mut self, keep: usize) {
-        let Some(path) = self.tabs.get(keep).map(|t| t.path.clone()) else {
-            return;
+    /// Closes every tab but `keep` (`None`: but the class reference).
+    fn close_other_tabs(&mut self, keep: Option<usize>) {
+        let path = match keep {
+            Some(keep) => match self.tabs.get(keep) {
+                Some(tab) => Some(tab.path.clone()),
+                None => return,
+            },
+            None if self.class_ref.is_some() => None,
+            None => return,
         };
         // Back to front, so indices stay valid; unsaved tabs stay open.
         for index in (0..self.tabs.len()).rev() {
-            if index != keep && !self.tabs[index].dirty {
+            if Some(index) != keep && !self.tabs[index].dirty {
                 self.close_tab(index);
             }
         }
-        if let Some(index) = self.tabs.iter().position(|t| t.path == path) {
-            self.active = Some(index);
+        match &path {
+            Some(path) => {
+                if self.class_ref.is_some() {
+                    self.close_class_ref();
+                }
+                if let Some(index) = self.tabs.iter().position(|t| &t.path == path) {
+                    self.focus_tab(index);
+                }
+            }
+            None => self.show_class_ref(),
         }
-        if self.tabs.iter().any(|t| t.dirty && t.path != path) {
+        if self.tabs.iter().any(|t| t.dirty && Some(&t.path) != path.as_ref()) {
             self.status = Some("Tabs with unsaved changes were kept open".to_string());
         }
     }
@@ -2947,15 +3277,23 @@ impl App {
                 let Some(tab) = self.tabs.get(*index) else {
                     return Vec::new();
                 };
-                let side = if tab.group == 0 && !self.is_split() { "Move to the Right Side" } else { "Move to the Other Side" };
+                let side = if self.is_split() { "Move to the Other Side" } else { "Move to the Right Side" };
                 let mut entries = vec![
                     Entry::with_shortcut("Close", key("file.closeTab"), Some(pick(Message::CloseTab(*index)))),
-                    Entry::item("Close Others", pick(Message::CloseOtherTabs(*index))),
-                    Entry::with_shortcut(side, key("view.split"), Some(pick(Message::MoveTabToOtherSide(*index)))),
+                    Entry::item("Close Others", pick(Message::CloseOtherTabs(Some(*index)))),
+                    Entry::with_shortcut(side, key("view.split"), Some(pick(Message::MoveTabToOtherSide(Some(*index))))),
                     Entry::Separator,
                 ];
                 entries.extend(paths(&tab.path));
                 entries
+            }
+            ContextTarget::ClassRef => {
+                let side = if self.is_split() { "Move to the Other Side" } else { "Move to the Right Side" };
+                vec![
+                    Entry::with_shortcut("Close", key("file.closeTab"), Some(pick(Message::ClassRef(ClassRefMessage::Close)))),
+                    Entry::item("Close Others", pick(Message::CloseOtherTabs(None))),
+                    Entry::with_shortcut(side, key("view.split"), Some(pick(Message::MoveTabToOtherSide(None)))),
+                ]
             }
             ContextTarget::Editor => {
                 let Some(tab) = self.active_tab() else {
@@ -3005,9 +3343,14 @@ impl App {
     fn open_file(&mut self, path: PathBuf) -> bool {
         // Opening a file shows it, even from the shortcuts page.
         self.shortcuts = None;
+        // A file on the class reference's side takes its place.
+        let group = self.tabs.iter().find(|t| uri::same_path(&t.path, &path)).map_or(self.focused_group, |t| t.group);
+        if group == self.class_ref_side {
+            self.class_ref_shown = false;
+        }
         self.link = None;
         if let Some(index) = self.tabs.iter().position(|t| uri::same_path(&t.path, &path)) {
-            self.active = Some(index);
+            self.focus_tab(index);
             return true;
         }
         match std::fs::read_to_string(&path) {
@@ -3040,7 +3383,7 @@ impl App {
             let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
         }
         self.tabs.push(tab);
-        self.active = Some(self.tabs.len() - 1);
+        self.focus_tab(self.tabs.len() - 1);
         self.refresh_marks();
     }
 
@@ -3063,7 +3406,8 @@ impl App {
                 }
             })
             .collect();
-        session::Session { tabs, active: self.active }
+        let split_ratio = Some(self.split_ratio).filter(|&r| r != 0.5);
+        session::Session { tabs, active: self.active, split_ratio }
     }
 
     /// Saves the project's session if it changed since the last save.
@@ -3087,6 +3431,7 @@ impl App {
             return;
         };
         let saved = session::load(&project.root);
+        self.split_ratio = saved.split_ratio.unwrap_or(0.5).clamp(0.0, 1.0);
         for state in &saved.tabs {
             if self.tabs.iter().any(|t| uri::same_path(&t.path, &state.path)) {
                 continue;
@@ -3159,7 +3504,7 @@ impl App {
     }
 
     fn save_active(&mut self) {
-        if let Some(index) = self.active {
+        if let Some(index) = self.active_index() {
             if self.save_tab(index) {
                 self.status = Some(format!("Saved {}", self.tabs[index].title()));
             }
@@ -3203,7 +3548,12 @@ impl App {
     }
 
     fn active_tab(&self) -> Option<&Tab> {
-        self.active.and_then(|i| self.tabs.get(i))
+        self.active_index().and_then(|i| self.tabs.get(i))
+    }
+
+    /// The active file tab: none while the class reference is active.
+    fn active_index(&self) -> Option<usize> {
+        self.active.filter(|_| !self.class_ref_active())
     }
 
     fn project_name(&self, project: &Project) -> String {
@@ -3283,6 +3633,15 @@ impl App {
             None => window,
         };
         numpad::numpad_fix(window).into()
+    }
+
+    fn class_ref_page(&self) -> Element<'_, Message> {
+        let Some(page) = &self.class_ref else {
+            return space().into();
+        };
+        let theme = self.current_theme();
+        let view = page.view(&self.native_classes, theme).map(Message::ClassRef);
+        container(view).width(Length::Fill).height(Length::Fill).style(style::surface(&theme.ui)).into()
     }
 
     fn shortcuts_page(&self) -> Element<'_, Message> {
@@ -3400,28 +3759,35 @@ impl App {
         if !self.is_split() {
             return self.pane(0);
         }
-        let border = style::to_color(self.current_theme().ui.border);
-        let divider = container(space()).width(1).height(Length::Fill).style(move |_| container::Style {
-            background: Some(border.into()),
-            ..container::Style::default()
-        });
-        row![
-            container(self.pane(0)).width(Length::FillPortion(1)),
-            divider,
-            container(self.pane(1)).width(Length::FillPortion(1)),
-        ]
+        let ui = &self.current_theme().ui;
+        let (line, active) = (style::to_color(ui.border), style::to_color(ui.accent));
+        // Laid out at the area's width, which turns drags into a share of it.
+        responsive(move |size| {
+            let width = (size.width - splitter::THICKNESS).max(1.0);
+            row![
+                container(self.pane(0)).width(split::left_width(self.split_ratio, width)),
+                splitter::vertical(line, active, move |delta| Message::ResizeSplit(delta, width)),
+                container(self.pane(1)).width(Length::Fill),
+            ]
+            .into()
+        })
         .into()
     }
 
     /// Whether the editor area is split in two sides.
     fn is_split(&self) -> bool {
-        self.tabs.iter().any(|t| t.group == 1)
+        self.tabs.iter().any(|t| t.group == 1) || (self.class_ref.is_some() && self.class_ref_side == 1)
     }
 
     /// One side of the editor area: its tabs and the file it shows. Only
     /// the focused side has the find / rename bars and the popups.
     fn pane(&self, group: usize) -> Element<'_, Message> {
         let focused = group == self.focused_group;
+        if self.class_ref.is_some() && self.class_ref_shown && group == self.class_ref_side {
+            // A click on the page's background focuses its side too.
+            let page = mouse_area(self.class_ref_page()).on_press(Message::ShowClassRef);
+            return column![self.tab_bar(group), page].into();
+        }
         let Some(tab) = self.group_active[group].and_then(|i| self.tabs.get(i)) else {
             let muted = style::to_color(self.current_theme().ui.text_muted);
             return center(text("Open a file from the explorer").color(muted)).into();
@@ -3565,7 +3931,9 @@ impl App {
 
     /// The tabs of one side of the split.
     fn tab_bar(&self, group: usize) -> Element<'_, Message> {
-        let shown = self.group_active[group];
+        let has_class_ref = self.class_ref.is_some() && group == self.class_ref_side;
+        let class_ref_shown = has_class_ref && self.class_ref_shown;
+        let shown = self.group_active[group].filter(|_| !class_ref_shown);
         let tabs = self.tabs.iter().enumerate().filter(|(_, tab)| tab.group == group).map(|(index, tab)| {
             let marker = match (tab.dirty, tab.disk_changed) {
                 (_, true) => " (changed on disk)",
@@ -3596,6 +3964,31 @@ impl App {
             ];
             context_area(tab, move |point| Message::ContextMenu(ContextTarget::Tab(index), point)).into()
         });
+        let mut tabs: Vec<Element<'_, Message>> = tabs.collect();
+        if let Some(page) = self.class_ref.as_ref().filter(|_| has_class_ref) {
+            let label = match page.page.as_ref() {
+                Some(page) => format!("Docs: {}", page.name),
+                None => "Class Reference".to_string(),
+            };
+            let style: fn(&iced::Theme, button::Status) -> button::Style =
+                if class_ref_shown { button::secondary } else { button::text };
+            let tab = row![
+                button(text(label).size(13).font(iced::Font { style: iced::font::Style::Italic, ..iced::Font::default() }))
+                    .on_press(Message::ShowClassRef)
+                    .style(style)
+                    .padding([4, 10]),
+                style::tip(
+                    button(text("×").size(13))
+                        .on_press(Message::ClassRef(ClassRefMessage::Close))
+                        .style(button::text)
+                        .padding([4, 6]),
+                    "Close (Ctrl+W)",
+                    tooltip::Position::Bottom,
+                    &self.current_theme().ui,
+                ),
+            ];
+            tabs.push(context_area(tab, |point| Message::ContextMenu(ContextTarget::ClassRef, point)).into());
+        }
 
         container(Row::with_children(tabs).spacing(2))
             .width(Length::Fill)
@@ -3752,6 +4145,7 @@ fn command_message(id: &str) -> Option<Message> {
         "palette.commands" => Message::OpenPalette(">".to_string()),
         "go.line" => Message::OpenPalette(":".to_string()),
         "go.symbol" => Message::OpenPalette("@".to_string()),
+        "go.projectSymbol" => Message::OpenPalette("#".to_string()),
         "go.definition" => Message::GotoDefinition,
         "go.references" => Message::FindReferences,
         "refactor.rename" => Message::StartRename,
@@ -3766,6 +4160,7 @@ fn command_message(id: &str) -> Option<Message> {
         "view.terminal" => Message::ToggleTerminal,
         "view.split" => Message::SplitMove,
         "view.shortcuts" => Message::OpenShortcuts,
+        "help.classReference" => Message::OpenClassRef(None, None),
         "view.zoomIn" => Message::Zoom(1),
         "view.zoomOut" => Message::Zoom(-1),
         "view.zoomReset" => Message::ZoomReset,

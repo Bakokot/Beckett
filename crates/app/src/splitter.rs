@@ -1,35 +1,61 @@
-//! A thin horizontal bar that resizes the panel below it: dragging it
-//! reports how far the mouse moved vertically.
+//! A thin bar that resizes what is beside it: dragging it reports how far
+//! the mouse moved across the bar (vertically for a horizontal bar, such as
+//! the one above the bottom panel; horizontally for the one between the two
+//! sides of the split editor).
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
 use iced::advanced::widget::{tree, Tree, Widget};
 use iced::advanced::{mouse, Clipboard, Renderer as _, Shell};
-use iced::{Color, Element, Event, Length, Rectangle, Size, Theme};
+use iced::{Color, Element, Event, Length, Point, Rectangle, Size, Theme};
 
-/// Height of the grab area; only a 1px line is drawn in it.
-const HEIGHT: f32 = 5.0;
+/// Thickness of the grab area; only a 1px line is drawn in it.
+pub const THICKNESS: f32 = 5.0;
 
 pub struct Splitter<'a, Message> {
     on_drag: Box<dyn Fn(f32) -> Message + 'a>,
     line: Color,
     active: Color,
+    /// A vertical bar, dragged left and right.
+    vertical: bool,
 }
 
-/// `on_drag` gets the vertical movement in pixels (negative is up).
+/// A horizontal bar: `on_drag` gets the vertical movement in pixels
+/// (negative is up).
 pub fn splitter<'a, Message>(line: Color, active: Color, on_drag: impl Fn(f32) -> Message + 'a) -> Splitter<'a, Message> {
-    Splitter { on_drag: Box::new(on_drag), line, active }
+    Splitter { on_drag: Box::new(on_drag), line, active, vertical: false }
+}
+
+/// A vertical bar: `on_drag` gets the horizontal movement in pixels
+/// (negative is left).
+pub fn vertical<'a, Message>(line: Color, active: Color, on_drag: impl Fn(f32) -> Message + 'a) -> Splitter<'a, Message> {
+    Splitter { on_drag: Box::new(on_drag), line, active, vertical: true }
 }
 
 #[derive(Default)]
 struct State {
-    /// Mouse y where the last reported drag step ended.
+    /// Mouse position (across the bar) where the last reported drag step ended.
     dragging_from: Option<f32>,
+}
+
+impl<Message> Splitter<'_, Message> {
+    fn size(&self) -> Size<Length> {
+        if self.vertical {
+            Size::new(Length::Fixed(THICKNESS), Length::Fill)
+        } else {
+            Size::new(Length::Fill, Length::Fixed(THICKNESS))
+        }
+    }
+
+    /// The coordinate the bar moves along.
+    fn across(&self, point: Point) -> f32 {
+        if self.vertical { point.x } else { point.y }
+    }
 }
 
 impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Message> {
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fixed(HEIGHT))
+        Splitter::size(self)
     }
 
     fn tag(&self) -> tree::Tag {
@@ -41,7 +67,8 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Messag
     }
 
     fn layout(&mut self, _tree: &mut Tree, _renderer: &iced::Renderer, limits: &layout::Limits) -> layout::Node {
-        layout::Node::new(limits.resolve(Length::Fill, Length::Fixed(HEIGHT), Size::ZERO))
+        let size = Splitter::size(self);
+        layout::Node::new(limits.resolve(size.width, size.height, Size::ZERO))
     }
 
     fn update(
@@ -59,16 +86,16 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Messag
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(point) = cursor.position_over(layout.bounds()) {
-                    state.dragging_from = Some(point.y);
+                    state.dragging_from = Some(self.across(point));
                     shell.capture_event();
                 }
             }
             // Followed anywhere in the window, not just over the bar.
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 if let Some(from) = state.dragging_from {
-                    let delta = position.y - from;
+                    let delta = self.across(*position) - from;
                     if delta != 0.0 {
-                        state.dragging_from = Some(position.y);
+                        state.dragging_from = Some(self.across(*position));
                         shell.publish((self.on_drag)(delta));
                     }
                     shell.capture_event();
@@ -95,8 +122,13 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Messag
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
         let hot = state.dragging_from.is_some() || cursor.is_over(bounds);
-        let (color, height) = if hot { (self.active, 2.0) } else { (self.line, 1.0) };
-        let line = Rectangle { y: bounds.y + (HEIGHT - height) / 2.0, height, ..bounds };
+        let (color, thickness) = if hot { (self.active, 2.0) } else { (self.line, 1.0) };
+        let offset = (THICKNESS - thickness) / 2.0;
+        let line = if self.vertical {
+            Rectangle { x: bounds.x + offset, width: thickness, ..bounds }
+        } else {
+            Rectangle { y: bounds.y + offset, height: thickness, ..bounds }
+        };
         renderer.fill_quad(Quad { bounds: line, ..Quad::default() }, color);
     }
 
@@ -109,10 +141,10 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Messag
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         let dragging = tree.state.downcast_ref::<State>().dragging_from.is_some();
-        if dragging || cursor.is_over(layout.bounds()) {
-            mouse::Interaction::ResizingVertically
-        } else {
-            mouse::Interaction::None
+        match dragging || cursor.is_over(layout.bounds()) {
+            false => mouse::Interaction::None,
+            true if self.vertical => mouse::Interaction::ResizingHorizontally,
+            true => mouse::Interaction::ResizingVertically,
         }
     }
 }

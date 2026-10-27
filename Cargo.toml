@@ -14,7 +14,7 @@ lsp-client = { path = "crates/lsp-client" }
 terminal = { path = "crates/terminal" }
 theme = { path = "crates/theme" }
 
-iced = { version = "0.14", features = ["advanced"] }
+iced = { version = "0.14", features = ["advanced", "svg"] }
 rfd = "0.15"
 ropey = "1.6"
 regex = "1"
