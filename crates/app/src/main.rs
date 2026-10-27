@@ -4015,6 +4015,8 @@ impl App {
                     &self.current_theme().ui,
                 ),
             ];
+            // Middle click closes, as in browsers.
+            let tab = mouse_area(tab).on_middle_release(Message::CloseTab(index));
             context_area(tab, move |point| Message::ContextMenu(ContextTarget::Tab(index), point)).into()
         });
         let mut tabs: Vec<Element<'_, Message>> = tabs.collect();
@@ -4040,6 +4042,7 @@ impl App {
                     &self.current_theme().ui,
                 ),
             ];
+            let tab = mouse_area(tab).on_middle_release(Message::ClassRef(ClassRefMessage::Close));
             tabs.push(context_area(tab, |point| Message::ContextMenu(ContextTarget::ClassRef, point)).into());
         }
 

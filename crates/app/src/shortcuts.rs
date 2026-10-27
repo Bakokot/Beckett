@@ -43,6 +43,7 @@ pub const SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+Click", "Go to definition, or open the res:// or uid:// path in a string"),
             ("Ctrl (hold)", "Underline what Ctrl+Click can open under the mouse"),
             ("Right-click", "Menu of the file, tab or code under the mouse"),
+            ("Middle-click a tab", "Close it"),
             ("Click the gutter", "Fold or unfold the block (indentation or #region)"),
             ("Mouse rest", "Documentation of the word under the mouse"),
             ("Escape", "Back to a single cursor"),
