@@ -263,7 +263,8 @@ crates/
 - [x] Import VS Code themes: "Theme: Import from VS Code..." lists the themes of the installed VS Code
       (built-in and extensions, by their labels), or Theme: Import File... takes a `.json`; UI, terminal and
       TextMate syntax colors mapped (most specific scope wins, `include`s merged, JSONC accepted), the rest
-      from Godot Dark / Light — all 9 themes installed here convert, not yet seen on screen
+      from Godot Dark / Light; "Import all" at the top of the list takes every one at once (also for the
+      Godot editor colors) — all 9 themes installed here convert, not yet seen on screen
 - [x] Import the Godot editor's colors ("Theme: Import from the Godot Editor..."): text editor highlighting
       and interface base / accent colors of `editor_settings-4.x.tres` (one per Godot version, read only) —
       the 4 versions installed here convert, not yet seen on screen

@@ -136,8 +136,10 @@ pub enum Message {
     ChooseVsCodeTheme,
     /// List the Godot editor settings found here, to import their colors.
     ChooseGodotEditorTheme,
-    /// Import this VS Code theme file.
+    /// Import this theme file (and switch to it).
     ImportThemeFile(PathBuf),
+    /// Import all these theme files, keeping the current theme.
+    ImportThemeFiles(Vec<PathBuf>),
     /// The OS is (or went) dark or light.
     SystemTheme(iced::theme::Mode),
     /// Turn following the OS light/dark mode on or off.
@@ -1211,6 +1213,7 @@ impl App {
             Message::ChooseVsCodeTheme => return self.choose_vscode_theme(),
             Message::ChooseGodotEditorTheme => return self.choose_godot_editor_theme(),
             Message::ImportThemeFile(path) => self.import_theme_file(&path),
+            Message::ImportThemeFiles(paths) => self.import_theme_files(&paths),
             Message::SystemTheme(mode) => {
                 self.os_theme = match mode {
                     iced::theme::Mode::Dark => Some(theme::ThemeKind::Dark),
@@ -1776,13 +1779,17 @@ impl App {
             self.status = Some("No VS Code themes found (VS Code's extensions folder): import a theme .json file instead".to_string());
             return Task::none();
         }
-        let choices = installed
-            .into_iter()
-            .map(|found| palette::Choice {
+        let all = palette::Choice {
+            label: format!("Import all {} themes", installed.len()),
+            detail: "keeps the current theme".to_string(),
+            message: Message::ImportThemeFiles(installed.iter().map(|found| found.path.clone()).collect()),
+        };
+        let choices = std::iter::once(all)
+            .chain(installed.into_iter().map(|found| palette::Choice {
                 detail: found.path.display().to_string(),
                 message: Message::ImportThemeFile(found.path),
                 label: found.label,
-            })
+            }))
             .collect();
         let mut palette = Palette::choose("Import which VS Code theme?", choices);
         palette.refresh(&[]);
@@ -1800,16 +1807,20 @@ impl App {
             self.status = Some("No Godot editor settings found (editor_settings-4.x.tres in Godot's config folder)".to_string());
             return Task::none();
         }
-        let choices = files
-            .into_iter()
-            .map(|path| palette::Choice {
+        let all = palette::Choice {
+            label: format!("Import all {} Godot versions' colors", files.len()),
+            detail: "keeps the current theme".to_string(),
+            message: Message::ImportThemeFiles(files.clone()),
+        };
+        let choices = std::iter::once(all)
+            .chain(files.into_iter().map(|path| palette::Choice {
                 label: match theme::godot_editor::version_of(&path) {
                     Some((major, minor)) => format!("Godot {major}.{minor} editor colors"),
                     None => "Godot editor colors".to_string(),
                 },
                 detail: path.display().to_string(),
                 message: Message::ImportThemeFile(path),
-            })
+            }))
             .collect();
         let mut palette = Palette::choose("Import the colors of which Godot editor?", choices);
         palette.refresh(&[]);
@@ -1820,30 +1831,44 @@ impl App {
     }
 
     fn import_theme_file(&mut self, path: &Path) {
-        let vscode = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("jsonc"));
-        let result = if vscode {
-            theme::vscode::import(path)
-        } else if theme::godot_editor::version_of(path).is_some() {
-            theme::godot_editor::import(path)
-        } else {
-            std::fs::read_to_string(path)
-                .map_err(|e| e.to_string())
-                .and_then(|text| theme::Theme::from_toml(&text).map_err(|e| e.to_string()))
-        };
-        match result {
+        match read_theme_file(path) {
             Ok(theme) => self.install_theme(theme, &path.display().to_string()),
             Err(error) => self.status = Some(format!("Cannot import theme: {error}")),
         }
     }
 
-    /// Copies a theme into the user themes folder and switches to it.
-    fn install_theme(&mut self, mut theme: theme::Theme, source: &str) {
+    /// Imports every one of these theme files, keeping the current theme.
+    fn import_theme_files(&mut self, paths: &[PathBuf]) {
+        let mut imported = 0;
+        let mut failed = Vec::new();
+        for path in paths {
+            match read_theme_file(path).and_then(|theme| self.store_theme(theme)) {
+                Ok(_) => imported += 1,
+                Err(error) => failed.push(error),
+            }
+        }
+        let plural = if imported == 1 { "" } else { "s" };
+        self.status = Some(match failed.first() {
+            None => format!("Imported {imported} theme{plural} (pick them from the theme list)"),
+            Some(error) => format!("Imported {imported} theme{plural}; {} failed, e.g. {error}", failed.len()),
+        });
+    }
+
+    /// Adds a theme to the user themes folder (a built-in one's name gets
+    /// "(imported)") and to the list; returns its index.
+    fn store_theme(&mut self, mut theme: theme::Theme) -> Result<usize, String> {
         if self.themes.iter().zip(&self.theme_paths).any(|(t, p)| p.is_none() && t.name == theme.name) {
             theme.name = format!("{} (imported)", theme.name);
         }
-        match self.write_user_theme(&theme) {
-            Ok(path) => {
-                let index = self.add_theme(theme.clone(), path);
+        let path = self.write_user_theme(&theme)?;
+        Ok(self.add_theme(theme, path))
+    }
+
+    /// Copies a theme into the user themes folder and switches to it.
+    fn install_theme(&mut self, theme: theme::Theme, source: &str) {
+        match self.store_theme(theme) {
+            Ok(index) => {
+                let theme = self.themes[index].clone();
                 self.theme_index = index;
                 if let Some(editor) = &mut self.theme_editor {
                     editor.reset(theme.clone(), index, false);
@@ -5572,6 +5597,20 @@ fn command_message(id: &str) -> Option<Message> {
         "edit.format" => Message::Edit(EditorEvent::FormatDocument),
         _ => return None,
     })
+}
+
+/// A theme from a file: a VS Code theme (`.json`), Godot's editor settings
+/// (`editor_settings-4.x.tres`) or one of ours (`.toml`).
+fn read_theme_file(path: &Path) -> Result<theme::Theme, String> {
+    let vscode = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json") || e.eq_ignore_ascii_case("jsonc"));
+    if vscode {
+        theme::vscode::import(path)
+    } else if theme::godot_editor::version_of(path).is_some() {
+        theme::godot_editor::import(path)
+    } else {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        theme::Theme::from_toml(&text).map_err(|e| e.to_string())
+    }
 }
 
 /// Shows a file (selected) or folder in the system file manager.
