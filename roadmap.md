@@ -227,7 +227,11 @@ crates/
 - [x] Drag a file from the explorer into code: `preload("res://…")` at the drop caret, the bare path
       inside a string or outside GDScript, Ctrl+drop gives `const BIG_ENEMY = preload(…)` (as in Godot);
       either side of the split — unit-tested, not yet seen on screen
-- [ ] Script templates / "New Script" dialog
+- [x] New Script bar (right-click a folder or file, or "File: New Script..."): `res://` path with the
+      name selected, extends, template (Godot's Default and Empty, plus the project's
+      `script_templates/<Base>/` and `Object/` ones with `# meta-name/default/space-indent` and
+      `_BASE_` / `_CLASS_` / `_CLASS_SNAKE_CASE_` / `_TS_`); creates missing folders, opens the file —
+      unit-tested, not yet seen on screen
 - [ ] Godot version picker (choose among installed versions per project)
 
 **Debug**

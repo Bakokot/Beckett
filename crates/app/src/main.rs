@@ -12,6 +12,7 @@ mod find;
 mod format;
 mod keymap;
 mod lsp;
+mod new_script;
 mod numpad;
 mod on_escape;
 mod outline;
@@ -61,6 +62,7 @@ use palette::{CommandEntry, Palette, PaletteMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
 use project_panel::ProjectInfo;
+use new_script::{NewScript, NewScriptMessage};
 use rename::{Rename, RenameMessage};
 use class_ref::{ClassRef, ClassRefMessage};
 use shortcuts::{Shortcuts, ShortcutsMessage};
@@ -195,6 +197,10 @@ pub enum Message {
     CopyText(String),
     /// A file is being dragged from the explorer (`None`: the drag ended).
     FileDrag(Option<PathBuf>),
+    /// Open the New Script bar for this folder (a file: its folder; `None`:
+    /// the active file's folder).
+    OpenNewScript(Option<PathBuf>),
+    NewScript(NewScriptMessage),
     /// Show a file or folder in the system file manager.
     Reveal(PathBuf),
     /// Close every tab but this file (`None`: but the class reference).
@@ -363,6 +369,8 @@ struct App {
     context_menu: Option<context_menu::Menu<Message>>,
     /// File being dragged from the explorer, droppable into code.
     file_drag: Option<PathBuf>,
+    /// The New Script bar, and why its last submit failed.
+    new_script: Option<(NewScript, Option<String>)>,
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
@@ -490,6 +498,7 @@ impl App {
             window_width: WINDOW_SIZE.0,
             context_menu: None,
             file_drag: None,
+            new_script: None,
             run: RunState::default(),
             find: None,
             rename: None,
@@ -1039,6 +1048,8 @@ impl App {
                 return iced::clipboard::write(text);
             }
             Message::FileDrag(path) => self.file_drag = path,
+            Message::OpenNewScript(path) => return self.open_new_script(path),
+            Message::NewScript(message) => self.on_new_script(message),
             Message::Reveal(path) => {
                 if let Err(error) = reveal_in_file_manager(&path) {
                     self.status = Some(format!("Cannot show {}: {error}", path.display()));
@@ -1528,6 +1539,7 @@ impl App {
             ("View: Outline", "", Message::ShowSidebar(SidebarView::Outline)),
             ("View: Files", "", Message::ShowSidebar(SidebarView::Files)),
             ("View: Project (Autoloads, Input Map)", "", Message::ShowSidebar(SidebarView::Project)),
+            ("File: New Script...", "", Message::OpenNewScript(None)),
             ("Go to Definition", "go.definition", Message::GotoDefinition),
             ("Find All References", "go.references", Message::FindReferences),
             ("Rename Symbol", "refactor.rename", Message::StartRename),
@@ -2850,6 +2862,75 @@ impl App {
         }
     }
 
+    /// Opens the New Script bar for `path`'s folder (or the active file's,
+    /// or the project root), with the file name selected.
+    fn open_new_script(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        let Some(godot) = self.project.as_ref().and_then(|p| p.godot.as_ref()) else {
+            self.status = Some("New scripts need a Godot project (project.godot)".to_string());
+            return Task::none();
+        };
+        let folder = path
+            .or_else(|| self.active_tab().map(|t| t.path.clone()))
+            .map(|p| if p.is_dir() { p } else { p.parent().map(Path::to_path_buf).unwrap_or(p) })
+            .and_then(|dir| godot.to_res_path(&dir))
+            .unwrap_or_else(|| "res://".to_string());
+        let script = NewScript::new(godot, &folder);
+        let end = script.path.chars().count() - ".gd".len();
+        let start = end - new_script::DEFAULT_NAME.len();
+        self.new_script = Some((script, None));
+        self.focus = Focus::Input;
+        Task::batch([
+            iced::widget::operation::focus(new_script::PATH_INPUT),
+            iced::widget::operation::select_range(new_script::PATH_INPUT, start, end),
+        ])
+    }
+
+    fn on_new_script(&mut self, message: NewScriptMessage) {
+        let Some((script, error)) = &mut self.new_script else {
+            return;
+        };
+        match message {
+            NewScriptMessage::Close => {
+                self.new_script = None;
+                self.focus = Focus::Editor;
+            }
+            NewScriptMessage::Submit => {
+                let Some(project) = &mut self.project else {
+                    return;
+                };
+                let Some(godot) = &project.godot else {
+                    return;
+                };
+                let (target, text) = match script.validate(godot) {
+                    Ok(created) => created,
+                    Err(message) => {
+                        *error = Some(message);
+                        return;
+                    }
+                };
+                let written = target
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&target, text));
+                if let Err(e) = written {
+                    *error = Some(format!("Cannot write the file: {e}"));
+                    return;
+                }
+                self.status = Some(format!("Created {}", script.path.trim()));
+                if let Some(dir) = target.parent() {
+                    project.explorer.refresh(dir);
+                }
+                self.new_script = None;
+                self.focus = Focus::Editor;
+                self.open_file(target);
+            }
+            other => {
+                script.update(other);
+                *error = None;
+            }
+        }
+    }
+
     /// Inserts a file dragged from the explorer where it was dropped in the
     /// active tab: `preload("res://…")`, or the bare path in a string.
     fn drop_file(&mut self, path: &Path, pos: Pos, ctrl: bool) {
@@ -3344,11 +3425,18 @@ impl App {
                     Entry::item("Open", pick(Message::OpenFile(path.clone()))),
                     Entry::with_shortcut("Open to the Side", "split view", Some(pick(Message::OpenToSide(path.clone())))),
                     Entry::Separator,
+                    Entry::item("New Script Here...", pick(Message::OpenNewScript(Some(path.clone())))),
+                    Entry::Separator,
                 ];
                 entries.extend(paths(path));
                 entries
             }
-            ContextTarget::Folder(path) => paths(path),
+            ContextTarget::Folder(path) => {
+                let mut entries =
+                    vec![Entry::item("New Script...", pick(Message::OpenNewScript(Some(path.clone())))), Entry::Separator];
+                entries.extend(paths(path));
+                entries
+            }
             ContextTarget::Tab(index) => {
                 let Some(tab) = self.tabs.get(*index) else {
                     return Vec::new();
@@ -3657,7 +3745,12 @@ impl App {
             None if self.theme_editor.is_some() || self.shortcuts.is_some() => self.editor_area(),
             None => self.welcome(),
             Some(project) => {
-                let mut main = column![self.editor_area()];
+                let mut main = column![];
+                if let Some((script, error)) = &self.new_script {
+                    let bar = script.view(&self.current_theme().ui, error.as_deref()).map(Message::NewScript);
+                    main = main.push(on_escape::on_escape(bar, Message::NewScript(NewScriptMessage::Close)));
+                }
+                main = main.push(self.editor_area());
                 if let Some(panel) = self.panel {
                     let ui = &self.current_theme().ui;
                     let (line, active) = (style::to_color(ui.border), style::to_color(ui.accent));
