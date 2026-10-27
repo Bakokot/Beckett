@@ -3126,6 +3126,10 @@ impl App {
         let Some((client, tab, _)) = self.lsp_target() else {
             return;
         };
+        // No docs for words in comments and strings.
+        if paths::in_prose(&tab.buffer, tab.buffer.pos_to_char(pos)) {
+            return;
+        }
         if let Ok(id) = client.hover(&tab.path, to_lsp(pos)) {
             self.pending.insert(id, Pending::Hover(pos));
         }
@@ -3939,7 +3943,8 @@ impl App {
             return;
         }
         let (start, end) = tab.buffer.word_range(index);
-        let is_word = tab.buffer.slice(start, end).starts_with(|c: char| c.is_alphabetic() || c == '_');
+        let is_word = tab.buffer.slice(start, end).starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && !paths::in_prose(&tab.buffer, index);
         let Some((client, tab, _)) = self.lsp_target().filter(|_| is_word) else {
             return;
         };

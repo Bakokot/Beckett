@@ -63,6 +63,19 @@ pub fn string_at(buffer: &Buffer, index: usize) -> Option<StringAt> {
     })
 }
 
+/// Whether the char at `index` is in a comment or a plain string: prose,
+/// where a word like `a` isn't a symbol (the language server would still
+/// match it to some engine member). StringNames and NodePaths count as code.
+pub fn in_prose(buffer: &Buffer, index: usize) -> bool {
+    let pos = buffer.char_to_pos(index);
+    let line = buffer.line_text(pos.line);
+    let byte = line.char_indices().nth(pos.column).map_or(line.len(), |(b, _)| b);
+    buffer
+        .tokens(pos.line)
+        .iter()
+        .any(|t| matches!(t.kind, TokenKind::Comment | TokenKind::String) && t.range.start <= byte && byte < t.range.end)
+}
+
 /// The `res://` or `uid://` path in the string under `index`, without a
 /// `::sub_resource` suffix.
 pub fn link_at(buffer: &Buffer, index: usize) -> Option<String> {
@@ -176,6 +189,21 @@ mod tests {
         // Comments and node paths are not strings.
         let (b, i) = at("# \"res://|a.gd\"\n");
         assert_eq!(string_at(&b, i), None);
+    }
+
+    #[test]
+    fn comments_and_strings_are_prose() {
+        let (b, i) = at("var x = 1 # a lo|ng note\n");
+        assert!(in_prose(&b, i));
+        let (b, i) = at("print(\"a wo|rd\")\n");
+        assert!(in_prose(&b, i));
+        let (b, i) = at("var a: Vec|tor2\n");
+        assert!(!in_prose(&b, i));
+        let (b, i) = at("get_node(^\"Pla|yer\")\n");
+        assert!(!in_prose(&b, i));
+        // The code before a comment on the same line is still code.
+        let (b, i) = at("var spe|ed = 2 # fast\n");
+        assert!(!in_prose(&b, i));
     }
 
     #[test]
