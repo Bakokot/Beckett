@@ -22,8 +22,56 @@ pub struct LineChange {
 /// than diffed (time and memory grow with the square of it).
 const MAX_EDITS: usize = 1000;
 
+/// Lines `old` of the old text became lines `new` of the new one
+/// (zero-based; one of them may be empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub old: Range<usize>,
+    pub new: Range<usize>,
+}
+
+impl Hunk {
+    /// How the gutter shows it.
+    pub fn change(&self) -> LineChange {
+        let kind = match (self.old.is_empty(), self.new.is_empty()) {
+            (true, _) => ChangeKind::Added,
+            (false, true) => ChangeKind::Deleted,
+            (false, false) => ChangeKind::Modified,
+        };
+        LineChange { kind, lines: self.new.clone() }
+    }
+}
+
+/// The edit of `new` that puts back what `hunk` changed: a char range of
+/// `new` and the old lines to put there.
+pub fn revert(old: &str, new: &str, hunk: &Hunk) -> (Range<usize>, String) {
+    let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
+    let char_at = |line: usize| -> usize { new_lines[..line.min(new_lines.len())].iter().map(|l| l.chars().count()).sum() };
+    let (mut start, end) = (char_at(hunk.new.start), char_at(hunk.new.end));
+    let mut text: String = old_lines[hunk.old.start.min(old_lines.len())..hunk.old.end.min(old_lines.len())].concat();
+    let total = new.chars().count();
+    // Final newlines: lines put back after a last line without one need it
+    // before them; an old last line without one needs it before what follows;
+    // lines removed up to the end take the newline the old end didn't have.
+    let old_ends_bare = !old.is_empty() && !old.ends_with('\n') && hunk.old.end >= old_lines.len();
+    if end == total && text.is_empty() && old_ends_bare && start > 0 {
+        start -= 1;
+    } else if start == total && !new.is_empty() && !new.ends_with('\n') && !text.is_empty() {
+        text = format!("\n{}", text.strip_suffix('\n').unwrap_or(&text));
+    } else if end < total && !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    (start..end, text)
+}
+
 /// The changed lines of `new` compared with `old`.
 pub fn line_changes(old: &str, new: &str) -> Vec<LineChange> {
+    hunks(old, new).iter().map(Hunk::change).collect()
+}
+
+/// The runs of lines that differ between `old` and `new`, in order.
+pub fn hunks(old: &str, new: &str) -> Vec<Hunk> {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
     // Common ends are skipped first: most edits are local.
@@ -31,30 +79,25 @@ pub fn line_changes(old: &str, new: &str) -> Vec<LineChange> {
     let suffix = a[prefix..].iter().rev().zip(b[prefix..].iter().rev()).take_while(|(x, y)| x == y).count();
     let (a_mid, b_mid) = (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix]);
 
-    let mut changes = Vec::new();
+    let mut hunks = Vec::new();
+    let mut push = |old: Range<usize>, new: Range<usize>| {
+        if !old.is_empty() || !new.is_empty() {
+            hunks.push(Hunk { old: prefix + old.start..prefix + old.end, new: prefix + new.start..prefix + new.end });
+        }
+    };
     match matches(a_mid, b_mid) {
         Some(pairs) => {
             // Between two matched lines (and at the ends): what was removed
             // from `a` and added in `b`.
             let (mut i, mut j) = (0, 0);
             for (x, y) in pairs.into_iter().chain([(a_mid.len(), b_mid.len())]) {
-                push_hunk(&mut changes, x - i, prefix + j..prefix + y);
+                push(i..x, j..y);
                 (i, j) = (x + 1, y + 1);
             }
         }
-        None => push_hunk(&mut changes, a_mid.len(), prefix..prefix + b_mid.len()),
+        None => push(0..a_mid.len(), 0..b_mid.len()),
     }
-    changes
-}
-
-fn push_hunk(changes: &mut Vec<LineChange>, removed: usize, added: Range<usize>) {
-    let kind = match (removed, added.is_empty()) {
-        (0, true) => return,
-        (0, false) => ChangeKind::Added,
-        (_, true) => ChangeKind::Deleted,
-        (_, false) => ChangeKind::Modified,
-    };
-    changes.push(LineChange { kind, lines: added });
+    hunks
 }
 
 /// Index pairs of the lines common to `a` and `b` (a longest common
@@ -159,6 +202,46 @@ mod tests {
         // Everything different: past the limit, one modified block.
         let other: String = (0..3000).map(|i| format!("other {i}\n")).collect();
         assert_eq!(line_changes(&old[..30_000], &other), [change(ChangeKind::Modified, 0..3000)]);
+    }
+
+    #[test]
+    fn hunks_keep_both_sides() {
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n";
+        let new = "1\nTWO\n3\n4\n5\nnew\n6\n7\n";
+        assert_eq!(
+            hunks(old, new),
+            [Hunk { old: 1..2, new: 1..2 }, Hunk { old: 5..5, new: 5..6 }, Hunk { old: 7..8, new: 8..8 }]
+        );
+    }
+
+    /// Applies every revert, last first, and checks `old` comes back.
+    fn revert_all(old: &str, new: &str) -> String {
+        let mut text = new.to_string();
+        for hunk in hunks(old, new).iter().rev() {
+            let (range, replacement) = revert(old, &text, hunk);
+            let start = text.char_indices().nth(range.start).map_or(text.len(), |(b, _)| b);
+            let end = text.char_indices().nth(range.end).map_or(text.len(), |(b, _)| b);
+            text.replace_range(start..end, &replacement);
+        }
+        text
+    }
+
+    #[test]
+    fn reverting_every_hunk_gives_back_the_old_text() {
+        let cases = [
+            ("1\n2\n3\n4\n5\n6\n7\n8\n", "1\nTWO\n3\n4\n5\nnew\n6\n7\n"),
+            ("a\nb\nc\n", "a\nc\n"),
+            ("a\nb\n", "x\na\nb\n"),
+            ("a\nb\nc", "a\nb"),
+            ("a\nb", "a\nb\nc"),
+            ("a\nlast", "a\nchanged\nmore\n"),
+            ("é\nü\n", "é\nß\nü\n"),
+            ("", "new\n"),
+            ("old\n", ""),
+        ];
+        for (old, new) in cases {
+            assert_eq!(revert_all(old, new), old, "{new:?} back to {old:?}");
+        }
     }
 
     #[test]

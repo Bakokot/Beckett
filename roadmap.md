@@ -267,7 +267,11 @@ crates/
       success / accent / danger), live while typing; explorer names colored (changed, new, conflict, and
       folders holding changes). Refreshed after saves, file changes, window focus and every 30 s — through
       the `git` command (no git or no repository: nothing shown); unit-tested on this repo, not yet seen on screen
-- [ ] Diff view
+- [x] Diff view: CHANGES tab in the bottom panel (palette "Git: Show Changes", or click a gutter marker for
+      that file): every changed file with its hunks against the staged text (removed lines red, added
+      green, 3 lines of context, unsaved edits of open tabs included), click a line to jump there, "revert"
+      puts the staged lines back in the tab as one undo step (left unsaved) — revert unit-tested on the
+      end-of-file newline cases, panel not yet seen on screen
 - [ ] Godot-aware `.gitignore` generator
 
 ## Phase 3 — Godot editor replacement

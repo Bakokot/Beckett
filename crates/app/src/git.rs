@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use editor_core::diff::{self, Hunk};
+
 /// How a file differs from the last commit, as the explorer shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
@@ -18,14 +20,22 @@ pub enum FileStatus {
 /// The statuses of a repository's changed files.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
-    files: HashMap<PathBuf, FileStatus>,
+    /// By normalized path: the path as git gave it, and its status.
+    files: HashMap<PathBuf, (PathBuf, FileStatus)>,
     /// Folders holding at least one changed file.
     folders: HashSet<PathBuf>,
 }
 
 impl Status {
     pub fn file(&self, path: &Path) -> Option<FileStatus> {
-        self.files.get(&normalize(path)).copied()
+        self.files.get(&normalize(path)).map(|(_, status)| *status)
+    }
+
+    /// Every changed file, sorted by path.
+    pub fn changed(&self) -> Vec<(PathBuf, FileStatus)> {
+        let mut files: Vec<_> = self.files.values().cloned().collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
     }
 
     pub fn folder_changed(&self, path: &Path) -> bool {
@@ -60,7 +70,8 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     let out = git(dir, &["rev-parse", "--show-toplevel"])?;
     let root = String::from_utf8(out).ok()?;
-    Some(PathBuf::from(root.trim()))
+    // git prints `C:/…`: rebuilt with the native separators.
+    Some(Path::new(root.trim()).components().collect())
 }
 
 /// The text of `path` as staged (the index), which the working file is
@@ -82,6 +93,59 @@ fn strip_prefix_ignoring_case<'a>(path: &'a Path, prefix: &Path) -> Option<&'a P
     let mut components = path.components();
     let head: PathBuf = components.by_ref().take(prefix_len).collect();
     (normalize(&head) == normalize(prefix)).then(|| components.as_path())
+}
+
+/// A changed file as the CHANGES panel shows it.
+#[derive(Debug, Clone)]
+pub struct ChangedFile {
+    pub path: PathBuf,
+    pub status: FileStatus,
+    /// The staged text (`None`: new file).
+    pub base: Option<String>,
+    /// The text on disk and its hunks; `None` for files open in a tab,
+    /// whose current text is the tab's.
+    pub current: Option<(String, Vec<Hunk>)>,
+}
+
+/// What a refresh reads: the status, the staged text of the open files,
+/// and the changed files.
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub status: Status,
+    pub bases: Vec<(PathBuf, Option<String>)>,
+    pub files: Vec<ChangedFile>,
+}
+
+/// Files past this size aren't diffed in the CHANGES panel.
+const MAX_DIFF_BYTES: u64 = 2_000_000;
+/// Nor more than this many files.
+const MAX_CHANGED_FILES: usize = 200;
+
+/// Reads everything the gutter, explorer and CHANGES panel show; `open`
+/// are the files open in tabs. `None` when git can't be asked.
+pub fn snapshot(repo: &Path, open: &[PathBuf]) -> Option<Snapshot> {
+    let status = status(repo)?;
+    let is_open = |path: &Path| open.iter().any(|o| normalize(o) == normalize(path));
+    let bases = open.iter().map(|p| (p.clone(), staged_text(repo, p))).collect();
+    let files = status
+        .changed()
+        .into_iter()
+        .take(MAX_CHANGED_FILES)
+        .map(|(path, status)| {
+            let base = staged_text(repo, &path);
+            let small = std::fs::metadata(&path).is_ok_and(|m| m.len() <= MAX_DIFF_BYTES);
+            let current = (!is_open(&path) && small)
+                .then(|| std::fs::read_to_string(&path).ok())
+                .flatten()
+                .map(|text| text.trim_start_matches('\u{feff}').replace("\r\n", "\n"))
+                .map(|text| {
+                    let hunks = diff::hunks(base.as_deref().unwrap_or(""), &text);
+                    (text, hunks)
+                });
+            ChangedFile { path, status, base, current }
+        })
+        .collect();
+    Some(Snapshot { status, bases, files })
 }
 
 pub fn status(repo: &Path) -> Option<Status> {
@@ -107,7 +171,7 @@ fn parse_status(repo: &Path, out: &[u8]) -> Status {
             (_, b'D') | (b'D', _) => continue,
             _ => FileStatus::Modified,
         };
-        let full = repo.join(path.as_ref());
+        let full: PathBuf = repo.join(path.as_ref()).components().collect();
         let mut folder = full.parent();
         while let Some(dir) = folder.filter(|d| d.starts_with(repo)) {
             if !status.folders.insert(normalize(dir)) {
@@ -115,7 +179,7 @@ fn parse_status(repo: &Path, out: &[u8]) -> Status {
             }
             folder = dir.parent();
         }
-        status.files.insert(normalize(&full), kind);
+        status.files.insert(normalize(&full), (full, kind));
     }
     status
 }
@@ -136,6 +200,15 @@ mod tests {
         assert!(staged.contains("[package]") && !staged.contains('\r'));
         assert_eq!(staged_text(&repo, &crate_dir.join("no-such-file.gd")), None);
         assert!(status(&repo).is_some());
+
+        // Changed files (if any right now) are real paths, with their text.
+        let snapshot = snapshot(&repo, &[]).unwrap();
+        for file in snapshot.files.iter().filter(|f| f.status == FileStatus::Modified) {
+            assert!(file.path.is_file(), "{}", file.path.display());
+            assert!(!file.path.to_string_lossy().contains('/') || !cfg!(windows));
+            // Changes that are all staged have no hunks against the index.
+            assert!(file.base.is_some() && file.current.is_some(), "{}", file.path.display());
+        }
     }
 
     #[test]
@@ -151,6 +224,9 @@ mod tests {
         assert_eq!(s.file(Path::new("/r/conflict.tscn")), Some(FileStatus::Conflicted));
         assert!(s.folder_changed(Path::new("/r/player")) && s.folder_changed(Path::new("/r/added")));
         assert!(!s.folder_changed(Path::new("/r/other")));
+        let names: Vec<PathBuf> = s.changed().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(names.len(), 5);
+        assert!(names.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[cfg(windows)]

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod changes;
 mod class_ref;
 mod code_editor;
 mod completion;
@@ -37,13 +38,14 @@ mod terminal_view;
 mod theme_editor;
 mod watcher;
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use editor_core::diff::{self, LineChange};
+use editor_core::diff::{self, Hunk, LineChange};
 use editor_core::{snippet, Buffer, Command, Language, Pos};
 use godot_project::GodotProject;
 use iced::widget::{
@@ -97,9 +99,15 @@ pub enum Message {
     /// Periodic session save, so a crash loses little.
     AutosaveSession,
     /// Git status of this repository, and the staged text of open files.
-    GitRefreshed(PathBuf, Option<git::Status>, Vec<(PathBuf, Option<String>)>),
+    GitRefreshed(PathBuf, Option<Box<git::Snapshot>>),
     /// The window came to the front (git may have changed meanwhile).
     WindowFocused,
+    /// Read the git status again now.
+    RefreshGit,
+    /// Open the CHANGES panel (at this file only, when given).
+    ShowChanges(Option<PathBuf>),
+    /// Put back the staged lines of this hunk, in the file's tab.
+    RevertHunk(PathBuf, Hunk),
     /// The window is closing: save the session, then close.
     CloseRequested(iced::window::Id),
     FolderPicked(Option<PathBuf>),
@@ -266,6 +274,8 @@ pub enum Panel {
     Output,
     Terminal,
     Search,
+    /// Files changed since the staged text, with their hunks.
+    Changes,
 }
 
 #[derive(Default)]
@@ -387,6 +397,8 @@ struct App {
     /// The new folder / rename / delete bar.
     file_op: Option<FileOpBar>,
     git_refresh: GitRefresh,
+    /// The CHANGES panel shows only this file.
+    changes_focus: Option<PathBuf>,
     /// Open tab of the bottom panel, if it is shown.
     panel: Option<Panel>,
     run: RunState,
@@ -442,6 +454,8 @@ struct Project {
     /// The git repository holding the project, if any.
     repo: Option<PathBuf>,
     git_status: git::Status,
+    /// Changed files of the repository, for the CHANGES panel.
+    git_files: Vec<git::ChangedFile>,
     explorer: Explorer,
 }
 
@@ -478,8 +492,15 @@ struct GitMarks {
     base: Option<String>,
     /// Bumped when `base` changes.
     base_id: u64,
-    /// (buffer version, base id) the changes were computed for.
-    cache: RefCell<Option<(u64, u64, Rc<Vec<LineChange>>)>>,
+    /// (buffer version, base id) the diff was computed for, its hunks and
+    /// their gutter markers.
+    cache: RefCell<Option<GitDiff>>,
+}
+
+struct GitDiff {
+    key: (u64, u64),
+    hunks: Rc<Vec<Hunk>>,
+    changes: Rc<Vec<LineChange>>,
 }
 
 impl GitMarks {
@@ -491,18 +512,28 @@ impl GitMarks {
     }
 
     fn changes(&self, buffer: &Buffer) -> Rc<Vec<LineChange>> {
+        self.diff(buffer, |d| Rc::clone(&d.changes))
+    }
+
+    fn hunks(&self, buffer: &Buffer) -> Rc<Vec<Hunk>> {
+        self.diff(buffer, |d| Rc::clone(&d.hunks))
+    }
+
+    /// Reads the diff of the buffer's current version, computing it if needed.
+    fn diff<T: Default>(&self, buffer: &Buffer, read: impl Fn(&GitDiff) -> T) -> T {
         let Some(base) = &self.base else {
-            return Rc::default();
+            return T::default();
         };
         let key = (buffer.version(), self.base_id);
-        if let Some((version, base_id, changes)) = &*self.cache.borrow() {
-            if (*version, *base_id) == key {
-                return Rc::clone(changes);
-            }
+        if let Some(diff) = self.cache.borrow().as_ref().filter(|d| d.key == key) {
+            return read(diff);
         }
-        let changes = Rc::new(diff::line_changes(base, &buffer.text()));
-        *self.cache.borrow_mut() = Some((key.0, key.1, Rc::clone(&changes)));
-        changes
+        let hunks = diff::hunks(base, &buffer.text());
+        let changes = hunks.iter().map(Hunk::change).collect();
+        let diff = GitDiff { key, hunks: Rc::new(hunks), changes: Rc::new(changes) };
+        let value = read(&diff);
+        *self.cache.borrow_mut() = Some(diff);
+        value
     }
 }
 
@@ -566,6 +597,7 @@ impl App {
             new_script: None,
             file_op: None,
             git_refresh: GitRefresh::default(),
+            changes_focus: None,
             run: RunState::default(),
             find: None,
             rename: None,
@@ -733,28 +765,26 @@ impl App {
         refresh.wanted = false;
         let repo = self.project.as_ref()?.repo.clone()?;
         refresh.running = true;
-        let paths: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
+        let open: Vec<PathBuf> = self.tabs.iter().map(|t| t.path.clone()).collect();
         let task = Task::perform(
             {
                 let repo = repo.clone();
-                async move {
-                    let status = git::status(&repo);
-                    let bases = paths.into_iter().map(|p| (git::staged_text(&repo, &p), p)).map(|(b, p)| (p, b)).collect();
-                    (status, bases)
-                }
+                async move { git::snapshot(&repo, &open).map(Box::new) }
             },
-            move |(status, bases)| Message::GitRefreshed(repo.clone(), status, bases),
+            move |snapshot| Message::GitRefreshed(repo.clone(), snapshot),
         );
         Some(task)
     }
 
-    fn on_git_refreshed(&mut self, repo: PathBuf, status: Option<git::Status>, bases: Vec<(PathBuf, Option<String>)>) {
+    fn on_git_refreshed(&mut self, repo: PathBuf, snapshot: Option<Box<git::Snapshot>>) {
         self.git_refresh.running = false;
         let Some(project) = self.project.as_mut().filter(|p| p.repo.as_ref() == Some(&repo)) else {
             return;
         };
-        project.git_status = status.unwrap_or_default();
-        for (path, base) in bases {
+        let snapshot = snapshot.map(|s| *s).unwrap_or_default();
+        project.git_status = snapshot.status;
+        project.git_files = snapshot.files;
+        for (path, base) in snapshot.bases {
             for tab in self.tabs.iter_mut().filter(|t| t.path == path) {
                 tab.git.set_base(base.clone());
             }
@@ -921,8 +951,14 @@ impl App {
             Message::FolderPicked(Some(path)) => self.open_path(path),
             Message::FolderPicked(None) => {}
             Message::CloseFolder => self.close_folder(),
-            Message::GitRefreshed(repo, status, bases) => self.on_git_refreshed(repo, status, bases),
-            Message::WindowFocused => self.git_refresh.wanted = true,
+            Message::GitRefreshed(repo, snapshot) => self.on_git_refreshed(repo, snapshot),
+            Message::WindowFocused | Message::RefreshGit => self.git_refresh.wanted = true,
+            Message::ShowChanges(path) => {
+                self.changes_focus = path;
+                self.git_refresh.wanted = true;
+                self.show_panel(Panel::Changes);
+            }
+            Message::RevertHunk(path, hunk) => self.revert_hunk(&path, &hunk),
             Message::AutosaveSession => {
                 // Also catches commits made in the terminal.
                 self.git_refresh.wanted = true;
@@ -1264,7 +1300,7 @@ impl App {
         self.focus = match panel {
             Panel::Terminal => Focus::Terminal,
             Panel::Search => Focus::Input,
-            Panel::Problems | Panel::Output => Focus::Editor,
+            Panel::Problems | Panel::Output | Panel::Changes => Focus::Editor,
         };
         self.dismiss_popups();
     }
@@ -1655,6 +1691,8 @@ impl App {
             ("View: Files", "", Message::ShowSidebar(SidebarView::Files)),
             ("View: Project (Autoloads, Input Map)", "", Message::ShowSidebar(SidebarView::Project)),
             ("File: New Script...", "", Message::OpenNewScript(None)),
+            ("Git: Show Changes", "", Message::ShowChanges(None)),
+            ("Git: Show Changes in This File", "", Message::ShowChanges(self.active_tab().map(|t| t.path.clone()))),
             ("Go to Definition", "go.definition", Message::GotoDefinition),
             ("Find All References", "go.references", Message::FindReferences),
             ("Rename Symbol", "refactor.rename", Message::StartRename),
@@ -2232,6 +2270,10 @@ impl App {
                 }
             }
             EditorEvent::DropFile { path, pos, ctrl } => self.drop_file(&path, pos, ctrl),
+            EditorEvent::GitMarker => {
+                let path = self.active_tab().map(|t| t.path.clone());
+                return self.update(Message::ShowChanges(path));
+            }
             EditorEvent::Hover(pos) => self.request_hover(pos),
             EditorEvent::HoverEnd => self.hover = None,
             EditorEvent::Focused => {
@@ -3191,6 +3233,40 @@ impl App {
 
     /// Inserts a file dragged from the explorer where it was dropped in the
     /// active tab: `preload("res://…")`, or the bare path in a string.
+    /// Puts back the staged lines of `hunk` in `path`'s tab (opening it),
+    /// as one undo step, left unsaved.
+    fn revert_hunk(&mut self, path: &Path, hunk: &Hunk) {
+        let found = |tabs: &[Tab]| tabs.iter().position(|t| uri::same_path(&t.path, path));
+        if found(&self.tabs).is_none() && !self.open_file(path.to_path_buf()) {
+            return;
+        }
+        let Some(index) = found(&self.tabs) else {
+            return;
+        };
+        self.focus_tab(index);
+        // A tab just opened gets its staged text with the next refresh; the
+        // last refresh already read it.
+        if self.tabs[index].git.base.is_none() {
+            let base = self.project.as_ref().and_then(|p| p.git_files.iter().find(|f| uri::same_path(&f.path, path)));
+            if let Some(base) = base.and_then(|f| f.base.clone()) {
+                self.tabs[index].git.set_base(Some(base));
+            }
+        }
+        let tab = &self.tabs[index];
+        let Some(base) = tab.git.base.as_deref() else {
+            self.status = Some(format!("{} has no staged version to go back to", tab.title()));
+            return;
+        };
+        // The text may have changed since the panel was drawn.
+        if !tab.git.hunks(&tab.buffer).contains(hunk) {
+            self.status = Some("That change moved meanwhile; try again from the CHANGES panel".to_string());
+            return;
+        }
+        let (range, text) = diff::revert(base, &tab.buffer.text(), hunk);
+        self.apply_command(Command::Replace(vec![(range.start, range.end, text)]));
+        self.status = Some(format!("Reverted a change in {} (unsaved; Ctrl+Z undoes it)", self.tabs[index].title()));
+    }
+
     fn drop_file(&mut self, path: &Path, pos: Pos, ctrl: bool) {
         self.file_drag = None;
         let Some(res_path) = self.project.as_ref().and_then(|p| p.godot.as_ref()).and_then(|g| g.to_res_path(path)) else {
@@ -3465,6 +3541,7 @@ impl App {
             info: ProjectInfo::read(godot.as_ref()),
             repo: git::repo_root(&root),
             git_status: git::Status::default(),
+            git_files: Vec::new(),
             root,
             godot,
         });
@@ -3808,7 +3885,7 @@ impl App {
     /// unsaved edits restored from the session).
     fn add_tab(&mut self, path: PathBuf, text: &str, dirty: bool) {
         let language = Language::from_path(&path);
-        let tab = Tab {
+        let mut tab = Tab {
             language,
             buffer: Buffer::new(text, language),
             path,
@@ -3819,6 +3896,10 @@ impl App {
             group: self.focused_group,
             git: GitMarks::default(),
         };
+        // The staged text from the last refresh shows the markers at once.
+        if let Some(file) = self.project.as_ref().and_then(|p| p.git_files.iter().find(|f| uri::same_path(&f.path, &tab.path))) {
+            tab.git.set_base(file.base.clone());
+        }
         self.git_refresh.wanted = true;
         if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
             let _ = client.did_open(&tab.path, tab.version, &tab.buffer.text());
@@ -4317,6 +4398,10 @@ impl App {
             (Panel::Output, if self.is_running() { "OUTPUT (running)".to_string() } else { "OUTPUT".to_string() }),
             (Panel::Terminal, "TERMINAL".to_string()),
             (Panel::Search, "SEARCH".to_string()),
+            (Panel::Changes, match self.project.as_ref().map_or(0, |p| p.git_files.len()) {
+                0 => "CHANGES".to_string(),
+                n => format!("CHANGES  {n}"),
+            }),
         ]
         .into_iter()
         .map(|(tab, label)| {
@@ -4335,6 +4420,13 @@ impl App {
             Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun, "Stop the game (F8)")),
             Panel::Output => header = header.push(action("clear", Message::ClearOutput, "Clear the output")),
             Panel::Terminal => header = header.push(action("kill", Message::KillTerminal, "End the shell; the next toggle starts a new one")),
+            Panel::Changes => {
+                if let Some(path) = &self.changes_focus {
+                    header = header.push(text(self.display_path(path)).size(12).color(muted));
+                    header = header.push(action("show all", Message::ShowChanges(None), "List every changed file"));
+                }
+                header = header.push(action("refresh", Message::RefreshGit, "Read the git status again"));
+            }
             Panel::Problems | Panel::Search => {}
         }
         header = header.push(action("x", Message::ClosePanel, "Close the panel"));
@@ -4343,6 +4435,7 @@ impl App {
             Panel::Problems => self.problems.view(ui, |p| self.display_path(p)),
             Panel::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),
             Panel::Output => self.output_view(),
+            Panel::Changes => self.changes_view(),
             Panel::Terminal => match &self.terminal.session {
                 Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
                     .font(code_editor::CodeFont::from_settings(&theme.font))
@@ -4359,6 +4452,52 @@ impl App {
             .height(self.panel_height())
             .style(style::surface(ui))
             .into()
+    }
+
+    /// The CHANGES panel: open files show their tab's text (unsaved edits
+    /// included), the others the text read on the last git refresh.
+    fn changes_view(&self) -> Element<'_, Message> {
+        let theme = self.current_theme();
+        let ui = &theme.ui;
+        let look = changes::Look {
+            text: style::to_color(theme.syntax.text),
+            muted: style::to_color(ui.text_muted),
+            added: style::to_color(ui.success),
+            removed: style::to_color(ui.danger),
+            modified: style::to_color(ui.warning),
+            conflicted: style::to_color(ui.danger),
+        };
+        let Some(project) = &self.project else {
+            return changes::view(Vec::new(), &look, ui);
+        };
+        let files = project
+            .git_files
+            .iter()
+            .filter(|f| self.changes_focus.as_ref().is_none_or(|p| uri::same_path(p, &f.path)))
+            .map(|file| {
+                let tab = self.tabs.iter().find(|t| uri::same_path(&t.path, &file.path));
+                let (new, hunks, unsaved) = match (tab, &file.current) {
+                    (Some(tab), _) => {
+                        let hunks = tab.git.hunks(&tab.buffer).to_vec();
+                        (Some(Cow::Owned(tab.buffer.text())), Cow::Owned(hunks), tab.dirty)
+                    }
+                    (None, Some((text, hunks))) => (Some(Cow::Borrowed(text.as_str())), Cow::Borrowed(hunks.as_slice()), false),
+                    (None, None) => (None, Cow::Borrowed(&[][..]), false),
+                };
+                changes::FileView {
+                    path: &file.path,
+                    label: self.display_path(&file.path),
+                    status: file.status,
+                    old: file.base.as_deref(),
+                    new,
+                    hunks,
+                    unsaved,
+                }
+            })
+            // Changes already all staged: nothing left against the index.
+            .filter(|f| !(f.status == git::FileStatus::Modified && f.new.is_some() && f.hunks.is_empty()))
+            .collect();
+        changes::view(files, &look, ui)
     }
 
     fn output_view(&self) -> Element<'_, Message> {

@@ -66,6 +66,8 @@ pub enum EditorEvent {
     /// A file dragged from the explorer was dropped at this position (with
     /// Ctrl held or not).
     DropFile { path: PathBuf, pos: Pos, ctrl: bool },
+    /// A git change marker in the gutter was clicked.
+    GitMarker,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -529,6 +531,17 @@ enum KeyAction {
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
+    /// Whether `point` (on `line`) is on a git change marker: the strip at
+    /// the gutter's right edge, beside a changed line or a removal wedge.
+    fn on_git_marker(&self, geometry: &Geometry, point: Point, line: usize) -> bool {
+        let strip = point.x >= geometry.text_area.x - geometry.char_width * 0.8 && point.x < geometry.text_area.x;
+        strip
+            && self.git_changes.iter().any(|c| match c.kind {
+                ChangeKind::Deleted => c.lines.start == line || c.lines.start == line + 1,
+                ChangeKind::Added | ChangeKind::Modified => c.lines.contains(&line),
+            })
+    }
+
     fn pos_at(&self, geometry: &Geometry, scroll: Vector, point: Point) -> Pos {
         let line = geometry.line_at_y(point.y, scroll);
         let visual = ((point.x - geometry.text_x + scroll.x) / geometry.char_width).round().max(0.0);
@@ -891,6 +904,13 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
 
                 // Fold markers in the gutter, and the "..." of a folded line.
                 let line = geometry.line_at_y(point.y, state.scroll);
+
+                // Git change markers, at the gutter's right edge.
+                if self.on_git_marker(&geometry, point, line) {
+                    self.emit(shell, EditorEvent::GitMarker);
+                    shell.capture_event();
+                    return;
+                }
                 let on_marker = self.buffer.is_folded(line)
                     && geometry.fold_marker(self.buffer, line, state.scroll).contains(point);
                 if (geometry.fold_column().contains(point) && self.buffer.fold_range_at(line).is_some()) || on_marker {
@@ -1376,6 +1396,11 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
         let geometry = Geometry::new(self.buffer, layout.bounds(), metrics);
         if self.dropping.is_some() && cursor.is_over(geometry.text_area) {
             return mouse::Interaction::Grabbing;
+        }
+        if let Some(point) = cursor.position_over(geometry.bounds) {
+            if self.on_git_marker(&geometry, point, geometry.line_at_y(point.y, state.scroll)) {
+                return mouse::Interaction::Pointer;
+            }
         }
         if let Some(popup) = &self.completion {
             let layout = self.completion_layout(popup, &geometry, state.scroll, metrics);
