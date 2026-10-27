@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::SidebarView;
+
 pub const ZOOM_STEP: f32 = 0.1;
 pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 
@@ -15,8 +17,8 @@ pub struct Settings {
     pub ui_scale: f32,
     /// Format GDScript files (gdformat, else a light tidy) when saving.
     pub format_on_save: bool,
-    /// The sidebar shows the outline instead of the files.
-    pub show_outline: bool,
+    /// What the sidebar shows: files, outline or project.
+    pub sidebar: SidebarView,
     /// Name of the theme in use, restored at startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
@@ -24,7 +26,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { ui_scale: 1.0, format_on_save: false, show_outline: false, theme: None }
+        Self { ui_scale: 1.0, format_on_save: false, sidebar: SidebarView::Files, theme: None }
     }
 }
 

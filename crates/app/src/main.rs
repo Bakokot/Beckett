@@ -17,6 +17,7 @@ mod outline;
 mod palette;
 mod paths;
 mod problems;
+mod project_panel;
 mod project_symbols;
 mod recent;
 mod rename;
@@ -50,7 +51,7 @@ use code_editor::{
     CodeEditor, CompletionAction, CompletionPopup, CompletionRow, EditorEvent, HoverPopup, Mark,
     SignaturePopup,
 };
-use completion::Completion;
+use completion::{Completion, InString};
 use docs::Doc;
 use explorer::Explorer;
 use editor_core::search::LineMatch;
@@ -58,6 +59,7 @@ use find::{FileResult, Find, FindMessage, ProjectSearch, SearchMessage};
 use palette::{CommandEntry, Palette, PaletteMessage};
 use lsp::{Lsp, LspEvent};
 use problems::Problems;
+use project_panel::ProjectInfo;
 use rename::{Rename, RenameMessage};
 use class_ref::{ClassRef, ClassRefMessage};
 use shortcuts::{Shortcuts, ShortcutsMessage};
@@ -124,6 +126,9 @@ pub enum Message {
     Terminal(TerminalEvent),
     ShowPanel(Panel),
     ShowSidebar(SidebarView),
+    /// List every use of this word in the project (whole word, case
+    /// sensitive) in the SEARCH tab.
+    SearchProject(String),
     ClosePanel,
     /// The splitter above the bottom panel moved by this many pixels.
     ResizePanel(f32),
@@ -213,10 +218,14 @@ pub enum ContextTarget {
 }
 
 /// What the sidebar shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SidebarView {
+    #[default]
     Files,
     Outline,
+    /// Main scene, autoloads and Input Map.
+    Project,
 }
 
 /// Which panel receives keyboard input.
@@ -399,6 +408,8 @@ struct App {
 struct Project {
     root: PathBuf,
     godot: Option<GodotProject>,
+    /// Autoloads and Input Map, read from `project.godot` with `godot`.
+    info: ProjectInfo,
     explorer: Explorer,
 }
 
@@ -444,7 +455,7 @@ impl App {
         let settings = settings::Settings::load();
         let theme_index = settings.theme.as_ref().and_then(|name| themes.iter().position(|t| &t.name == name)).unwrap_or(0);
         let iced_theme = style::iced_theme(&themes[theme_index]);
-        let sidebar_view = if settings.show_outline { SidebarView::Outline } else { SidebarView::Files };
+        let sidebar_view = settings.sidebar;
 
         let mut app = Self {
             project: None,
@@ -981,8 +992,20 @@ impl App {
             Message::ShowPanel(panel) => self.show_panel(panel),
             Message::ShowSidebar(view) => {
                 self.sidebar_view = view;
-                self.settings.show_outline = view == SidebarView::Outline;
+                self.settings.sidebar = view;
                 let _ = self.settings.save();
+            }
+            Message::SearchProject(word) => {
+                if self.project.is_none() {
+                    return Task::none();
+                }
+                let query = &mut self.search.query;
+                query.text = word;
+                query.case_sensitive = true;
+                query.whole_word = true;
+                query.regex = false;
+                self.show_panel(Panel::Search);
+                return self.on_search(SearchMessage::Run);
             }
             // Dragging the splitter up makes the panel taller.
             Message::ResizePanel(delta) => self.panel_height = (self.panel_height() - delta).max(MIN_PANEL_HEIGHT),
@@ -1497,6 +1520,7 @@ impl App {
             ("Go to Symbol in Project", "go.projectSymbol", Message::OpenPalette("#".to_string())),
             ("View: Outline", "", Message::ShowSidebar(SidebarView::Outline)),
             ("View: Files", "", Message::ShowSidebar(SidebarView::Files)),
+            ("View: Project (Autoloads, Input Map)", "", Message::ShowSidebar(SidebarView::Project)),
             ("Go to Definition", "go.definition", Message::GotoDefinition),
             ("Find All References", "go.references", Message::FindReferences),
             ("Rename Symbol", "refactor.rename", Message::StartRename),
@@ -1914,6 +1938,15 @@ impl App {
             for dir in dirs {
                 project.explorer.refresh(dir);
             }
+            // Godot rewrites project.godot when autoloads or actions change.
+            let changed = project.godot.as_ref().is_some_and(|g| paths.iter().any(|p| project_panel::is_project_file(g, p)));
+            if changed {
+                // A half-written file keeps the previous settings.
+                if let Ok(godot) = GodotProject::load(&project.root) {
+                    project.info = ProjectInfo::read(Some(&godot));
+                    project.godot = Some(godot);
+                }
+            }
         }
 
         for index in 0..self.tabs.len() {
@@ -2280,11 +2313,14 @@ impl App {
     }
 
     fn after_typing(&mut self, c: char) {
-        // Inside a `res://` string, every typed char narrows the path list.
-        if let Some(anchor) = self.path_completion_anchor() {
+        // Inside a `res://` or action-name string, every typed char narrows
+        // the list.
+        if let Some((anchor, kind)) = self.string_completion_anchor() {
             match &self.completion {
-                Some(completion) if completion.paths && completion.anchor == anchor => self.refilter_completion(),
-                _ => self.open_path_completion(anchor),
+                Some(completion) if completion.in_string == Some(kind) && completion.anchor == anchor => {
+                    self.refilter_completion()
+                }
+                _ => self.open_string_completion(anchor, kind),
             }
             return;
         }
@@ -2326,8 +2362,8 @@ impl App {
     /// Asks the server for completions; snippets are offered too, and alone
     /// when the server is not connected.
     fn request_completion(&mut self, trigger: Option<char>) {
-        if let Some(anchor) = self.path_completion_anchor() {
-            return self.open_path_completion(anchor);
+        if let Some((anchor, kind)) = self.string_completion_anchor() {
+            return self.open_string_completion(anchor, kind);
         }
         let Some(tab) = self.active_tab().filter(|t| t.language == Language::GDScript) else {
             return;
@@ -2348,20 +2384,34 @@ impl App {
         }
     }
 
-    /// Where `res://` path completion starts for the cursor of the active
-    /// GDScript tab, if it is in a string where a path goes.
-    fn path_completion_anchor(&self) -> Option<usize> {
+    /// Where completion inside a string starts for the cursor of the active
+    /// GDScript tab, and of what: a `res://` path, or an action name passed
+    /// to `Input.is_action_pressed(` and the like.
+    fn string_completion_anchor(&self) -> Option<(usize, InString)> {
         let tab = self.active_tab().filter(|t| t.language == Language::GDScript)?;
-        let single = tab.buffer.selections().len() == 1;
-        single.then(|| paths::path_completion_anchor(&tab.buffer, tab.buffer.primary().head)).flatten()
+        if tab.buffer.selections().len() != 1 {
+            return None;
+        }
+        let head = tab.buffer.primary().head;
+        paths::path_completion_anchor(&tab.buffer, head)
+            .map(|anchor| (anchor, InString::Paths))
+            .or_else(|| project_panel::action_completion_anchor(&tab.buffer, head).map(|anchor| (anchor, InString::Actions)))
     }
 
-    fn open_path_completion(&mut self, anchor: usize) {
-        let Some(godot) = self.project.as_ref().and_then(|p| p.godot.as_ref()) else {
+    fn open_string_completion(&mut self, anchor: usize, kind: InString) {
+        let Some(project) = &self.project else {
             return;
         };
-        let files = godot.resource_files().iter().filter_map(|f| godot.to_res_path(f)).collect();
-        self.completion = Some(Completion::paths(anchor, files));
+        self.completion = Some(match kind {
+            InString::Paths => {
+                let Some(godot) = &project.godot else {
+                    return;
+                };
+                let files = godot.resource_files().iter().filter_map(|f| godot.to_res_path(f)).collect();
+                Completion::paths(anchor, files)
+            }
+            InString::Actions => Completion::actions(anchor, project.info.action_names()),
+        });
         self.refilter_completion();
     }
 
@@ -2376,7 +2426,7 @@ impl App {
         let head = tab.buffer.primary().head;
         let same_line = tab.buffer.char_to_pos(head).line == tab.buffer.char_to_pos(c.anchor).line;
         let prefix = tab.buffer.slice(c.anchor, head);
-        let valid = if c.paths {
+        let valid = if c.in_string.is_some() {
             !prefix.contains(['"', '\''])
         } else {
             prefix.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
@@ -2388,7 +2438,7 @@ impl App {
         if c.request.is_some() {
             return; // Narrowed when the answer arrives.
         }
-        if c.paths {
+        if c.in_string == Some(InString::Paths) {
             let labels: Vec<String> = c.items.iter().map(|i| i.label.clone()).collect();
             c.filtered = paths::rank_paths(&labels, &prefix);
         } else {
@@ -3048,6 +3098,7 @@ impl App {
         self.recent = recent::add(&root);
         self.project = Some(Project {
             explorer: Explorer::new(root.clone()),
+            info: ProjectInfo::read(godot.as_ref()),
             root,
             godot,
         });
@@ -3725,6 +3776,7 @@ impl App {
         let tabs = row![
             view_tab("FILES", SidebarView::Files, "Project files"),
             view_tab("OUTLINE", SidebarView::Outline, "Functions, variables and signals of the current file (Ctrl+Shift+O to search them)"),
+            view_tab("PROJECT", SidebarView::Project, "Main scene, autoloads and Input Map of project.godot"),
         ]
         .spacing(4)
         .padding([0, 8]);
@@ -3740,6 +3792,7 @@ impl App {
                 let line = tab.map(|t| t.buffer.char_to_pos(t.buffer.primary().head).line as u32);
                 outline::view(outline, line, self.current_theme())
             }
+            SidebarView::Project => project_panel::view(&project.info, project.godot.as_ref(), self.current_theme()),
         };
 
         container(column![header, tabs, body].spacing(4))

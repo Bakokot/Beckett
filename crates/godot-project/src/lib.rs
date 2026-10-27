@@ -1,8 +1,10 @@
 //! Godot project awareness: `project.godot` parsing and `res://` paths.
 
+mod input;
 mod settings;
 
-pub use settings::ProjectSettings;
+pub use input::{Autoload, InputAction, BUILTIN_ACTIONS};
+pub use settings::{Entry, ProjectSettings};
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -30,6 +32,16 @@ impl GodotProject {
 
     pub fn main_scene(&self) -> Option<String> {
         self.settings.get_string("application/run/main_scene")
+    }
+
+    /// Actions of the Input Map saved in the project (not the built-in
+    /// `ui_*` ones it leaves unchanged), in file order.
+    pub fn input_actions(&self) -> Vec<InputAction> {
+        input::input_actions(&self.settings)
+    }
+
+    pub fn autoloads(&self) -> Vec<Autoload> {
+        input::autoloads(&self.settings)
     }
 
     pub fn features(&self) -> Vec<String> {
@@ -105,9 +117,17 @@ impl GodotProject {
     /// `.uid` file next to scripts and shaders, in the header of `.tscn` /
     /// `.tres` files, or in the `.import` file next to imported assets.
     pub fn find_uid(&self, uid: &str) -> Option<PathBuf> {
-        let mut found = None;
+        self.find_uids(&[uid]).pop().flatten()
+    }
+
+    /// The files of several `uid://`s, found in one pass over the project.
+    pub fn find_uids(&self, uids: &[&str]) -> Vec<Option<PathBuf>> {
+        let mut found = vec![None; uids.len()];
+        if uids.is_empty() {
+            return found;
+        }
         walk_files(&self.root, &mut |path, name| {
-            if found.is_some() {
+            if found.iter().all(Option::is_some) {
                 return;
             }
             let (owner, recorded) = if let Some(owner) = name.strip_suffix(".uid") {
@@ -119,8 +139,13 @@ impl GodotProject {
             } else {
                 return;
             };
-            if recorded.as_deref() == Some(uid) {
-                found = Some(owner);
+            let Some(recorded) = recorded else {
+                return;
+            };
+            for (uid, slot) in uids.iter().zip(&mut found) {
+                if slot.is_none() && *uid == recorded {
+                    *slot = Some(owner.clone());
+                }
             }
         });
         found

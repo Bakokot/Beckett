@@ -9,15 +9,28 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectSettings {
     values: BTreeMap<String, String>,
+    /// Keys in file order, with the zero-based line each starts on.
+    order: Vec<(String, usize)>,
+}
+
+/// One setting of a section, as written in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry<'a> {
+    /// The key within its section, e.g. `config/name`.
+    pub key: &'a str,
+    pub raw: &'a str,
+    /// Zero-based line the setting starts on.
+    pub line: usize,
 }
 
 impl ProjectSettings {
     pub fn parse(text: &str) -> Self {
         let mut values = BTreeMap::new();
+        let mut order = Vec::new();
         let mut section = String::new();
-        let mut lines = text.lines();
+        let mut lines = text.lines().enumerate();
 
-        while let Some(line) = lines.next() {
+        while let Some((number, line)) = lines.next() {
             let line = line.trim();
             if line.is_empty() || line.starts_with(';') {
                 continue;
@@ -31,20 +44,39 @@ impl ProjectSettings {
             };
             let mut value = value.trim().to_string();
             while bracket_depth(&value) > 0 {
-                let Some(next) = lines.next() else { break };
+                let Some((_, next)) = lines.next() else { break };
                 value.push('\n');
                 value.push_str(next);
             }
+            // Keys with spaces are quoted: `"debug menu"={…}`.
             let key = key.trim();
+            let key = &match key.strip_prefix('"').and_then(|k| k.strip_suffix('"')) {
+                Some(inner) => unescape(inner),
+                None => key.to_string(),
+            };
             let key = if section.is_empty() {
                 key.to_string()
             } else {
                 format!("{section}/{key}")
             };
-            values.insert(key, value);
+            if values.insert(key.clone(), value).is_none() {
+                order.push((key, number));
+            }
         }
 
-        Self { values }
+        Self { values, order }
+    }
+
+    /// The settings of `[section]`, in file order.
+    pub fn section(&self, section: &str) -> Vec<Entry<'_>> {
+        let prefix = format!("{section}/");
+        self.order
+            .iter()
+            .filter_map(|(key, line)| {
+                let short = key.strip_prefix(&prefix)?;
+                Some(Entry { key: short, raw: self.values[key].as_str(), line: *line })
+            })
+            .collect()
     }
 
     /// Raw variant text for a `section/key` setting.
@@ -188,5 +220,14 @@ textures/canvas_textures/default_texture_filter=0
         assert!(jump.starts_with('{') && jump.ends_with('}'));
         assert!(jump.contains("deadzone"));
         assert!(s.keys().all(|k| !k.starts_with('"')));
+    }
+
+    #[test]
+    fn sections_keep_file_order_and_lines() {
+        let s = ProjectSettings::parse(SAMPLE);
+        let app: Vec<(&str, usize)> = s.section("application").iter().map(|e| (e.key, e.line)).collect();
+        assert_eq!(app, [("config/name", 6), ("run/main_scene", 7), ("config/features", 8)]);
+        assert_eq!(s.section("input")[0].line, 12);
+        assert!(s.section("missing").is_empty());
     }
 }

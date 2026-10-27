@@ -217,7 +217,13 @@ crates/
       the language server (`gdscript/capabilities` + `textDocument/nativeSymbol`), not `--doctool`,
       whose XML has no descriptions in release builds — seen on screen (Node2D, Vector2.lerp);
       F12 path unit-tested only
-- [ ] Autoloads / Input Map / project settings panel + completion for action names
+- [x] PROJECT sidebar tab (palette: "View: Project"): main scene, autoloads (global or not; click
+      opens the script/scene, `uid://` paths resolved) and Input Map actions with readable events
+      ("A (Physical)", "Ctrl+S", "Joypad Start", "Left Stick Left"); click shows the line in
+      `project.godot`, "uses" lists them in the SEARCH tab; reread when `project.godot` changes.
+      Action names complete in strings passed to `is_action_pressed(` / `get_axis(` / `get_vector(`…
+      (project actions, then the built-in `ui_*` ones; events shown as docs). Parser checked on 3 real
+      projects (quoted names with spaces, uids) — not yet seen on screen
 - [ ] Drag file into code → `preload("res://…")`
 - [ ] Script templates / "New Script" dialog
 - [ ] Godot version picker (choose among installed versions per project)

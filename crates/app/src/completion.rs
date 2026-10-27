@@ -7,6 +7,15 @@ use lsp_client::{CompletionItem, CompletionKind};
 use crate::code_editor::CompletionRow;
 use crate::docs::Doc;
 
+/// What is completed inside a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InString {
+    /// `res://` paths.
+    Paths,
+    /// Input Map action names.
+    Actions,
+}
+
 pub struct Completion {
     /// In-flight `textDocument/completion` request.
     pub request: Option<u64>,
@@ -17,9 +26,9 @@ pub struct Completion {
     pub snippets_from: usize,
     /// Whether snippets are offered here (not after `.`, in strings, …).
     pub with_snippets: bool,
-    /// `res://` paths inside a string: `anchor` is the string's start and
-    /// the typed text may contain `/`, `.`, `:`.
-    pub paths: bool,
+    /// Completing inside a string (`anchor` is the string's start), of
+    /// what; the typed text may contain anything but quotes.
+    pub in_string: Option<InString>,
     /// Indices into `items`, best first.
     pub filtered: Vec<usize>,
     pub rows: Vec<CompletionRow>,
@@ -38,7 +47,7 @@ impl Completion {
             items: Vec::new(),
             snippets_from: 0,
             with_snippets,
-            paths: false,
+            in_string: None,
             filtered: Vec::new(),
             rows: Vec::new(),
             selected: 0,
@@ -52,7 +61,7 @@ impl Completion {
     /// at `anchor`.
     pub fn paths(anchor: usize, files: Vec<String>) -> Self {
         let mut completion = Self::new(None, anchor, false);
-        completion.paths = true;
+        completion.in_string = Some(InString::Paths);
         completion.set_items(
             files
                 .into_iter()
@@ -62,6 +71,26 @@ impl Completion {
                     kind: CompletionKind::File,
                     // Known to have no docs, so none are requested.
                     documentation: Some(String::new()),
+                    raw: serde_json::Value::Null,
+                })
+                .collect(),
+        );
+        completion
+    }
+
+    /// Completion of Input Map action names (with their events as docs) for
+    /// a string starting at `anchor`.
+    pub fn actions(anchor: usize, actions: Vec<(String, String)>) -> Self {
+        let mut completion = Self::new(None, anchor, false);
+        completion.in_string = Some(InString::Actions);
+        completion.set_items(
+            actions
+                .into_iter()
+                .map(|(name, events)| CompletionItem {
+                    label: name.clone(),
+                    insert_text: name,
+                    kind: CompletionKind::Constant,
+                    documentation: Some(events),
                     raw: serde_json::Value::Null,
                 })
                 .collect(),
