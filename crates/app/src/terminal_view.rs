@@ -35,6 +35,7 @@ pub struct TerminalView<'a, Message> {
     /// Ctrl+click on a link (path or URL) in the output.
     on_link: Option<Box<dyn Fn(TermLink) -> Message + 'a>>,
     link_color: Color,
+    blink: bool,
 }
 
 impl<'a, Message: Clone> TerminalView<'a, Message> {
@@ -49,6 +50,7 @@ impl<'a, Message: Clone> TerminalView<'a, Message> {
             passthrough: Vec::new(),
             on_link: None,
             link_color: Color::from_rgb8(0x47, 0x8c, 0xbf),
+            blink: true,
         }
     }
 
@@ -72,6 +74,11 @@ impl<'a, Message: Clone> TerminalView<'a, Message> {
 
     pub fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    pub fn blink(mut self, blink: bool) -> Self {
+        self.blink = blink;
         self
     }
 
@@ -278,7 +285,7 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
         match event {
             Event::Window(window::Event::RedrawRequested(now)) => {
                 state.now = Some(*now);
-                if self.focused {
+                if self.focused && self.blink {
                     let from = *state.blink_from.get_or_insert(*now);
                     let elapsed = now.saturating_duration_since(from).as_millis();
                     let wait = BLINK_MILLIS - elapsed % BLINK_MILLIS;
@@ -545,7 +552,7 @@ impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for TerminalView
             if let Some((row, column)) = snapshot.cursor {
                 let rect = cell_rect(row, column, 1);
                 let cursor = color(self.palette.cursor);
-                if self.focused && !state.cursor_visible() {
+                if self.focused && self.blink && !state.cursor_visible() {
                     // Blinked off.
                 } else if self.focused {
                     fill(r, rect, cursor);

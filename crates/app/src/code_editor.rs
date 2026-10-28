@@ -30,12 +30,28 @@ use crate::keymap::{Chord, Keymap};
 use crate::style::to_color;
 
 const BLINK_MILLIS: u128 = 500;
-const HOVER_DELAY: Duration = Duration::from_millis(500);
 const COMPLETION_ROWS: usize = 10;
 const DOC_FONT_SIZE: f32 = 13.0;
 const POPUP_PADDING: f32 = 8.0;
 /// Width of the kind-tag column in the completion list (`const` + a space).
 const TAG_COLUMNS: usize = 6;
+
+/// Behaviors the user can turn off or tune (settings).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditorOptions {
+    pub cursor_blink: bool,
+    /// Diagnostic messages written at the end of their line.
+    pub inline_diagnostics: bool,
+    pub indent_guides: bool,
+    /// How long the mouse rests on a word before its documentation shows.
+    pub hover_delay: Duration,
+}
+
+impl Default for EditorOptions {
+    fn default() -> Self {
+        Self { cursor_blink: true, inline_diagnostics: true, indent_guides: true, hover_delay: Duration::from_millis(500) }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum EditorEvent {
@@ -232,6 +248,7 @@ pub struct CodeEditor<'a, Message> {
     breakpoints: Option<Vec<usize>>,
     /// The line the debugger is paused on.
     paused_line: Option<usize>,
+    options: EditorOptions,
 }
 
 impl<'a, Message> CodeEditor<'a, Message> {
@@ -259,6 +276,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
             git_changes: Rc::default(),
             breakpoints: None,
             paused_line: None,
+            options: EditorOptions::default(),
         }
     }
 
@@ -303,6 +321,11 @@ impl<'a, Message> CodeEditor<'a, Message> {
 
     pub fn font(mut self, font: CodeFont) -> Self {
         self.font = font;
+        self
+    }
+
+    pub fn options(mut self, options: EditorOptions) -> Self {
+        self.options = options;
         self
     }
 
@@ -449,10 +472,10 @@ impl State {
         }
     }
 
-    fn cursor_visible(&self) -> bool {
+    fn cursor_visible(&self, blink: bool) -> bool {
         self.focused
             && self.window_focused
-            && (self.now.saturating_duration_since(self.focused_at).as_millis() / BLINK_MILLIS) % 2 == 0
+            && (!blink || (self.now.saturating_duration_since(self.focused_at).as_millis() / BLINK_MILLIS).is_multiple_of(2))
     }
 }
 
@@ -820,7 +843,7 @@ impl<'a, Message> CodeEditor<'a, Message> {
                     self.emit(shell, EditorEvent::HoverEnd);
                 }
                 state.hover = Some(HoverTrack { point, since: now, sent: None });
-                shell.request_redraw_at(now + HOVER_DELAY);
+                shell.request_redraw_at(now + self.options.hover_delay);
             }
         }
     }
@@ -885,7 +908,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
             Event::Window(window::Event::RedrawRequested(now)) => {
                 state.now = *now;
-                if state.focused && state.window_focused {
+                if state.focused && state.window_focused && self.options.cursor_blink {
                     let elapsed = now.saturating_duration_since(state.focused_at).as_millis();
                     let wait = BLINK_MILLIS - elapsed % BLINK_MILLIS;
                     shell.request_redraw_at(*now + Duration::from_millis(wait as u64));
@@ -904,7 +927,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
                     });
                 }
                 if let Some(track) = &mut state.hover {
-                    if track.sent.is_none() && now.saturating_duration_since(track.since) >= HOVER_DELAY {
+                    if track.sent.is_none() && now.saturating_duration_since(track.since) >= self.options.hover_delay {
                         let index = self.char_under(&geometry, state.scroll, track.point);
                         let word = self.buffer.word_range(index);
                         track.sent = Some(word);
@@ -1244,7 +1267,8 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
 
             // Indentation guides.
-            for (line, levels) in (first..last).zip(indent_levels(buffer, first, last)).filter(|&(l, _)| shown(l)) {
+            let guides = if self.options.indent_guides { indent_levels(buffer, first, last) } else { Vec::new() };
+            for (line, levels) in (first..last).zip(guides).filter(|&(l, _)| shown(l)) {
                 let y = g.line_y(line, scroll);
                 for level in 0..levels {
                     let x = g.col_x(level * TAB_WIDTH, scroll).round();
@@ -1333,7 +1357,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             // Inline messages: one per line, the first mark's (marks come
             // sorted most severe first).
             let mut with_message = std::collections::HashSet::new();
-            for mark in self.marks.iter().filter(|m| (first..last).contains(&m.line) && shown(m.line)) {
+            for mark in self.marks.iter().filter(|m| self.options.inline_diagnostics && (first..last).contains(&m.line) && shown(m.line)) {
                 let Some(message) = &mark.message else {
                     continue;
                 };
@@ -1362,7 +1386,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for CodeEditor<'a, Mess
             }
 
             // Cursors.
-            if self.focused && state.cursor_visible() && state.preedit.is_none() {
+            if self.focused && state.cursor_visible(self.options.cursor_blink) && state.preedit.is_none() {
                 for sel in buffer.selections() {
                     let pos = buffer.char_to_pos(sel.head);
                     if !(first..last).contains(&pos.line) {

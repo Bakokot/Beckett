@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ropey::Rope;
+use serde::{Deserialize, Serialize};
 
 use crate::folding::{self, LineMap};
 use crate::gdscript::{self, LineState, Token};
@@ -24,11 +25,12 @@ pub struct Pos {
     pub column: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     pub anchor: usize,
     pub head: usize,
     /// Visual column kept across vertical moves.
+    #[serde(skip)]
     goal: Option<usize>,
 }
 
@@ -55,7 +57,7 @@ impl Selection {
 }
 
 /// Replace `start..end` (pre-edit char indices) with `text`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Change {
     pub start: usize,
     pub end: usize,
@@ -140,11 +142,70 @@ enum EditKind {
     Other,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Entry {
     forward: Vec<Change>,
     inverse: Vec<Change>,
     before: Vec<Selection>,
     after: Vec<Selection>,
+}
+
+/// A buffer's undo and redo stacks, taken out so they can outlive it
+/// (persistent undo) and be put back on a buffer holding the same text.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct History {
+    undo: Vec<Vec<Entry>>,
+    redo: Vec<Vec<Entry>>,
+}
+
+impl History {
+    pub fn is_empty(&self) -> bool {
+        self.undo.is_empty() && self.redo.is_empty()
+    }
+
+    /// Whether every step applies cleanly to `rope` (the text the history
+    /// ends at) and undoing then redoing it all comes back to the same text.
+    fn fits(&self, rope: &Rope) -> bool {
+        let well_formed = self.undo.iter().chain(&self.redo).all(|group| {
+            !group.is_empty() && group.iter().all(|e| !e.before.is_empty() && !e.after.is_empty())
+        });
+        if !well_formed {
+            return false;
+        }
+        // Undo back to the oldest text, then redo forward to the current one.
+        let mut text = rope.clone();
+        let undone = self.undo.iter().rev().flat_map(|group| group.iter().rev());
+        if !undone.into_iter().all(|entry| apply_checked(&mut text, &entry.inverse)) {
+            return false;
+        }
+        let redone = self.undo.iter().flat_map(|group| group.iter());
+        if !redone.into_iter().all(|entry| apply_checked(&mut text, &entry.forward)) || text != *rope {
+            return false;
+        }
+        // Redo every undone step (top of the stack first), then undo them again.
+        let mut text = rope.clone();
+        let entries: Vec<&Entry> = self.redo.iter().rev().flat_map(|group| group.iter()).collect();
+        entries.iter().all(|entry| apply_checked(&mut text, &entry.forward))
+            && entries.iter().rev().all(|entry| apply_checked(&mut text, &entry.inverse))
+            && text == *rope
+    }
+}
+
+/// Applies changes like `Buffer::apply_raw`, but refuses ones out of order
+/// or out of bounds instead of panicking.
+fn apply_checked(rope: &mut Rope, changes: &[Change]) -> bool {
+    let mut previous_end = 0;
+    for c in changes {
+        if c.start < previous_end || c.end < c.start || c.end > rope.len_chars() {
+            return false;
+        }
+        previous_end = c.end;
+    }
+    for c in changes.iter().rev() {
+        rope.remove(c.start..c.end);
+        rope.insert(c.start, &c.text);
+    }
+    true
 }
 
 pub struct Buffer {
@@ -169,6 +230,9 @@ pub struct Buffer {
     folds: Vec<usize>,
     /// Marked lines (breakpoints), kept the same way so they follow edits.
     marks: Vec<usize>,
+    /// Typing an opening bracket or quote adds its closer (and the pair
+    /// steps over, wraps selections and is deleted together).
+    auto_close: bool,
     /// Foldable ranges, computed once per text version.
     fold_cache: RefCell<Option<(u64, FoldRanges)>>,
 }
@@ -222,6 +286,7 @@ impl Buffer {
             line_states: RefCell::new(vec![LexState::initial(language)]),
             folds: Vec::new(),
             marks: Vec::new(),
+            auto_close: true,
             fold_cache: RefCell::new(None),
         }
     }
@@ -839,7 +904,21 @@ impl Buffer {
         }
     }
 
+    pub fn set_auto_close(&mut self, on: bool) {
+        self.auto_close = on;
+    }
+
+    /// The bracket and quote pairs typing handles as pairs.
+    fn pairs(&self) -> &'static [(char, char)] {
+        if self.auto_close {
+            PAIRS
+        } else {
+            &[]
+        }
+    }
+
     fn insert(&mut self, text: &str) {
+        let pairs = self.pairs();
         let mut chars = text.chars();
         let single = match (chars.next(), chars.next()) {
             (Some(c), None) => Some(c),
@@ -856,12 +935,12 @@ impl Buffer {
 
             // Typing a closer that is already there just steps over it.
             if let Some(c) = single {
-                if sel.is_empty() && next == Some(c) && PAIRS.iter().any(|&(_, close)| close == c) {
+                if sel.is_empty() && next == Some(c) && pairs.iter().any(|&(_, close)| close == c) {
                     after.push(Selection::cursor(shift(start, delta) + 1));
                     continue;
                 }
             }
-            let pair = single.and_then(|c| PAIRS.iter().find(|&&(open, _)| open == c));
+            let pair = single.and_then(|c| pairs.iter().find(|&&(open, _)| open == c));
             let (inserted, selection) = match pair {
                 // Wrap a selection: `(selected)`, keeping it selected.
                 Some(&(open, close)) if !sel.is_empty() => {
@@ -953,7 +1032,8 @@ impl Buffer {
                     return Some(change(self.word_left(head), head, ""));
                 }
                 let prev = self.rope.char(head - 1);
-                let empty_pair = PAIRS
+                let empty_pair = self
+                    .pairs()
                     .iter()
                     .any(|&(open, close)| open == prev && self.char_at(head) == Some(close));
                 let end = if empty_pair { head + 1 } else { head };
@@ -1095,6 +1175,26 @@ impl Buffer {
         };
         let cursor = Selection::cursor(start.min(self.len_chars() - (end - start)));
         self.edit(vec![change(start, end, "")], Some(vec![cursor]), EditKind::Other);
+    }
+
+    /// The undo and redo stacks, at most `limit` steps of each (the most
+    /// recent ones).
+    pub fn history(&self, limit: usize) -> History {
+        let undo = &self.undo[self.undo.len().saturating_sub(limit)..];
+        let redo = &self.redo[self.redo.len().saturating_sub(limit)..];
+        History { undo: undo.to_vec(), redo: redo.to_vec() }
+    }
+
+    /// Puts back a history taken from a buffer with this same text. Returns
+    /// false (keeping the current one) when it doesn't fit the text.
+    pub fn set_history(&mut self, history: History) -> bool {
+        if !history.fits(&self.rope) {
+            return false;
+        }
+        self.undo = history.undo;
+        self.redo = history.redo;
+        self.last_kind = None;
+        true
     }
 
     fn undo(&mut self) {
@@ -1489,6 +1589,49 @@ mod tests {
     }
 
     #[test]
+    fn history_moves_to_a_buffer_with_the_same_text() {
+        let mut a = buf("extends Node\n");
+        at(&mut a, 1, 0);
+        type_str(&mut a, "var x");
+        a.apply(Command::Newline);
+        type_str(&mut a, "var y");
+        a.apply(Command::Undo);
+        let history = a.history(100);
+        assert!(!history.is_empty());
+
+        let mut b = buf(&a.text());
+        assert!(b.set_history(history.clone()));
+        b.apply(Command::Redo);
+        assert_eq!(b.text(), "extends Node\nvar x\nvar y");
+        for _ in 0..3 {
+            b.apply(Command::Undo);
+        }
+        assert_eq!(b.text(), "extends Node\n");
+
+        // Another text refuses it, and so does a damaged history.
+        assert!(!buf("extends Node2D\n").set_history(history.clone()));
+        let mut broken = history;
+        broken.undo[0][0].inverse[0].end = 999;
+        assert!(!buf(&a.text()).set_history(broken));
+    }
+
+    #[test]
+    fn history_keeps_the_most_recent_steps() {
+        let mut b = buf("");
+        for word in ["a", "b", "c"] {
+            type_str(&mut b, word);
+            b.apply(Command::Move { motion: Motion::Left, extend: false });
+        }
+        assert_eq!(b.text(), "cba");
+        let mut c = buf("cba");
+        assert!(c.set_history(b.history(2)));
+        for _ in 0..3 {
+            c.apply(Command::Undo);
+        }
+        assert_eq!(c.text(), "a");
+    }
+
+    #[test]
     fn moving_breaks_undo_group() {
         let mut b = buf("");
         type_str(&mut b, "ab");
@@ -1532,6 +1675,23 @@ mod tests {
         at(&mut b, 0, 3);
         type_str(&mut b, "'");
         assert_eq!(b.text(), "don'");
+    }
+
+    #[test]
+    fn auto_close_can_be_turned_off() {
+        let mut b = buf("");
+        b.set_auto_close(false);
+        type_str(&mut b, "f(x)");
+        assert_eq!(b.text(), "f(x)");
+        // No stepping over a closer, no deleting the pair together.
+        at(&mut b, 0, 3);
+        type_str(&mut b, ")");
+        assert_eq!(b.text(), "f(x))");
+        let mut b = buf("()");
+        b.set_auto_close(false);
+        at(&mut b, 0, 1);
+        b.apply(Command::Backspace { word: false });
+        assert_eq!(b.text(), ")");
     }
 
     #[test]

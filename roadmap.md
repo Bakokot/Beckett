@@ -196,7 +196,11 @@ crates/
       the session) — seen on screen with a mouse drag
 - [x] Hot exit: unsaved edits kept in the session on close (and every 30 s), restored as unsaved;
       flagged "(changed on disk)" when the file changed meanwhile — seen on screen
-- [ ] Persistent undo
+- [x] Persistent undo: each file's undo/redo history (last 500 steps of each) is kept in `<config>/undo/` when
+      its tab closes and with the session (on exit and every 30 s), and comes back when the file opens with
+      the text the history ends at (hash-checked, then replayed both ways before use, so a stale or damaged
+      history is ignored, never applied); unsaved tabs restored by hot exit get theirs too; histories untouched
+      for 30 days are removed — unit-tested, not yet seen on screen
 - [x] Format Document (Shift+Alt+F) and opt-in format on save (`"format_on_save": true` in
       settings.json): gdformat when installed (Godot's LSP has no formatter), else trailing whitespace
       and final newline tidied; one undo step — unit-tested, gdformat path untested (not installed)
@@ -291,7 +295,14 @@ crates/
 - [x] Middle-click a tab to close it (the class reference tab too; unsaved tabs ask once, like ×)
 - [x] Keybinding presets: Default, VS Code and Godot (buttons on the F1 page, or the palette);
       changes are kept on top of the preset in `keybindings.json`, picking a preset resets them
-- [ ] Settings UI + user/project JSON
+- [x] Settings UI + user/project JSON: a Settings page (Ctrl+, or "Preferences: Open Settings") with a filter,
+      toggles and − / + steppers, "reset" on changed ones, and "Open JSON" to edit the file in a tab (rereads it
+      on save). User scope writes `settings.json` in the config folder; Project scope writes overrides to
+      `<project>/.beckett/settings.json` (Godot skips dot folders; the file goes once nothing is overridden;
+      reread when it changes on disk), for the settings that allow it (others show "yours only"). New settings:
+      auto-close brackets and quotes, suggest while typing, hover documentation delay, inline diagnostics,
+      indentation guides, blinking cursor (editor and terminal); format on save and zoom moved onto the page —
+      seen on screen (user and project scopes, an override applied live to an open tab)
 - [x] Session restore: per-project tabs, active tab, cursors, folds; the last project reopens at
       launch; "File: Close Folder" goes back to the welcome screen
 

@@ -31,6 +31,7 @@ mod rename;
 mod runner;
 mod session;
 mod settings;
+mod settings_page;
 mod shortcuts;
 mod split;
 mod splitter;
@@ -39,6 +40,7 @@ mod terminal_links;
 mod terminal_panel;
 mod terminal_view;
 mod theme_editor;
+mod undo_history;
 mod watcher;
 
 use std::borrow::Cow;
@@ -78,6 +80,7 @@ use new_script::{NewScript, NewScriptMessage};
 use rename::{Rename, RenameMessage};
 use class_ref::{ClassRef, ClassRefMessage};
 use shortcuts::{Shortcuts, ShortcutsMessage};
+use settings_page::{Scope, SettingsMessage, SettingsPage};
 use runner::{OutputLine, RunEvent, RunHandle, RunRequest};
 use terminal_panel::TerminalEvent;
 use terminal_view::TerminalView;
@@ -234,6 +237,9 @@ pub enum Message {
     /// F1: the keyboard shortcuts page.
     OpenShortcuts,
     Shortcuts(ShortcutsMessage),
+    /// Ctrl+,: the settings page.
+    OpenSettings,
+    Settings(SettingsMessage),
     /// The class reference, at this class (and member) when given.
     OpenClassRef(Option<String>, Option<String>),
     /// Bring the class reference tab to the front.
@@ -440,6 +446,10 @@ struct App {
     /// The session as last written, to skip rewriting an unchanged one.
     saved_session: Option<session::Session>,
     settings: settings::Settings,
+    /// The open project's overrides of some settings (`.beckett/settings.json`).
+    project_settings: serde_json::Map<String, serde_json::Value>,
+    /// The settings in effect: yours with the project's overrides.
+    options: settings::Settings,
     /// Settings changed without being saved yet (the sidebar width while
     /// dragging): saved with the next autosave or on close.
     settings_dirty: bool,
@@ -502,6 +512,8 @@ struct App {
     theme_editor: Option<ThemeEditor>,
     /// The keyboard shortcuts page, shown in place of the editor.
     shortcuts: Option<Shortcuts>,
+    /// The settings page, shown in place of the editor.
+    settings_page: Option<SettingsPage>,
     /// The class reference tab (one at most), on side `class_ref_side`.
     class_ref: Option<ClassRef>,
     class_ref_side: usize,
@@ -574,6 +586,20 @@ struct Tab {
     group: usize,
     /// Change markers against the file's staged text.
     git: GitMarks,
+    /// Buffer version whose undo history was last kept on disk.
+    history_kept: u64,
+}
+
+impl Tab {
+    /// Keeps the undo history on disk if it changed since last time.
+    fn keep_history(&mut self) -> Result<(), String> {
+        if self.buffer.version() == self.history_kept {
+            return Ok(());
+        }
+        undo_history::save(&self.path, &self.buffer)?;
+        self.history_kept = self.buffer.version();
+        Ok(())
+    }
 }
 
 /// Reading git status and staged texts runs in the background, one run at
@@ -648,6 +674,7 @@ impl Tab {
 
 impl App {
     fn new(initial: Option<PathBuf>) -> (Self, Task<Message>) {
+        undo_history::prune();
         let mut themes = theme::builtin();
         let mut theme_paths = vec![None; themes.len()];
         let mut status = None;
@@ -667,6 +694,7 @@ impl App {
             }
         }
         let settings = settings::Settings::load();
+        let options = settings.clone();
         sort_themes(&mut themes, &mut theme_paths, &settings.theme_order);
         let theme_index = settings.theme.as_ref().and_then(|name| themes.iter().position(|t| &t.name == name)).unwrap_or(0);
         let iced_theme = style::iced_theme(&themes[theme_index]);
@@ -715,6 +743,9 @@ impl App {
             theme_paths,
             theme_editor: None,
             shortcuts: None,
+            settings_page: None,
+            project_settings: serde_json::Map::new(),
+            options,
             class_ref: None,
             class_ref_side: 0,
             class_ref_shown: false,
@@ -1144,6 +1175,7 @@ impl App {
                     self.dismiss_popups();
                     self.focus_tab(index);
                     self.shortcuts = None;
+                    self.settings_page = None;
                     if self.tabs[index].group == self.class_ref_side {
                         self.class_ref_shown = false;
                     }
@@ -1155,6 +1187,7 @@ impl App {
             Message::OpenShortcuts => {
                 // Keep the filter when it is already open.
                 self.shortcuts.get_or_insert_with(Shortcuts::default);
+                self.settings_page = None;
                 self.palette = None;
                 self.focus = Focus::Input;
                 self.dismiss_popups();
@@ -1204,6 +1237,19 @@ impl App {
                     self.focus = Focus::Editor;
                 }
             }
+            Message::OpenSettings => {
+                // Keep the filter and scope when it is already open.
+                self.settings_page.get_or_insert_with(SettingsPage::default);
+                self.shortcuts = None;
+                self.palette = None;
+                self.focus = Focus::Input;
+                self.dismiss_popups();
+                return Task::batch([
+                    iced::widget::operation::focus(settings_page::INPUT),
+                    iced::widget::operation::select_all(settings_page::INPUT),
+                ]);
+            }
+            Message::Settings(message) => self.on_settings(message),
             Message::CloseTab(index) => {
                 self.dismiss_popups();
                 self.close_tab(index);
@@ -2132,6 +2178,7 @@ impl App {
             ("Edit: Add Cursor Below", "edit.cursorBelow", edit(Command::AddCursorBelow)),
             ("Edit: Trigger Completion", "edit.completion", Message::Edit(EditorEvent::TriggerCompletion)),
             ("Help: Keyboard Shortcuts", "view.shortcuts", Message::OpenShortcuts),
+            ("Preferences: Open Settings", "view.settings", Message::OpenSettings),
             ("Help: Class Reference", "help.classReference", Message::OpenClassRef(None, None)),
             ("Theme: Edit Colors", "", Message::OpenThemeEditor),
             (
@@ -2739,6 +2786,10 @@ impl App {
     fn on_files_changed(&mut self, paths: &[PathBuf]) {
         // Our own saves come back here too: the markers and statuses follow.
         self.git_refresh.wanted = true;
+        let project_settings = self.project.as_ref().map(|p| settings::project_file(&p.root));
+        if project_settings.is_some_and(|file| paths.iter().any(|p| uri::same_path(p, &file))) {
+            self.reload_project_settings();
+        }
         // Files appeared or vanished: refresh their folders in the explorer.
         if let Some(project) = &mut self.project {
             let dirs: std::collections::BTreeSet<&Path> = paths.iter().filter_map(|p| p.parent()).collect();
@@ -2800,7 +2851,12 @@ impl App {
         };
         let cursor = tab.buffer.char_to_pos(tab.buffer.primary().head);
         let marks = tab.buffer.line_marks();
+        // Kept for the old text, in case the file goes back to it.
+        let _ = tab.keep_history();
         tab.buffer = Buffer::new(&text, tab.language);
+        undo_history::load(&tab.path, &mut tab.buffer);
+        tab.buffer.set_auto_close(self.options.auto_close_brackets);
+        tab.history_kept = tab.buffer.version();
         tab.buffer.set_line_marks(marks);
         tab.buffer.set_cursor(cursor);
         tab.dirty = false;
@@ -3155,7 +3211,7 @@ impl App {
         if c.is_alphanumeric() || c == '_' {
             if self.completion.is_some() {
                 self.refilter_completion();
-            } else {
+            } else if self.options.completion_while_typing {
                 self.request_completion(None);
             }
         } else if matches!(c, '.' | '$' | '"' | '\'') {
@@ -4115,6 +4171,7 @@ impl App {
     /// to `member` when given.
     fn open_class_ref(&mut self, class: Option<String>, member: Option<String>) -> Task<Message> {
         self.shortcuts = None;
+        self.settings_page = None;
         self.palette = None;
         self.dismiss_popups();
         self.focus = Focus::Input;
@@ -4343,6 +4400,7 @@ impl App {
         self.reset_terminal();
         self.run = RunState::default();
         self.panel = None;
+        self.reload_project_settings();
         self.restore_session();
         self.git_refresh.wanted = true;
         if let Some(file) = file {
@@ -4644,12 +4702,14 @@ impl App {
         self.run = RunState::default();
         self.panel = None;
         self.recent = recent::load();
+        self.reload_project_settings();
     }
 
     /// Opens (or focuses) a file tab. Returns whether it is now active.
     fn open_file(&mut self, path: PathBuf) -> bool {
-        // Opening a file shows it, even from the shortcuts page.
+        // Opening a file shows it, even from the shortcuts or settings page.
         self.shortcuts = None;
+        self.settings_page = None;
         // A file on the class reference's side takes its place.
         let group = self.tabs.iter().find(|t| uri::same_path(&t.path, &path)).map_or(self.focused_group, |t| t.group);
         if group == self.class_ref_side {
@@ -4686,7 +4746,11 @@ impl App {
             disk_changed: false,
             group: self.focused_group,
             git: GitMarks::default(),
+            history_kept: 0,
         };
+        // Undo reaches back past the last time the file was open.
+        undo_history::load(&tab.path, &mut tab.buffer);
+        tab.buffer.set_auto_close(self.options.auto_close_brackets);
         if let Some(lines) = self.breakpoints.get(&tab.path) {
             tab.buffer.set_line_marks(lines.iter().copied());
         }
@@ -4744,6 +4808,12 @@ impl App {
         let Some(project) = &self.project else {
             return;
         };
+        // Undo histories go with the session (it is saved on exit).
+        for tab in &mut self.tabs {
+            if let Err(error) = tab.keep_history() {
+                self.status = Some(format!("Cannot keep the undo history of {}: {error}", tab.title()));
+            }
+        }
         let snapshot = self.session_snapshot();
         if self.saved_session.as_ref() == Some(&snapshot) {
             return;
@@ -4817,6 +4887,13 @@ impl App {
         if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
             let _ = client.did_close(&tab.path);
         }
+        // Discarded edits leave the file at a text the history doesn't end at.
+        if !tab.dirty {
+            if let Err(error) = self.tabs[index].keep_history() {
+                self.status = Some(format!("Cannot keep the undo history: {error}"));
+            }
+        }
+        let tab = &self.tabs[index];
         // Its breakpoints, as moved by edits, stay known once it is closed.
         if tab.language == Language::GDScript {
             let marks: std::collections::BTreeSet<usize> = tab.buffer.line_marks().into_iter().collect();
@@ -4842,6 +4919,130 @@ impl App {
         };
     }
 
+    fn on_settings(&mut self, message: SettingsMessage) {
+        let scope = self.settings_scope();
+        match message {
+            SettingsMessage::Filter(filter) => {
+                if let Some(page) = &mut self.settings_page {
+                    page.filter = filter;
+                }
+            }
+            SettingsMessage::Scope(choice) => {
+                if let Some(page) = &mut self.settings_page {
+                    page.scope = choice;
+                }
+            }
+            SettingsMessage::Set(key, value) => self.change_setting(scope, key, Some(value)),
+            SettingsMessage::Reset(key) => self.change_setting(scope, key, None),
+            SettingsMessage::OpenFile => self.open_settings_file(scope),
+            SettingsMessage::Close => {
+                self.settings_page = None;
+                self.focus = Focus::Editor;
+            }
+        }
+    }
+
+    /// The scope the settings page changes (yours without a project).
+    fn settings_scope(&self) -> Scope {
+        match (&self.settings_page, &self.project) {
+            (Some(page), Some(_)) => page.scope,
+            _ => Scope::User,
+        }
+    }
+
+    /// Sets (or with `None`, resets) a setting in `scope` and saves it.
+    fn change_setting(&mut self, scope: Scope, key: &'static str, value: Option<serde_json::Value>) {
+        let title = settings::item(key).map_or(key, |item| item.title);
+        let result = match scope {
+            Scope::User => {
+                let value = value.or_else(|| settings::Settings::default().value(key));
+                match value.and_then(|v| self.settings.with(key, v)) {
+                    Some(changed) => {
+                        self.settings = changed;
+                        self.settings.save()
+                    }
+                    None => Err(format!("{title} can't take that value")),
+                }
+            }
+            Scope::Project => {
+                let Some(project) = &self.project else {
+                    return;
+                };
+                match value {
+                    Some(value) => self.project_settings.insert(key.to_string(), value),
+                    None => self.project_settings.remove(key),
+                };
+                settings::save_project(&project.root, &self.project_settings)
+            }
+        };
+        self.refresh_options();
+        self.status = Some(match (result, scope) {
+            (Ok(()), Scope::User) => format!("Saved: {title}"),
+            (Ok(()), Scope::Project) => format!("Saved for this project: {title}"),
+            (Err(error), _) => format!("Cannot save the settings: {error}"),
+        });
+    }
+
+    /// Opens the JSON file of `scope` in a tab, creating it if needed.
+    fn open_settings_file(&mut self, scope: Scope) {
+        let path = match scope {
+            Scope::User => settings::user_file(),
+            Scope::Project => self.project.as_ref().map(|p| settings::project_file(&p.root)),
+        };
+        let Some(path) = path else {
+            self.status = Some("No user config folder".to_string());
+            return;
+        };
+        if !path.exists() {
+            let created = match scope {
+                Scope::User => self.settings.save(),
+                Scope::Project => path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&path, "{\n}\n"))
+                    .map_err(|e| e.to_string()),
+            };
+            if let Err(error) = created {
+                self.status = Some(format!("Cannot create {}: {error}", path.display()));
+                return;
+            }
+        }
+        self.focus = Focus::Editor;
+        self.open_file(path);
+    }
+
+    /// Recomputes the settings in effect and applies those tabs hold.
+    fn refresh_options(&mut self) {
+        self.options = self.settings.with_project(&self.project_settings);
+        for tab in &mut self.tabs {
+            tab.buffer.set_auto_close(self.options.auto_close_brackets);
+        }
+    }
+
+    /// Rereads a settings file saved from a tab.
+    fn settings_file_saved(&mut self, path: &Path) {
+        if settings::user_file().is_some_and(|file| uri::same_path(&file, path)) {
+            self.settings = settings::Settings::load();
+            self.refresh_options();
+            self.status = Some("Settings reloaded".to_string());
+        }
+    }
+
+    /// Rereads the project's settings file.
+    fn reload_project_settings(&mut self) {
+        self.project_settings = self.project.as_ref().map(|p| settings::load_project(&p.root)).unwrap_or_default();
+        self.refresh_options();
+    }
+
+    fn editor_options(&self) -> code_editor::EditorOptions {
+        code_editor::EditorOptions {
+            cursor_blink: self.options.cursor_blink,
+            inline_diagnostics: self.options.inline_diagnostics,
+            indent_guides: self.options.indent_guides,
+            hover_delay: std::time::Duration::from_millis(self.options.hover_delay_ms),
+        }
+    }
+
     fn save_active(&mut self) {
         if let Some(index) = self.active_index() {
             if self.save_tab(index) {
@@ -4861,7 +5062,7 @@ impl App {
 
     fn save_tab(&mut self, index: usize) -> bool {
         let formats = self.tabs.get(index).is_some_and(|t| matches!(t.language, Language::GDScript | Language::Shader));
-        if self.settings.format_on_save && formats {
+        if self.options.format_on_save && formats {
             if let Err(error) = self.format_tab(index) {
                 // Saved as typed: a formatter error must not block saving.
                 self.status = Some(error);
@@ -4877,11 +5078,12 @@ impl App {
                 if let (Language::GDScript, Some(client)) = (tab.language, self.lsp.client()) {
                     let _ = client.did_save(&tab.path, &tab.buffer.text());
                 }
+                let (path, language) = (tab.path.clone(), tab.language);
                 // Godot reads the saved file: its breakpoints may have moved with edits.
-                if tab.language == Language::GDScript {
-                    let path = tab.path.clone();
+                if language == Language::GDScript {
                     self.send_file_breakpoints(&path);
                 }
+                self.settings_file_saved(&path);
                 true
             }
             Err(error) => {
@@ -4922,7 +5124,7 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let body: Element<'_, Message> = match &self.project {
             // Pages that don't need a project replace the welcome screen.
-            None if self.theme_editor.is_some() || self.shortcuts.is_some() => self.editor_area(),
+            None if self.theme_editor.is_some() || self.shortcuts.is_some() || self.settings_page.is_some() => self.editor_area(),
             None => self.welcome(),
             Some(project) => {
                 let mut main = column![];
@@ -5007,6 +5209,17 @@ impl App {
         let ui = &self.current_theme().ui;
         let view = page.view(ui, &self.keymap).map(Message::Shortcuts);
         let view = on_escape::on_escape(view, Message::Shortcuts(ShortcutsMessage::Close));
+        container(view).width(Length::Fill).height(Length::Fill).style(style::surface(ui)).into()
+    }
+
+    fn settings_view(&self) -> Element<'_, Message> {
+        let Some(page) = &self.settings_page else {
+            return space().into();
+        };
+        let ui = &self.current_theme().ui;
+        let project = self.project.as_ref().map(|_| &self.project_settings);
+        let view = page.view(ui, &self.settings, project).map(Message::Settings);
+        let view = on_escape::on_escape(view, Message::Settings(SettingsMessage::Close));
         container(view).width(Length::Fill).height(Length::Fill).style(style::surface(ui)).into()
     }
 
@@ -5136,6 +5349,9 @@ impl App {
         if self.shortcuts.is_some() {
             return self.shortcuts_page();
         }
+        if self.settings_page.is_some() {
+            return self.settings_view();
+        }
         if !self.is_split() {
             return self.pane(0);
         }
@@ -5181,7 +5397,8 @@ impl App {
             .focused(focused && self.focus == Focus::Editor)
             .dropping(self.file_drag.as_deref())
             .git_changes(tab.git.changes(&tab.buffer))
-            .breakpoints(self.breakpoints_of(tab), self.paused_line_in(&tab.path));
+            .breakpoints(self.breakpoints_of(tab), self.paused_line_in(&tab.path))
+            .options(self.editor_options());
         let mut area = column![self.tab_bar(group)];
         if !focused {
             return area.push(editor).into();
@@ -5292,6 +5509,7 @@ impl App {
                     .font(code_editor::CodeFont::from_settings(&theme.font))
                     .passthrough(self.terminal_passthrough())
                     .focused(self.focus == Focus::Terminal)
+                    .blink(self.options.cursor_blink)
                     .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
                     .on_link(style::to_color(ui.accent), Message::TerminalLink)
                     .into(),
@@ -5630,6 +5848,15 @@ impl App {
             .style(button::text)
             .padding([0, 4]);
         right.push(style::tip(help, "Keyboard shortcuts (F1)", tooltip::Position::Top, ui));
+        let tint = style::to_color(ui.text);
+        let gear = iced::widget::svg(settings_icon())
+            .width(14)
+            .height(14)
+            .style(move |_, _| iced::widget::svg::Style { color: Some(tint) });
+        let open_settings = button(gear).on_press(Message::OpenSettings).style(button::text).padding([0, 4]);
+        let keys = self.keymap.label("view.settings");
+        let tip = if keys.is_empty() { "Settings".to_string() } else { format!("Settings ({keys})") };
+        right.push(style::tip(open_settings, tip, tooltip::Position::Top, ui));
 
         container(
             row![
@@ -5652,6 +5879,24 @@ const AUTOSAVE_SECONDS: u64 = 30;
 
 fn autosave_later() -> Task<Message> {
     Task::perform(sleep(std::time::Duration::from_secs(AUTOSAVE_SECONDS)), |()| Message::AutosaveSession)
+}
+
+/// A gear (the status bar's settings button), tinted by the theme when drawn.
+fn settings_icon() -> iced::widget::svg::Handle {
+    const GEAR: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><g fill="#000">
+<path fill-rule="evenodd" d="M8 3a5 5 0 1 0 0 10A5 5 0 0 0 8 3zm0 3a2 2 0 1 1 0 4 2 2 0 0 1 0-4z"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5" transform="rotate(45 8 8)"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5" transform="rotate(90 8 8)"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5" transform="rotate(135 8 8)"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5" transform="rotate(180 8 8)"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5" transform="rotate(225 8 8)"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5" transform="rotate(270 8 8)"/>
+<rect x="6.75" y="0.5" width="2.5" height="3.5" rx="0.5" transform="rotate(315 8 8)"/>
+</g></svg>"##;
+    static HANDLE: std::sync::LazyLock<iced::widget::svg::Handle> =
+        std::sync::LazyLock::new(|| iced::widget::svg::Handle::from_memory(GEAR.as_bytes()));
+    HANDLE.clone()
 }
 
 /// Completes after `duration`, without an async runtime timer.
@@ -5701,6 +5946,7 @@ fn command_message(id: &str) -> Option<Message> {
         "view.terminal" => Message::ToggleTerminal,
         "view.split" => Message::SplitMove,
         "view.shortcuts" => Message::OpenShortcuts,
+        "view.settings" => Message::OpenSettings,
         "help.classReference" => Message::OpenClassRef(None, None),
         "view.zoomIn" => Message::Zoom(1),
         "view.zoomOut" => Message::Zoom(-1),
