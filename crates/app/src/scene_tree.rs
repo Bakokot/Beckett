@@ -33,6 +33,8 @@ pub enum SceneEdit {
     /// A `res://` script, with its `uid://` when it has one.
     AttachScript { node: String, script: String, uid: Option<String> },
     DetachScript(String),
+    /// An instance of a `res://` scene (with its `uid://`) under `parent`.
+    Instance { parent: String, name: String, scene: String, uid: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,54 @@ pub enum SceneMessage {
     ToggleList,
     /// Open or close a folder of the SCENES list.
     ToggleFolder(PathBuf),
+    /// Ask which scene to instance under this node.
+    ChooseInstance(PathBuf, String),
+    /// Fold or unfold a node's children in the tree.
+    ToggleNode(PathBuf, String),
+    /// Ask the root type of a new scene in this folder.
+    NewScene(PathBuf),
+    /// Ask the name of a new scene in this folder, with a root of this type.
+    StartNewScene(PathBuf, String),
+    NewSceneInput(String),
+    NewSceneSubmit,
+    NewSceneClose,
+}
+
+/// The name field of a new scene, shown at the top of the view.
+pub struct NewSceneBar {
+    pub folder: PathBuf,
+    /// The folder as `res://menus/`.
+    pub label: String,
+    pub root_type: String,
+    pub name: String,
+    pub error: Option<String>,
+}
+
+impl NewSceneBar {
+    /// The scene's file: its name in snake_case, as Godot names them.
+    pub fn file(&self) -> PathBuf {
+        self.folder.join(format!("{}.tscn", file_stem(self.name.trim())))
+    }
+}
+
+/// `MainMenu` → `main_menu`, `Level 2` → `level_2`, `HUD` → `hud`.
+pub fn file_stem(name: &str) -> String {
+    let mut out = String::new();
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        if c.is_whitespace() || c == '-' {
+            if !out.ends_with('_') && !out.is_empty() {
+                out.push('_');
+            }
+        } else {
+            if c.is_uppercase() && previous.is_some_and(|p| p.is_lowercase() || p.is_ascii_digit()) && !out.ends_with('_') {
+                out.push('_');
+            }
+            out.extend(c.to_lowercase());
+        }
+        previous = Some(c);
+    }
+    out
 }
 
 /// The name field shown above the tree while a node is renamed.
@@ -187,6 +237,9 @@ pub fn apply(text: &str, edit: &SceneEdit) -> Result<String, String> {
         SceneEdit::Reparent { node, parent } => scene.reparent_node(node, parent, None).map(drop),
         SceneEdit::AttachScript { node, script, uid } => scene.attach_script(node, script, uid.as_deref()),
         SceneEdit::DetachScript(node) => scene.detach_script(node),
+        SceneEdit::Instance { parent, name, scene: res, uid } => {
+            scene.instance_scene(parent, name, res, uid.as_deref()).map(drop)
+        }
     };
     result.map_err(|e| e.to_string())?;
     Ok(scene.to_text())
@@ -305,6 +358,8 @@ pub struct ListState {
     pub filter: String,
     pub expanded: HashSet<PathBuf>,
     pub collapsed: bool,
+    /// Nodes whose children are hidden: scene file and node path.
+    pub folded: HashSet<(PathBuf, String)>,
 }
 
 /// Rows of a folder's contents, like the FILES tree: folders (with their
@@ -371,6 +426,7 @@ pub fn view<'a>(
     scene: Option<(&Path, &Result<Tree, String>)>,
     cursor_line: Option<usize>,
     rename: Option<&'a RenameBar>,
+    new_scene: Option<&'a NewSceneBar>,
     icon: &dyn Fn(&Tree, &SceneNode) -> Option<svg::Handle>,
     theme: &theme::Theme,
 ) -> Element<'a, Message> {
@@ -378,6 +434,7 @@ pub fn view<'a>(
     let muted = style::to_color(ui.text_muted);
     let message = |m: SceneMessage| Message::Scene(m);
     let heading = |label: String| text(label).size(11).color(muted);
+    let new_scene_bar = new_scene.map(|bar| new_scene_row(bar, ui));
 
     let arrow = if list.collapsed { ">" } else { "v" };
     let toggle = button(row![text(arrow).size(11).font(Font::MONOSPACE).color(muted), heading(format!("SCENES ({})", scenes.len()))].spacing(6))
@@ -387,6 +444,7 @@ pub fn view<'a>(
         .padding([2, 8]);
     let toggle = style::tip(toggle, if list.collapsed { "Show the project's scenes" } else { "Hide the scene list" }, Position::Bottom, ui);
     let mut parts: Vec<Element<'a, Message>> = vec![toggle];
+    parts.extend(new_scene_bar);
 
     if !list.collapsed {
         let filter = text_input("Filter scenes", &list.filter)
@@ -412,7 +470,7 @@ pub fn view<'a>(
     if let Some((path, _)) = scene {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         parts.push(container(heading(format!("NODES OF {}", name.to_uppercase()))).padding(iced::Padding { top: 6.0, ..[0, 8].into() }).into());
-        parts.push(container(tree_view(scene, cursor_line, rename, icon, theme)).height(Length::FillPortion(3)).into());
+        parts.push(container(tree_view(scene, cursor_line, rename, &list.folded, icon, theme)).height(Length::FillPortion(3)).into());
     } else if list.collapsed {
         let note = "Open a scene to see and edit its node tree";
         parts.push(container(text(note).size(12).color(muted)).padding([6, 12]).into());
@@ -438,6 +496,7 @@ fn tree_view<'a>(
     scene: Option<(&Path, &Result<Tree, String>)>,
     cursor_line: Option<usize>,
     rename: Option<&'a RenameBar>,
+    folded: &HashSet<(PathBuf, String)>,
     icon: &dyn Fn(&Tree, &SceneNode) -> Option<svg::Handle>,
     theme: &theme::Theme,
 ) -> Element<'a, Message> {
@@ -460,8 +519,27 @@ fn tree_view<'a>(
     let type_color = style::to_color(theme.syntax.r#type);
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     let rename = rename.filter(|bar| bar.scene == path);
+    let parents: HashSet<&str> = tree.nodes.iter().filter_map(|n| n.parent.as_deref()).collect();
+    // The folded node whose descendants are being skipped.
+    let mut hidden_under: Option<&str> = None;
     for (index, node) in tree.nodes.iter().enumerate() {
+        if hidden_under.is_some_and(|folded| is_within(&node.path, folded) && node.path != folded) {
+            continue;
+        }
+        let is_folded = folded.contains(&(path.to_path_buf(), node.path.clone()));
+        hidden_under = is_folded.then_some(node.path.as_str());
         let scene = path.to_path_buf();
+        // Nodes with children get an arrow to fold them; others its room.
+        let arrow: Element<'a, Message> = if parents.contains(node.path.as_str()) {
+            let arrow = if is_folded { Icon::ArrowRight } else { Icon::ArrowDown };
+            button(svg(arrow.handle()).width(12).height(12))
+                .on_press(Message::Scene(SceneMessage::ToggleNode(scene.clone(), node.path.clone())))
+                .style(button::text)
+                .padding(0)
+                .into()
+        } else {
+            space().width(12).into()
+        };
         if let Some(bar) = rename.filter(|bar| bar.node == node.path) {
             rows.push(rename_row(bar, node.depth, ui));
             continue;
@@ -479,6 +557,7 @@ fn tree_view<'a>(
         };
         let mut content = row![
             space().width(14.0 * node.depth as f32),
+            arrow,
             icon,
             text(node.name.clone()).size(13).color_maybe(name_color),
             text(kind).size(11).font(Font::MONOSPACE).color(type_color.scale_alpha(0.8)),
@@ -508,6 +587,36 @@ fn tree_view<'a>(
     let hint = text("Right-click a node to edit the tree").size(11).color(muted);
     let list = scrollable(Column::with_children(rows).width(Length::Fill)).height(Length::Fill);
     column![container(hint).padding([0, 12]), list].spacing(4).into()
+}
+
+/// Whether node `path` is `ancestor` or below it (every node is below `.`).
+fn is_within(path: &str, ancestor: &str) -> bool {
+    ancestor == "." || path == ancestor || path.starts_with(&format!("{ancestor}/"))
+}
+
+pub const NEW_SCENE_INPUT: &str = "scene-new-input";
+
+fn new_scene_row<'a>(bar: &'a NewSceneBar, ui: &theme::UiColors) -> Element<'a, Message> {
+    let message = |m: SceneMessage| Message::Scene(m);
+    let muted = style::to_color(ui.text_muted);
+    let input = text_input("Scene name, e.g. MainMenu", &bar.name)
+        .id(NEW_SCENE_INPUT)
+        .on_input(move |name| message(SceneMessage::NewSceneInput(name)))
+        .on_submit(message(SceneMessage::NewSceneSubmit))
+        .size(13)
+        .padding([2, 6]);
+    let title = text(format!("New {} scene in {}", bar.root_type, bar.label)).size(11).color(muted);
+    let hint = match &bar.error {
+        Some(error) => text(error.as_str()).size(11).color(style::to_color(ui.danger)),
+        None if bar.name.trim().is_empty() => text("Enter to create, Escape to cancel").size(11).color(muted),
+        None => {
+            let file = bar.file();
+            let file = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            text(format!("Creates {}{file}", bar.label)).size(11).color(muted)
+        }
+    };
+    let content = column![title, input, hint].spacing(3).padding([4, 8]);
+    crate::on_escape::on_escape(container(content).style(style::surface(ui)), message(SceneMessage::NewSceneClose)).into()
 }
 
 fn rename_row<'a>(bar: &'a RenameBar, depth: usize, ui: &theme::UiColors) -> Element<'a, Message> {
@@ -551,6 +660,32 @@ mod tests {
         assert_eq!(apply(SCENE, &SceneEdit::Shift("A".into(), -1)).unwrap(), SCENE);
         assert_eq!(apply(SCENE, &SceneEdit::Shift("C".into(), 1)).unwrap(), SCENE);
         assert!(apply(SCENE, &SceneEdit::Shift(".".into(), 1)).is_err());
+    }
+
+    #[test]
+    fn instances_scenes_under_a_node() {
+        let edit = SceneEdit::Instance { parent: "B".into(), name: "Gun".into(), scene: "res://gun.tscn".into(), uid: None };
+        let text = apply(SCENE, &edit).unwrap();
+        assert_eq!(order(&text), [".", "A", "B", "B/Gun", "C"]);
+        assert!(text.contains("[ext_resource type=\"PackedScene\" path=\"res://gun.tscn\""));
+    }
+
+    #[test]
+    fn new_scene_files_are_snake_case() {
+        assert_eq!(file_stem("MainMenu"), "main_menu");
+        assert_eq!(file_stem("HUD"), "hud");
+        assert_eq!(file_stem("Level2Boss"), "level2_boss");
+        assert_eq!(file_stem("pause menu"), "pause_menu");
+        assert_eq!(file_stem("player"), "player");
+        let bar = NewSceneBar {
+            folder: PathBuf::from("/game/menus"),
+            label: "res://menus/".into(),
+            root_type: "Control".into(),
+            name: " MainMenu ".into(),
+            error: None,
+        };
+        assert_eq!(bar.file(), Path::new("/game/menus").join("main_menu.tscn"));
+        assert!(is_within("A/B", "A") && is_within("A", ".") && !is_within("AB", "A"));
     }
 
     #[test]

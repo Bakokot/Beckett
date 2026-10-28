@@ -123,6 +123,21 @@ impl GodotProject {
         files
     }
 
+    /// The `uid://` Godot gave a file: from the header of a `.tscn` /
+    /// `.tres`, else from the `.uid` or `.import` file next to it.
+    pub fn uid_of(path: &Path) -> Option<String> {
+        let name = path.file_name()?.to_string_lossy().into_owned();
+        if name.ends_with(".tscn") || name.ends_with(".tres") {
+            return first_line(path).and_then(|line| header_uid(&line));
+        }
+        let beside = |suffix: &str| path.with_file_name(format!("{name}{suffix}"));
+        std::fs::read_to_string(beside(".uid"))
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|uid| uid.starts_with("uid://"))
+            .or_else(|| std::fs::read_to_string(beside(".import")).ok().and_then(|t| import_uid(&t)))
+    }
+
     /// The file with this `uid://`, found the way Godot records it: in a
     /// `.uid` file next to scripts and shaders, in the header of `.tscn` /
     /// `.tres` files, or in the `.import` file next to imported assets.
@@ -314,6 +329,10 @@ mod tests {
         let files = project.resource_files();
         assert_eq!(files, [root.join("icon.svg"), root.join("player.gd"), root.join("scenes").join("main.tscn")]);
         assert_eq!(project.scenes(), [root.join("scenes").join("main.tscn")]);
+        assert_eq!(GodotProject::uid_of(&root.join("player.gd")).as_deref(), Some("uid://aaa"));
+        assert_eq!(GodotProject::uid_of(&root.join("scenes").join("main.tscn")).as_deref(), Some("uid://bbb"));
+        assert_eq!(GodotProject::uid_of(&root.join("icon.svg")).as_deref(), Some("uid://ccc"));
+        assert_eq!(GodotProject::uid_of(&root.join("missing.gd")), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

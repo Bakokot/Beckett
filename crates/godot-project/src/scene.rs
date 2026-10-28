@@ -220,6 +220,13 @@ impl Scene {
         Ok(Self { sections, trailing: pending, crlf })
     }
 
+    /// The text of a new scene with only its root node. Godot gives it a
+    /// `uid://` the next time it saves it.
+    pub fn new_text(root_name: &str, root_type: &str) -> Result<String, SceneError> {
+        validate_name(root_name)?;
+        Ok(format!("[gd_scene format=3]\n\n[node name={} type={}]\n", quote(root_name), quote(root_type)))
+    }
+
     pub fn load(path: &Path) -> io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Self::parse(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -344,14 +351,46 @@ impl Scene {
     /// Adds a `type_name` node as the last child of `parent`; a taken name
     /// gets a number, as Godot does. Returns the new node's path.
     pub fn add_node(&mut self, parent: &str, name: &str, type_name: &str) -> Result<String, SceneError> {
+        self.insert_node(parent, name, ("type", quote(type_name)))
+    }
+
+    /// Adds an instance of the scene at `res_path` (with its `uid://`, when
+    /// it has one) as the last child of `parent`, named `name` or with a
+    /// number. Returns the new node's path.
+    pub fn instance_scene(
+        &mut self,
+        parent: &str,
+        name: &str,
+        res_path: &str,
+        uid: Option<&str>,
+    ) -> Result<String, SceneError> {
+        validate_name(name)?;
+        if self.find(parent).is_none() {
+            return Err(SceneError::NoSuchNode(parent.to_string()));
+        }
+        let id = self.ext_resource("PackedScene", res_path, uid);
+        let path = self.insert_node(parent, name, ("instance", format!("ExtResource({})", quote(&id))))?;
+        self.prune_resources();
+        Ok(path)
+    }
+
+    /// Adds a `[node]` after `parent`'s last descendant, with `extra` (its
+    /// type or instance) after the name and parent.
+    fn insert_node(&mut self, parent: &str, name: &str, extra: (&str, String)) -> Result<String, SceneError> {
         validate_name(name)?;
         let index = self.find(parent).ok_or_else(|| SceneError::NoSuchNode(parent.to_string()))?;
         let name = self.unique_name(parent, name);
-        let mut attrs = vec![
-            ("name".to_string(), quote(&name)),
-            ("type".to_string(), quote(type_name)),
-            ("parent".to_string(), quote(parent)),
-        ];
+        let mut attrs = vec![("name".to_string(), quote(&name))];
+        // Godot writes a type before the parent, an instance after it.
+        let extra = (extra.0.to_string(), extra.1);
+        let instance = extra.0 == "instance";
+        if !instance {
+            attrs.push(extra.clone());
+        }
+        attrs.push(("parent".to_string(), quote(parent)));
+        if instance {
+            attrs.push(extra);
+        }
         if let Some(id) = self.new_unique_id() {
             attrs.push(("unique_id".to_string(), id.to_string()));
         }
@@ -843,6 +882,27 @@ text = "two
             "position = Vector2(4, 0)\n\n[node name=\"Shape2\" type=\"Area2D\" parent=\"Player\"]\n\n[node name=\"Label\""
         ));
         assert!(text.ends_with("[lines]\"\n\n[node name=\"Label2\" type=\"Label\" parent=\".\"]\n\n[connection signal=\"fired\" from=\"Player/Gun\" to=\".\" method=\"_on_fired\"]\n\n[editable path=\"Player/Gun\"]\n"));
+    }
+
+    #[test]
+    fn instances_scenes_and_makes_new_ones() {
+        let mut s = scene();
+        assert_eq!(s.instance_scene(".", "Gun", "res://gun.tscn", None).unwrap(), "Gun");
+        let text = s.to_text();
+        // The scene already loaded is reused.
+        assert_eq!(text.matches("path=\"res://gun.tscn\"").count(), 1);
+        assert!(text.contains("[node name=\"Gun\" parent=\".\" instance=ExtResource(\"2_fghij\")]\n\n[connection"));
+        assert_eq!(s.node("Gun").unwrap().instance.as_deref(), Some("res://gun.tscn"));
+
+        let mut s = Scene::parse(&Scene::new_text("Menu", "Control").unwrap()).unwrap();
+        assert_eq!(s.to_text(), "[gd_scene format=3]\n\n[node name=\"Menu\" type=\"Control\"]\n");
+        s.instance_scene(".", "Button", "res://ui/button.tscn", Some("uid://b9")).unwrap();
+        let text = s.to_text();
+        // No `load_steps` to keep in step: Godot 4.6+ doesn't write it.
+        assert!(text.starts_with("[gd_scene format=3]\n\n[ext_resource"), "{text}");
+        assert!(text.contains("[ext_resource type=\"PackedScene\" uid=\"uid://b9\" path=\"res://ui/button.tscn\" id=\"1_"));
+        assert!(text.contains("[node name=\"Button\" parent=\".\" instance=ExtResource(\"1_"));
+        assert_eq!(Scene::new_text("a/b", "Node"), Err(SceneError::InvalidName("a/b".into())));
     }
 
     #[test]

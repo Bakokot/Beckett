@@ -541,6 +541,8 @@ struct App {
     scene_cache: scene_tree::Cache,
     /// A node being renamed in the SCENE view.
     scene_rename: Option<scene_tree::RenameBar>,
+    /// The name of a scene being created in the SCENE view.
+    new_scene: Option<scene_tree::NewSceneBar>,
     /// The SCENE view's list of the project's scenes.
     scene_list: scene_tree::ListState,
     /// Scenes instanced by the one shown, read from disk by `res://` path
@@ -777,6 +779,7 @@ impl App {
             outline_request: None,
             scene_cache: scene_tree::Cache::default(),
             scene_rename: None,
+            new_scene: None,
             scene_list: scene_tree::ListState::default(),
             instanced_scenes: RefCell::default(),
             link: None,
@@ -2148,6 +2151,7 @@ impl App {
             ("Go to Symbol in Project", "go.projectSymbol", Message::OpenPalette("#".to_string())),
             ("View: Outline", "", Message::ShowView(View::Outline)),
             ("View: Scene Tree", "", Message::ShowView(View::Scene)),
+            ("Scene: New Scene...", "", Message::Scene(scene_tree::SceneMessage::NewScene(PathBuf::new()))),
             ("View: Files", "", Message::ShowView(View::Files)),
             ("View: Project (Autoloads, Input Map)", "", Message::ShowView(View::Project)),
             ("File: New Script...", "", Message::OpenNewScript(None)),
@@ -4210,6 +4214,115 @@ impl App {
                     self.scene_list.expanded.insert(folder);
                 }
             }
+            SceneMessage::ToggleNode(scene, node) => {
+                let key = (scene, node);
+                if !self.scene_list.folded.remove(&key) {
+                    self.scene_list.folded.insert(key);
+                }
+            }
+            SceneMessage::ChooseInstance(scene, parent) => {
+                let Some(project) = &self.project else {
+                    return Task::none();
+                };
+                let Some(godot) = &project.godot else {
+                    return Task::none();
+                };
+                let choices: Vec<_> = project
+                    .scenes
+                    .iter()
+                    .filter(|path| **path != scene)
+                    .filter_map(|path| {
+                        let res = godot.to_res_path(path)?;
+                        // Named after the instanced scene's root, as Godot does.
+                        let root = self
+                            .instanced_scene(&res)
+                            .and_then(|tree| tree.as_ref().as_ref().ok().and_then(|t| t.nodes.first().map(|n| n.name.clone())));
+                        let name = root.unwrap_or_else(|| {
+                            path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Scene".to_string())
+                        });
+                        let uid = GodotProject::uid_of(path);
+                        let edit = SceneEdit::Instance { parent: parent.clone(), name: name.clone(), scene: res.clone(), uid };
+                        Some(choice(res, name, &scene, edit))
+                    })
+                    .collect();
+                if choices.is_empty() {
+                    self.status = Some("No other scene in the project to instance".to_string());
+                    return Task::none();
+                }
+                return self.open_choice("Instance which scene?", choices);
+            }
+            SceneMessage::NewScene(folder) => {
+                let Some(project) = &self.project else {
+                    return Task::none();
+                };
+                // From the palette: the active file's folder, else the project's.
+                let folder = if folder.as_os_str().is_empty() {
+                    self.active_tab()
+                        .and_then(|t| t.path.parent().map(Path::to_path_buf))
+                        .filter(|dir| dir.starts_with(&project.root))
+                        .unwrap_or_else(|| project.root.clone())
+                } else {
+                    folder
+                };
+                let choices = scene_tree::node_types(&self.native_classes)
+                    .into_iter()
+                    .map(|type_name| palette::Choice {
+                        label: type_name.clone(),
+                        detail: String::new(),
+                        message: Message::Scene(SceneMessage::StartNewScene(folder.clone(), type_name)),
+                    })
+                    .collect();
+                return self.open_choice("Root node type of the new scene?", choices);
+            }
+            SceneMessage::StartNewScene(folder, root_type) => {
+                let godot = self.project.as_ref().and_then(|p| p.godot.as_ref());
+                let label = godot.and_then(|g| g.to_res_path(&folder)).unwrap_or_else(|| folder.display().to_string());
+                let label = if label.ends_with('/') { label } else { format!("{label}/") };
+                let end = root_type.chars().count();
+                self.new_scene = Some(scene_tree::NewSceneBar { folder, label, name: root_type.clone(), root_type, error: None });
+                self.scene_list.collapsed = false;
+                self.show_view(View::Scene);
+                self.focus = Focus::Input;
+                return Task::batch([
+                    iced::widget::operation::focus(scene_tree::NEW_SCENE_INPUT),
+                    iced::widget::operation::select_range(scene_tree::NEW_SCENE_INPUT, 0, end),
+                ]);
+            }
+            SceneMessage::NewSceneInput(name) => {
+                if let Some(bar) = &mut self.new_scene {
+                    bar.name = name;
+                    bar.error = None;
+                }
+            }
+            SceneMessage::NewSceneSubmit => {
+                let Some(bar) = &self.new_scene else {
+                    return Task::none();
+                };
+                match create_scene(bar) {
+                    Ok(path) => {
+                        self.new_scene = None;
+                        self.focus = Focus::Editor;
+                        if let Some(project) = &mut self.project {
+                            if let Some(dir) = path.parent() {
+                                project.explorer.refresh(dir);
+                            }
+                            if let Some(godot) = &project.godot {
+                                project.scenes = godot.scenes();
+                            }
+                        }
+                        self.open_file(path);
+                    }
+                    Err(error) => {
+                        if let Some(bar) = &mut self.new_scene {
+                            bar.error = Some(error);
+                        }
+                    }
+                }
+            }
+            SceneMessage::NewSceneClose => {
+                self.new_scene = None;
+                self.focus = Focus::Editor;
+            }
         }
         Task::none()
     }
@@ -4927,6 +5040,7 @@ impl App {
                 let mut entries = vec![
                     Entry::item("New Script...", pick(Message::OpenNewScript(Some(path.clone())))),
                     Entry::item("New Folder...", pick(Message::OpenFileOp(FileOp::NewFolder(path.clone())))),
+                    Entry::item("New Scene Here...", pick(Message::Scene(scene_tree::SceneMessage::NewScene(path.clone())))),
                     Entry::Separator,
                 ];
                 // The project root itself can't be renamed or deleted from here.
@@ -4992,6 +5106,10 @@ impl App {
                 let when = |enabled: bool, message: Message| enabled.then_some(message);
                 let mut entries = vec![
                     Entry::item("Add Child Node...", scene_message(scene_tree::SceneMessage::ChooseType(scene.clone(), path.clone()))),
+                    Entry::item(
+                        "Instance Child Scene...",
+                        scene_message(scene_tree::SceneMessage::ChooseInstance(scene.clone(), path.clone())),
+                    ),
                     Entry::with_shortcut(
                         "Rename...",
                         "",
@@ -5785,7 +5903,7 @@ impl App {
                     let class = tree.class_of(node, &scene_of);
                     godot_icons::handle(&scene_tree::icon_name(class.as_deref(), &self.native_classes), light)
                 };
-                scene_tree::view(&project.scenes, &project.root, &self.scene_list, scene, line, self.scene_rename.as_ref(), &icon, theme)
+                scene_tree::view(&project.scenes, &project.root, &self.scene_list, scene, line, self.scene_rename.as_ref(), self.new_scene.as_ref(), &icon, theme)
             }
             View::Project => project_panel::view(&project.info, project.godot.as_ref(), theme),
             View::Problems => self.problems.view(ui, |p| self.display_path(p)),
@@ -6382,6 +6500,24 @@ fn read_theme_file(path: &Path) -> Result<theme::Theme, String> {
 /// Whether the SCENE view shows this file's tree.
 fn is_scene_file(path: &Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("tscn"))
+}
+
+/// Writes the scene the New Scene bar describes: its root node named as
+/// typed, its file in snake_case. Never replaces a file.
+fn create_scene(bar: &scene_tree::NewSceneBar) -> Result<PathBuf, String> {
+    let name = bar.name.trim();
+    if name.is_empty() {
+        return Err("Type a name for the scene".to_string());
+    }
+    let text = godot_project::Scene::new_text(name, &bar.root_type).map_err(|e| e.to_string())?;
+    let path = bar.file();
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    file_ops::validate_name(&file_name)?;
+    if path.exists() {
+        return Err(format!("{file_name} already exists"));
+    }
+    std::fs::write(&path, text).map_err(|e| format!("Cannot write {file_name}: {e}"))?;
+    Ok(path)
 }
 
 /// Shows a file (selected) or folder in the system file manager.

@@ -354,7 +354,12 @@ crates/
         class icon, and its inner nodes theirs (read from the instanced scene); a class without an icon takes its
         nearest parent's, else Node's. On light themes the colors are converted as the Godot editor does — not yet
         seen on screen. Not yet: icons of GDExtension classes (e.g. Terrain3D) and of `@icon` script classes
-  - [ ] Drag and drop of nodes in the tree; new scene; instance a scene as a child; collapse / expand
+  - [x] Fold / unfold a node's children (arrow before nodes that have some). Instance Child Scene (right-click a
+        node; palette of the project's other scenes; named after the scene's root, `uid` from its header). New
+        Scene (right-click a folder in FILES or SCENES, or "Scene: New Scene..." for the active file's folder): root
+        type in the palette, then its name; the file is the name in snake_case (`MainMenu` → `main_menu.tscn`),
+        never replacing one, and opens; Godot adds its `uid` on its next save — not yet seen on screen
+  - [ ] Drag and drop of nodes in the tree
 - [ ] **ER2** Inspector for node properties, exports and resources (metadata from `godot --dump-extension-api`)
 - [ ] **ER3** Signal connection editor
 - [ ] **ER4** Project settings and Input Map editors
