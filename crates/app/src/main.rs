@@ -8,6 +8,7 @@ mod completion;
 mod context_menu;
 mod drag;
 mod debugger;
+mod dock;
 mod docs;
 mod explorer;
 mod file_icons;
@@ -53,6 +54,7 @@ use std::rc::Rc;
 use editor_core::diff::{self, Hunk, LineChange};
 use editor_core::gdscript::TokenKind;
 use editor_core::{snippet, Buffer, Command, Language, Pos};
+use dock::{Dock, View};
 use godot_project::GodotProject;
 use iced::widget::{
     button, center, column, container, mouse_area, pick_list, responsive, row, scrollable, space, text, tooltip,
@@ -171,12 +173,23 @@ pub enum Message {
     NewTerminal,
     SelectTerminal(u64),
     CloseTerminal(u64),
-    ShowPanel(Panel),
-    ShowSidebar(SidebarView),
+    /// The OUTLINE view's filter changed.
+    OutlineFilter(outline::FilterMessage),
+    /// Show this view in its dock (left or right sidebar, bottom panel).
+    ShowView(View),
     /// List every use of this word in the project (whole word, case
     /// sensitive) in the SEARCH tab.
     SearchProject(String),
-    ClosePanel,
+    /// Hide the bottom panel (sidebars stay open while they hold views).
+    CloseDock(Dock),
+    /// Move a view to another dock (right-click on its tab).
+    MoveView(View, Dock),
+    /// Every view back in its first dock.
+    ResetLayout,
+    /// The bar left of the right sidebar moved by this many pixels.
+    ResizeRight(f32),
+    /// Double-click on that bar: back to the default width.
+    ResetRight,
     /// The bar right of the sidebar moved by this many pixels.
     ResizeSidebar(f32),
     /// Double-click on that bar: back to the default width.
@@ -293,17 +306,8 @@ pub enum ContextTarget {
     ClassRef,
     /// The code of the focused editor.
     Editor,
-}
-
-/// What the sidebar shows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SidebarView {
-    #[default]
-    Files,
-    Outline,
-    /// Main scene, autoloads and Input Map.
-    Project,
+    /// The tab of a dockable view (files, terminal…).
+    View(View),
 }
 
 /// Which panel receives keyboard input.
@@ -313,19 +317,6 @@ enum Focus {
     Terminal,
     /// A text field (find bar, project search) has focus.
     Input,
-}
-
-/// Tabs of the bottom panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Panel {
-    Problems,
-    Output,
-    Terminal,
-    Search,
-    /// Files changed since the staged text, with their hunks.
-    Changes,
-    /// The debug session: call stack and variables.
-    Debug,
 }
 
 /// The shells of the terminal panel, one per tab.
@@ -498,8 +489,10 @@ struct App {
     git_refresh: GitRefresh,
     /// The CHANGES panel shows only this file.
     changes_focus: Option<PathBuf>,
-    /// Open tab of the bottom panel, if it is shown.
-    panel: Option<Panel>,
+    /// The view the bottom panel shows, if it is open.
+    panel: Option<View>,
+    /// The view the right sidebar shows (when still docked there).
+    right_view: Option<View>,
     run: RunState,
     /// Find bar of the active tab.
     find: Option<Find>,
@@ -531,9 +524,12 @@ struct App {
     hover: Option<(Pos, Doc)>,
     signature: Option<Signature>,
     snippet: Option<SnippetSession>,
-    sidebar_view: SidebarView,
+    /// The view the left sidebar shows (when still docked there).
+    sidebar_view: View,
     /// Outline of the active GDScript file, from the language server.
     outline: Option<outline::Outline>,
+    /// What the OUTLINE view shows of it (kept from one file to the next).
+    outline_filter: outline::Filter,
     outline_request: Option<u64>,
     /// Ctrl+click target under the mouse, underlined while Ctrl is held.
     link: Option<(usize, usize)>,
@@ -699,6 +695,7 @@ impl App {
         let theme_index = settings.theme.as_ref().and_then(|name| themes.iter().position(|t| &t.name == name)).unwrap_or(0);
         let iced_theme = style::iced_theme(&themes[theme_index]);
         let sidebar_view = settings.sidebar;
+        let right_view = settings.right_view;
 
         let mut app = Self {
             project: None,
@@ -724,6 +721,7 @@ impl App {
             pending: HashMap::new(),
             problems: Problems::default(),
             panel: None,
+            right_view,
             panel_height: DEFAULT_PANEL_HEIGHT,
             split_ratio: 0.5,
             window_height: WINDOW_SIZE.1,
@@ -758,6 +756,7 @@ impl App {
             snippet: None,
             sidebar_view,
             outline: None,
+            outline_filter: outline::Filter::default(),
             outline_request: None,
             link: None,
             link_probe: None,
@@ -1070,7 +1069,7 @@ impl App {
     /// typing doesn't queue one per keystroke.
     fn refresh_outline(&mut self) {
         let in_palette = self.palette.as_ref().is_some_and(|p| p.input.starts_with('@'));
-        if self.sidebar_view != SidebarView::Outline && !in_palette {
+        if !self.is_shown(View::Outline) && !in_palette {
             return;
         }
         if self.outline_request.is_some_and(|id| self.pending.contains_key(&id)) {
@@ -1137,7 +1136,7 @@ impl App {
             Message::ShowChanges(path) => {
                 self.changes_focus = path;
                 self.git_refresh.wanted = true;
-                self.show_panel(Panel::Changes);
+                self.show_view(View::Changes);
             }
             Message::RevertHunk(path, hunk) => self.revert_hunk(&path, &hunk),
             Message::AutosaveSession => {
@@ -1371,20 +1370,40 @@ impl App {
             Message::FindReferences => self.find_references(),
             Message::StartRename => self.start_rename(),
             Message::Rename(message) => return self.on_rename(message),
-            Message::ToggleProblems => self.toggle_panel(Panel::Problems),
+            Message::ToggleProblems => self.toggle_view(View::Problems),
             Message::JumpTo(path, line, character) => {
                 self.dismiss_popups();
                 self.jump_to(path, line, character);
             }
             Message::ToggleTerminal => {
                 if self.project.is_some() {
-                    self.toggle_panel(Panel::Terminal);
+                    self.toggle_view(View::Terminal);
                 }
             }
-            Message::ShowPanel(panel) => self.show_panel(panel),
-            Message::ShowSidebar(view) => {
-                self.sidebar_view = view;
-                self.settings.sidebar = view;
+            Message::ShowView(view) => self.show_view(view),
+            Message::OutlineFilter(message) => {
+                if matches!(message, outline::FilterMessage::Text(_)) {
+                    // Typing goes to the filter box, not the editor.
+                    self.focus = Focus::Input;
+                }
+                self.outline_filter.update(message);
+            }
+            Message::CloseDock(dock) => self.close_dock(dock),
+            Message::MoveView(view, dock) => self.move_view(view, dock),
+            Message::ResetLayout => {
+                for view in View::ALL {
+                    self.settings.docks.move_to(view, view.home());
+                }
+                self.set_right_view(None);
+                let _ = self.settings.save();
+                self.status = Some("Every view is back in its first place".to_string());
+            }
+            Message::ResizeRight(delta) => {
+                self.settings.right_width = self.right_width() - delta;
+                self.settings_dirty = true;
+            }
+            Message::ResetRight => {
+                self.settings.right_width = settings::DEFAULT_RIGHT_WIDTH;
                 let _ = self.settings.save();
             }
             Message::SearchProject(word) => {
@@ -1396,7 +1415,7 @@ impl App {
                 query.case_sensitive = true;
                 query.whole_word = true;
                 query.regex = false;
-                self.show_panel(Panel::Search);
+                self.show_view(View::Search);
                 return self.on_search(SearchMessage::Run);
             }
             // Dragging the splitter up makes the panel taller.
@@ -1466,10 +1485,6 @@ impl App {
             Message::PasteText(None) => {}
             Message::Zoom(steps) => self.set_zoom(|s| s.zoom(steps)),
             Message::ZoomReset => self.set_zoom(|s| s.ui_scale = 1.0),
-            Message::ClosePanel => {
-                self.panel = None;
-                self.focus = Focus::Editor;
-            }
             // F5 while paused in the debugger continues.
             Message::RunProject if self.debug.as_ref().is_some_and(debugger::Session::paused) => {
                 self.on_debug(debugger::DebugMessage::Step("continue"));
@@ -1538,7 +1553,7 @@ impl App {
             }
             Message::NewTerminal => {
                 self.terminals.add();
-                self.show_panel(Panel::Terminal);
+                self.show_view(View::Terminal);
             }
             Message::SelectTerminal(id) => {
                 if let Some(index) = self.terminals.tabs.iter().position(|t| t.id == id) {
@@ -1572,20 +1587,6 @@ impl App {
             },
         }
         Task::none()
-    }
-
-    fn show_panel(&mut self, panel: Panel) {
-        self.panel = Some(panel);
-        // Showing the terminal starts a shell when there is none.
-        if panel == Panel::Terminal && self.terminals.tabs.is_empty() && self.project.is_some() {
-            self.terminals.add();
-        }
-        self.focus = match panel {
-            Panel::Terminal => Focus::Terminal,
-            Panel::Search => Focus::Input,
-            Panel::Problems | Panel::Output | Panel::Changes | Panel::Debug => Focus::Editor,
-        };
-        self.dismiss_popups();
     }
 
     /// A single-line selection, to prefill a search box.
@@ -2122,9 +2123,9 @@ impl App {
             ("Go to Line", "go.line", Message::OpenPalette(":".to_string())),
             ("Go to Symbol in File", "go.symbol", Message::OpenPalette("@".to_string())),
             ("Go to Symbol in Project", "go.projectSymbol", Message::OpenPalette("#".to_string())),
-            ("View: Outline", "", Message::ShowSidebar(SidebarView::Outline)),
-            ("View: Files", "", Message::ShowSidebar(SidebarView::Files)),
-            ("View: Project (Autoloads, Input Map)", "", Message::ShowSidebar(SidebarView::Project)),
+            ("View: Outline", "", Message::ShowView(View::Outline)),
+            ("View: Files", "", Message::ShowView(View::Files)),
+            ("View: Project (Autoloads, Input Map)", "", Message::ShowView(View::Project)),
             ("File: New Script...", "", Message::OpenNewScript(None)),
             ("Git: Show Changes", "", Message::ShowChanges(None)),
             ("Terminal: New Terminal", "", Message::NewTerminal),
@@ -2142,7 +2143,7 @@ impl App {
             ("Debug: Start Debugging (Main Scene)", "debug.start", Message::StartDebug { scene: false }),
             ("Debug: Start Debugging (Current Scene)", "debug.startScene", Message::StartDebug { scene: true }),
             ("Debug: Toggle Breakpoint", "debug.toggleBreakpoint", Message::ToggleBreakpoint),
-            ("Debug: Show Debug Panel", "", Message::ShowPanel(Panel::Debug)),
+            ("Debug: Show Debug Panel", "", Message::ShowView(View::Debug)),
             ("Godot: Choose Version...", "", Message::ChooseGodot),
             ("Run: Stop", "run.stop", Message::StopRun),
             ("Godot: Open in Editor", "", Message::OpenInGodot),
@@ -2152,9 +2153,10 @@ impl App {
             ("View: Zoom In", "view.zoomIn", Message::Zoom(1)),
             ("View: Zoom Out", "view.zoomOut", Message::Zoom(-1)),
             ("View: Reset Zoom", "view.zoomReset", Message::ZoomReset),
-            ("View: Problems", "", Message::ShowPanel(Panel::Problems)),
-            ("View: Output", "", Message::ShowPanel(Panel::Output)),
-            ("View: Search Results", "", Message::ShowPanel(Panel::Search)),
+            ("View: Problems", "", Message::ShowView(View::Problems)),
+            ("View: Output", "", Message::ShowView(View::Output)),
+            ("View: Search Results", "", Message::ShowView(View::Search)),
+            ("View: Reset Panel Layout", "", Message::ResetLayout),
             ("Terminal: Kill", "", Message::KillTerminal),
             ("Output: Clear", "", Message::ClearOutput),
             ("Language Server: Restart", "", Message::RestartLsp),
@@ -2233,7 +2235,7 @@ impl App {
         if let Some(text) = self.selection_query() {
             self.search.query.text = text;
         }
-        self.show_panel(Panel::Search);
+        self.show_view(View::Search);
         Task::batch([
             iced::widget::operation::focus(find::SEARCH_INPUT),
             iced::widget::operation::select_all(find::SEARCH_INPUT),
@@ -2362,23 +2364,126 @@ impl App {
         }
     }
 
+    /// The view `dock` shows, if it is open.
+    fn dock_view(&self, dock: Dock) -> Option<View> {
+        let wanted = match dock {
+            Dock::Left => Some(self.sidebar_view),
+            Dock::Bottom => self.panel,
+            Dock::Right => self.right_view,
+        };
+        dock::shown_in(&self.settings.docks, dock, wanted)
+    }
+
+    /// Whether `view` is on screen (the shown view of an open dock).
+    fn is_shown(&self, view: View) -> bool {
+        self.dock_view(self.settings.docks.dock(view)) == Some(view)
+    }
+
+    /// Brings `view` to the front of its dock, opening the dock.
+    fn show_view(&mut self, view: View) {
+        match self.settings.docks.dock(view) {
+            Dock::Left => {
+                if self.sidebar_view != view {
+                    self.sidebar_view = view;
+                    self.settings.sidebar = view;
+                    let _ = self.settings.save();
+                }
+            }
+            Dock::Bottom => self.panel = Some(view),
+            Dock::Right => self.set_right_view(Some(view)),
+        }
+        // Showing the terminal starts a shell when there is none.
+        if view == View::Terminal && self.terminals.tabs.is_empty() && self.project.is_some() {
+            self.terminals.add();
+        }
+        self.focus = match view {
+            View::Terminal => Focus::Terminal,
+            View::Search => Focus::Input,
+            _ => Focus::Editor,
+        };
+        self.dismiss_popups();
+    }
+
+    /// Takes `view` off the screen: the bottom panel closes; a sidebar,
+    /// always open while it holds views, shows another of its views.
+    fn hide_view(&mut self, view: View) {
+        if !self.is_shown(view) {
+            return;
+        }
+        let dock = self.settings.docks.dock(view);
+        let other = self.settings.docks.views(dock).into_iter().find(|&v| v != view);
+        match dock {
+            Dock::Left => {
+                if let Some(other) = other {
+                    self.sidebar_view = other;
+                }
+            }
+            Dock::Bottom => self.panel = None,
+            Dock::Right => {
+                if other.is_some() {
+                    self.set_right_view(other);
+                }
+            }
+        }
+        self.focus = Focus::Editor;
+    }
+
+    fn toggle_view(&mut self, view: View) {
+        if self.is_shown(view) {
+            self.hide_view(view);
+        } else {
+            self.show_view(view);
+        }
+    }
+
+    fn close_dock(&mut self, dock: Dock) {
+        match dock {
+            Dock::Left | Dock::Right => {}
+            Dock::Bottom => self.panel = None,
+        }
+        self.focus = Focus::Editor;
+    }
+
+    /// The view the right sidebar shows, remembered in the settings.
+    fn set_right_view(&mut self, view: Option<View>) {
+        self.right_view = view;
+        if self.settings.right_view != view {
+            self.settings.right_view = view;
+            let _ = self.settings.save();
+        }
+    }
+
+    /// Docks `view` in `dock` and shows it there.
+    fn move_view(&mut self, view: View, dock: Dock) {
+        let from = self.settings.docks.dock(view);
+        let was_shown = self.is_shown(view);
+        self.settings.docks.move_to(view, dock);
+        let _ = self.settings.save();
+        // The dock it left shows another view only if it was showing this one.
+        if was_shown && from != Dock::Left {
+            self.close_dock(from);
+        }
+        self.show_view(view);
+        self.status = Some(format!("{} moved to the {}", view.name(), dock.name().to_lowercase()));
+    }
+
+    /// The left sidebar's width, kept between its minimum and what leaves
+    /// the editor (and the right sidebar) their own.
     fn sidebar_width(&self) -> f32 {
-        let max = (self.window_width - MIN_EDITOR_WIDTH).max(settings::MIN_SIDEBAR_WIDTH);
+        let right = if self.dock_view(Dock::Right).is_some() { self.settings.right_width } else { 0.0 };
+        let max = (self.window_width - MIN_EDITOR_WIDTH - right).max(settings::MIN_SIDEBAR_WIDTH);
         self.settings.sidebar_width.clamp(settings::MIN_SIDEBAR_WIDTH, max)
+    }
+
+    fn right_width(&self) -> f32 {
+        let left = if self.dock_view(Dock::Left).is_some() { self.settings.sidebar_width } else { 0.0 };
+        let max = (self.window_width - MIN_EDITOR_WIDTH - left).max(settings::MIN_SIDEBAR_WIDTH);
+        self.settings.right_width.clamp(settings::MIN_SIDEBAR_WIDTH, max)
     }
 
     fn panel_height(&self) -> f32 {
         let max = (self.window_height - MIN_EDITOR_HEIGHT).max(MIN_PANEL_HEIGHT);
         self.panel_height.clamp(MIN_PANEL_HEIGHT, max)
-    }
-
-    fn toggle_panel(&mut self, panel: Panel) {
-        if self.panel == Some(panel) {
-            self.panel = None;
-            self.focus = Focus::Editor;
-        } else {
-            self.show_panel(panel);
-        }
     }
 
     /// The `res://` scene to run for the active tab: the scene itself, or
@@ -2536,7 +2641,7 @@ impl App {
         self.push_output(OutputLine::info(format!("> Debugging {what}")));
         self.debug_generation += 1;
         self.debug = Some(debugger::Session::new(self.debug_generation, port, scene, self.watches.clone()));
-        self.show_panel(Panel::Debug);
+        self.show_view(View::Debug);
     }
 
     fn on_debugger(&mut self, generation: u64, event: debugger::DebugEvent) -> Task<Message> {
@@ -2746,7 +2851,7 @@ impl App {
         self.refresh_marks();
         self.push_output(OutputLine::info(format!("> {}", request.command_line())));
         self.run.request = Some(request);
-        self.show_panel(Panel::Output);
+        self.show_view(View::Output);
     }
 
     fn on_run(&mut self, event: RunEvent) {
@@ -2893,13 +2998,17 @@ impl App {
         }
     }
 
-    /// Ends every shell and hides their panel; the next toggle starts a
-    /// fresh one.
+    /// Ends every shell and closes the bottom panel showing them (the next
+    /// toggle starts a fresh one); a sidebar showing them starts one now.
     fn reset_terminal(&mut self) {
         self.terminals.tabs.clear();
         self.terminals.active = 0;
-        if self.panel == Some(Panel::Terminal) {
+        if self.panel == Some(View::Terminal) {
             self.panel = None;
+        }
+        // A sidebar showing the terminal stays open, with a fresh shell.
+        if self.is_shown(View::Terminal) && self.project.is_some() {
+            self.terminals.add();
         }
         self.focus = Focus::Editor;
     }
@@ -3086,7 +3195,7 @@ impl App {
         self.search.references = Some(name);
         self.search.running = None;
         self.search.error = None;
-        self.show_panel(Panel::Search);
+        self.show_view(View::Search);
         self.focus = Focus::Editor;
     }
 
@@ -4660,6 +4769,18 @@ impl App {
                     Entry::with_shortcut(side, key("view.split"), Some(pick(Message::MoveTabToOtherSide(None)))),
                 ]
             }
+            ContextTarget::View(view) => {
+                let here = self.settings.docks.dock(*view);
+                let mut entries: Vec<Entry<Message>> = Dock::ALL
+                    .into_iter()
+                    .filter(|&dock| dock != here)
+                    .map(|dock| Entry::item(format!("Move to the {}", dock.name()), pick(Message::MoveView(*view, dock))))
+                    .collect();
+                entries.push(Entry::Separator);
+                let reset = (!self.settings.docks.is_default()).then(|| pick(Message::ResetLayout));
+                entries.push(Entry::with_shortcut("Reset Panel Layout", "", reset));
+                entries
+            }
             ContextTarget::Editor => {
                 let Some(tab) = self.active_tab() else {
                     return Vec::new();
@@ -5137,16 +5258,22 @@ impl App {
                     main = main.push(on_escape::on_escape(bar, Message::FileOp(FileOpMessage::Close)));
                 }
                 main = main.push(self.editor_area());
-                if let Some(panel) = self.panel {
-                    let ui = &self.current_theme().ui;
-                    let (line, active) = (style::to_color(ui.border), style::to_color(ui.accent));
-                    main = main.push(splitter::splitter(line, active, Message::ResizePanel));
-                    main = main.push(self.bottom_panel(panel));
-                }
                 let ui = &self.current_theme().ui;
                 let (line, active) = (style::to_color(ui.border), style::to_color(ui.accent));
-                let edge = splitter::vertical(line, active, Message::ResizeSidebar).on_reset(Message::ResetSidebar);
-                let body = row![self.sidebar(project), edge, main];
+                if let Some(view) = self.dock_view(Dock::Bottom) {
+                    main = main.push(splitter::splitter(line, active, Message::ResizePanel));
+                    main = main.push(self.dock_pane(Dock::Bottom, view, project));
+                }
+                let mut body = Row::new();
+                if let Some(view) = self.dock_view(Dock::Left) {
+                    let edge = splitter::vertical(line, active, Message::ResizeSidebar).on_reset(Message::ResetSidebar);
+                    body = body.push(self.dock_pane(Dock::Left, view, project)).push(edge);
+                }
+                body = body.push(main);
+                if let Some(view) = self.dock_view(Dock::Right) {
+                    let edge = splitter::vertical(line, active, Message::ResizeRight).on_reset(Message::ResetRight);
+                    body = body.push(edge).push(self.dock_pane(Dock::Right, view, project));
+                }
                 match &self.palette {
                     // Drawn over everything, centered near the top. A
                     // backdrop under it catches clicks outside the box, which
@@ -5268,44 +5395,126 @@ impl App {
         center(content).into()
     }
 
-    fn sidebar<'a>(&'a self, project: &'a Project) -> Element<'a, Message> {
-        let header = row![
-            text(self.project_name(project).to_uppercase()).size(12),
-            space::horizontal(),
-            style::tip(
-                button(text("Open…").size(12))
-                    .on_press(Message::OpenFolderDialog)
-                    .style(button::text)
-                    .padding([2, 6]),
-                "Open a project folder (Ctrl+O)",
-                tooltip::Position::Bottom,
-                &self.current_theme().ui,
-            ),
-        ]
-        .align_y(Alignment::Center)
-        .padding([6, 8]);
-
-        let ui = &self.current_theme().ui;
-        let view_tab = |label: &'static str, view: SidebarView, description: &'static str| {
-            let style: fn(&iced::Theme, button::Status) -> button::Style =
-                if self.sidebar_view == view { button::secondary } else { button::text };
-            let tab = button(text(label).size(11)).on_press(Message::ShowSidebar(view)).style(style).padding([2, 8]);
-            style::tip(tab, description, tooltip::Position::Bottom, ui)
+    /// A dock: the tabs of its views (right-click one to move it), the shown
+    /// view's actions, then the view. The left sidebar starts with the
+    /// project's name.
+    fn dock_pane<'a>(&'a self, dock: Dock, view: View, project: &'a Project) -> Element<'a, Message> {
+        let theme = self.current_theme();
+        let ui = &theme.ui;
+        let muted = style::to_color(ui.text_muted);
+        let action = |label, message, description: &str| {
+            let button = button(text(label).size(12)).on_press(message).style(button::text).padding([0, 6]);
+            style::tip(button, description, tooltip::Position::Top, ui)
         };
-        let tabs = row![
-            view_tab("FILES", SidebarView::Files, "Project files"),
-            view_tab("OUTLINE", SidebarView::Outline, "Functions, variables and signals of the current file (Ctrl+Shift+O to search them)"),
-            view_tab("PROJECT", SidebarView::Project, "Main scene, autoloads and Input Map of project.godot"),
-        ]
-        .spacing(4)
-        .padding([0, 8]);
+        let side = dock != Dock::Bottom;
 
-        let body: Element<'a, Message> = match self.sidebar_view {
-            SidebarView::Files => {
+        let tabs = self.settings.docks.views(dock).into_iter().map(|tab| {
+            let style: fn(&iced::Theme, button::Status) -> button::Style =
+                if tab == view { button::secondary } else { button::text };
+            let size = if side { 11 } else { 12 };
+            let choose = button(text(self.view_label(tab)).size(size)).on_press(Message::ShowView(tab)).style(style).padding([2, 8]);
+            // No tooltip over the menu its right-click opens.
+            let choose: Element<'a, Message> = match self.context_menu {
+                Some(_) => choose.into(),
+                None => style::tip(choose, tab.description(), tooltip::Position::Bottom, ui),
+            };
+            context_area(choose, move |point| Message::ContextMenu(ContextTarget::View(tab), point)).into()
+        });
+        let tabs = Row::with_children(tabs).spacing(4);
+
+        let mut actions: Vec<Element<'a, Message>> = Vec::new();
+        match view {
+            View::Output if self.is_running() => actions.push(action("stop", Message::StopRun, "Stop the game (F8)")),
+            View::Output => actions.push(action("clear", Message::ClearOutput, "Clear the output")),
+            View::Terminal => actions.push(action("kill", Message::KillTerminal, "End this shell (the last one closes the panel)")),
+            View::Changes => {
+                if let Some(path) = &self.changes_focus {
+                    actions.push(text(self.display_path(path)).size(12).color(muted).into());
+                    actions.push(action("show all", Message::ShowChanges(None), "List every changed file"));
+                }
+                actions.push(action("refresh", Message::RefreshGit, "Read the git status again"));
+            }
+            View::Debug => {
+                if let Some(session) = &self.debug {
+                    let key = |id: &str| self.keymap.label(id);
+                    for control in debugger::controls(session, ui, key) {
+                        actions.push(control.map(Message::Debug));
+                    }
+                } else {
+                    let start = format!("Debug the main scene ({})", self.keymap.label("debug.start"));
+                    actions.push(action("start", Message::StartDebug { scene: false }, &start));
+                }
+            }
+            _ => {}
+        }
+        // Sidebars stay open while they hold views; only the panel closes.
+        if dock == Dock::Bottom {
+            actions.push(action("x", Message::CloseDock(dock), "Close the panel"));
+        }
+        let actions = Row::with_children(actions).spacing(4).align_y(Alignment::Center);
+
+        let mut content = column![].spacing(4);
+        if dock == Dock::Left {
+            let open = button(text("Open…").size(12)).on_press(Message::OpenFolderDialog).style(button::text).padding([2, 6]);
+            let header = row![
+                text(self.project_name(project).to_uppercase()).size(12),
+                space::horizontal(),
+                style::tip(open, "Open a project folder (Ctrl+O)", tooltip::Position::Bottom, ui),
+            ]
+            .align_y(Alignment::Center)
+            .padding([6, 8]);
+            content = content.push(header);
+        }
+        // Sidebars are narrow: their tabs wrap, the actions go under them.
+        content = if side {
+            let top = if dock == Dock::Right { 6.0 } else { 0.0 };
+            let padding = iced::Padding { top, bottom: 0.0, left: 8.0, right: 8.0 };
+            content.push(column![tabs.wrap().vertical_spacing(4), row![space::horizontal(), actions]].spacing(2).padding(padding))
+        } else {
+            content.push(row![tabs, space::horizontal(), actions].align_y(Alignment::Center).padding([4, 8]))
+        };
+        // The shells' tabs, on their own row under the view's tabs.
+        if view == View::Terminal {
+            content = content.push(container(self.terminal_tabs()).padding(iced::Padding { top: 0.0, bottom: 4.0, left: 8.0, right: 8.0 }));
+        }
+        let content = container(content.push(self.view_body(view, project))).style(style::surface(ui));
+        match dock {
+            Dock::Left => content.width(self.sidebar_width()).height(Length::Fill),
+            Dock::Right => content.width(self.right_width()).height(Length::Fill),
+            Dock::Bottom => content.width(Length::Fill).height(self.panel_height()),
+        }
+        .into()
+    }
+
+    /// The label of a view's tab, with its counts and state.
+    fn view_label(&self, view: View) -> String {
+        match view {
+            View::Problems => {
+                let (errors, warnings) = self.problems.counts();
+                format!("PROBLEMS  {errors}/{warnings}")
+            }
+            View::Output if self.is_running() => "OUTPUT (running)".to_string(),
+            View::Changes => match self.project.as_ref().map_or(0, |p| p.git_files.len()) {
+                0 => "CHANGES".to_string(),
+                n => format!("CHANGES  {n}"),
+            },
+            View::Debug => match &self.debug {
+                Some(session) if session.paused() => "DEBUG (paused)".to_string(),
+                Some(_) => "DEBUG (running)".to_string(),
+                None => "DEBUG".to_string(),
+            },
+            _ => view.name().to_uppercase(),
+        }
+    }
+
+    fn view_body<'a>(&'a self, view: View, project: &'a Project) -> Element<'a, Message> {
+        let theme = self.current_theme();
+        let ui = &theme.ui;
+        match view {
+            View::Files => {
                 let active = self.active_tab().map(|t| t.path.as_path());
                 // Right-click below or between the rows: the project root's menu.
                 let root = project.root.clone();
-                let ui = &self.current_theme().ui;
                 let git = explorer::GitLook {
                     status: &project.git_status,
                     modified: style::to_color(ui.warning),
@@ -5315,20 +5524,30 @@ impl App {
                 let files = scrollable(project.explorer.view(active, &git)).height(Length::Fill);
                 fallback_context_area(files, move |point| Message::ContextMenu(ContextTarget::Folder(root.clone()), point)).into()
             }
-            SidebarView::Outline => {
+            View::Outline => {
                 let tab = self.active_tab();
                 let outline = self.outline.as_ref().filter(|o| tab.is_some_and(|t| uri::same_path(&t.path, &o.path)));
                 let line = tab.map(|t| t.buffer.char_to_pos(t.buffer.primary().head).line as u32);
-                outline::view(outline, line, self.current_theme())
+                outline::view(outline, &self.outline_filter, line, theme)
             }
-            SidebarView::Project => project_panel::view(&project.info, project.godot.as_ref(), self.current_theme()),
-        };
-
-        container(column![header, tabs, body].spacing(4))
-            .width(self.sidebar_width())
-            .height(Length::Fill)
-            .style(style::surface(&self.current_theme().ui))
-            .into()
+            View::Project => project_panel::view(&project.info, project.godot.as_ref(), theme),
+            View::Problems => self.problems.view(ui, |p| self.display_path(p)),
+            View::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),
+            View::Output => self.output_view(),
+            View::Changes => self.changes_view(),
+            View::Debug => self.debug_view(),
+            View::Terminal => match self.terminals.active().and_then(|t| t.session.as_ref()) {
+                Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
+                    .font(code_editor::CodeFont::from_settings(&theme.font))
+                    .passthrough(self.terminal_passthrough())
+                    .focused(self.focus == Focus::Terminal)
+                    .blink(self.options.cursor_blink)
+                    .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
+                    .on_link(style::to_color(ui.accent), Message::TerminalLink)
+                    .into(),
+                None => center(text("Starting shell...").size(12).color(style::to_color(ui.text_muted))).into(),
+            },
+        }
     }
 
     fn editor_area(&self) -> Element<'_, Message> {
@@ -5438,97 +5657,6 @@ impl App {
     }
 
     /// The bottom panel: Problems / Output / Terminal tabs and the open one.
-    fn bottom_panel(&self, panel: Panel) -> Element<'_, Message> {
-        let theme = self.current_theme();
-        let ui = &theme.ui;
-        let muted = style::to_color(ui.text_muted);
-        let action = |label, message, description: &str| {
-            let button = button(text(label).size(12)).on_press(message).style(button::text).padding([0, 6]);
-            style::tip(button, description, tooltip::Position::Top, ui)
-        };
-
-        let (errors, warnings) = self.problems.counts();
-        let tabs = [
-            (Panel::Problems, format!("PROBLEMS  {errors}/{warnings}")),
-            (Panel::Output, if self.is_running() { "OUTPUT (running)".to_string() } else { "OUTPUT".to_string() }),
-            (Panel::Terminal, "TERMINAL".to_string()),
-            (Panel::Search, "SEARCH".to_string()),
-            (Panel::Changes, match self.project.as_ref().map_or(0, |p| p.git_files.len()) {
-                0 => "CHANGES".to_string(),
-                n => format!("CHANGES  {n}"),
-            }),
-            (Panel::Debug, match &self.debug {
-                Some(session) if session.paused() => "DEBUG (paused)".to_string(),
-                Some(_) => "DEBUG (running)".to_string(),
-                None => "DEBUG".to_string(),
-            }),
-        ]
-        .into_iter()
-        .map(|(tab, label)| {
-            let style: fn(&iced::Theme, button::Status) -> button::Style =
-                if tab == panel { button::secondary } else { button::text };
-            button(text(label).size(12)).on_press(Message::ShowPanel(tab)).style(style).padding([2, 8]).into()
-        });
-
-        let mut header = Row::with_children(tabs).spacing(4).align_y(Alignment::Center);
-        header = header.push(space::horizontal());
-        match panel {
-            Panel::Output if self.is_running() => header = header.push(action("stop", Message::StopRun, "Stop the game (F8)")),
-            Panel::Output => header = header.push(action("clear", Message::ClearOutput, "Clear the output")),
-            Panel::Terminal => header = header.push(action("kill", Message::KillTerminal, "End this shell (the last one closes the panel)")),
-            Panel::Changes => {
-                if let Some(path) = &self.changes_focus {
-                    header = header.push(text(self.display_path(path)).size(12).color(muted));
-                    header = header.push(action("show all", Message::ShowChanges(None), "List every changed file"));
-                }
-                header = header.push(action("refresh", Message::RefreshGit, "Read the git status again"));
-            }
-            Panel::Debug => {
-                if let Some(session) = &self.debug {
-                    let key = |id: &str| self.keymap.label(id);
-                    for control in debugger::controls(session, ui, key) {
-                        header = header.push(control.map(Message::Debug));
-                    }
-                } else {
-                    let start = format!("Debug the main scene ({})", self.keymap.label("debug.start"));
-                    header = header.push(action("start", Message::StartDebug { scene: false }, &start));
-                }
-            }
-            Panel::Problems | Panel::Search => {}
-        }
-        header = header.push(action("x", Message::ClosePanel, "Close the panel"));
-
-        let body: Element<'_, Message> = match panel {
-            Panel::Problems => self.problems.view(ui, |p| self.display_path(p)),
-            Panel::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),
-            Panel::Output => self.output_view(),
-            Panel::Changes => self.changes_view(),
-            Panel::Debug => self.debug_view(),
-            Panel::Terminal => match self.terminals.active().and_then(|t| t.session.as_ref()) {
-                Some(session) => TerminalView::new(session, terminal_panel::palette(theme), Message::FocusTerminal)
-                    .font(code_editor::CodeFont::from_settings(&theme.font))
-                    .passthrough(self.terminal_passthrough())
-                    .focused(self.focus == Focus::Terminal)
-                    .blink(self.options.cursor_blink)
-                    .selection_color(style::to_color(ui.accent).scale_alpha(0.4))
-                    .on_link(style::to_color(ui.accent), Message::TerminalLink)
-                    .into(),
-                None => center(text("Starting shell...").size(12).color(muted)).into(),
-            },
-        };
-
-        let mut content = column![header.padding([4, 8])];
-        // The shells' tabs, on their own row under the panel's tabs.
-        if panel == Panel::Terminal {
-            content = content.push(container(self.terminal_tabs()).padding(iced::Padding { top: 0.0, bottom: 4.0, left: 8.0, right: 8.0 }));
-        }
-        container(content.push(body))
-            .width(Length::Fill)
-            .height(self.panel_height())
-            .style(style::surface(ui))
-            .into()
-    }
-
     /// The DEBUG panel: the session's state, call stack and variables, or
     /// how to start one.
     fn debug_view(&self) -> Element<'_, Message> {

@@ -210,6 +210,9 @@ crates/
 **LSP / Godot**
 - [x] Outline panel (sidebar OUTLINE tab, nested, current symbol highlighted, remembered) and go to
       symbol in file (Ctrl+Shift+O / `@` in the palette) — seen on screen
+      Filter at its top: by name (every word, any case) and by kind (class, func, signal, var, const, enum chips;
+      click hides or shows a kind, right-click shows it alone); what matches inside a class or enum keeps its parent
+      (faded) unless that kind is hidden, then it moves out a level; kind tags in one column, names indented; the filter stays from one file to the next — seen on screen
 - [x] Go to symbol in project (Ctrl+T / `#` in the palette): classes, functions, signals, constants,
       variables and enums of every script, inner-class members included, open tabs read unsaved.
       Godot 4.7.1 has no `workspace/symbol`, so declarations are scanned client-side
@@ -284,7 +287,13 @@ crates/
 **Workspace**
 - [x] Resizable sidebar: drag the bar on its right (160 px minimum, the editor keeps 400 px), double-click
       it for the default 260 px; the width is kept in settings — not yet seen on screen
-- [ ] Dockable panels
+- [x] Dockable panels: every view (Files, Outline, Project, Problems, Output, Terminal, Search, Changes, Debug)
+      lives in the left sidebar, the bottom panel or a new right sidebar; right-click its tab to move it ("Reset
+      Panel Layout" there or in the palette puts them all back). Like the left one, the right sidebar is always shown
+      while it holds a view (it goes once the last one moves out) and is resizable (double-click its edge for the
+      default width); a sidebar showing the terminal starts a shell when a project
+      opens. Layout and widths kept in settings.json. No drag and drop of tabs yet — seen on screen (moving Outline
+      and Terminal to the right, restart, reset)
 - [x] Remappable keybindings: click a shortcut on the F1 page and press the new keys (Backspace
       unbinds, "reset" restores); overrides in `keybindings.json`; menus and palette show the
       current keys; terminal passthrough follows the bindings

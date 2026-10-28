@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::SidebarView;
+use crate::dock::{Layout, View};
 
 pub const ZOOM_STEP: f32 = 0.1;
 /// The sidebar's width until it is dragged (double-clicking its edge comes back to it).
 pub const DEFAULT_SIDEBAR_WIDTH: f32 = 260.0;
 pub const MIN_SIDEBAR_WIDTH: f32 = 160.0;
+pub const DEFAULT_RIGHT_WIDTH: f32 = 320.0;
 pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,8 +34,8 @@ pub struct Settings {
     pub inline_diagnostics: bool,
     /// How long the mouse rests on a word before its documentation shows.
     pub hover_delay_ms: u64,
-    /// What the sidebar shows: files, outline or project.
-    pub sidebar: SidebarView,
+    /// The view the left sidebar shows.
+    pub sidebar: View,
     /// Name of the theme in use, restored at startup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
@@ -49,6 +50,14 @@ pub struct Settings {
     pub light_theme: Option<String>,
     /// Width of the sidebar (files, outline, project), in pixels.
     pub sidebar_width: f32,
+    /// Width of the right sidebar, in pixels.
+    pub right_width: f32,
+    /// The view the right sidebar shows (its first one when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_view: Option<View>,
+    /// Views moved to another dock (sidebar, panel).
+    #[serde(skip_serializing_if = "Layout::is_default")]
+    pub docks: Layout,
     /// Order of the theme list, by name (themes not in it come after).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub theme_order: Vec<String>,
@@ -65,13 +74,16 @@ impl Default for Settings {
             indent_guides: true,
             inline_diagnostics: true,
             hover_delay_ms: 500,
-            sidebar: SidebarView::Files,
+            sidebar: View::Files,
             theme: None,
             follow_os_theme: false,
             dark_theme: None,
             light_theme: None,
             theme_order: Vec::new(),
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            right_width: DEFAULT_RIGHT_WIDTH,
+            docks: Layout::default(),
+            right_view: None,
         }
     }
 }
@@ -109,6 +121,9 @@ impl Settings {
         self.ui_scale = self.ui_scale.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
         if !self.sidebar_width.is_finite() || self.sidebar_width < MIN_SIDEBAR_WIDTH {
             self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+        }
+        if !self.right_width.is_finite() || self.right_width < MIN_SIDEBAR_WIDTH {
+            self.right_width = DEFAULT_RIGHT_WIDTH;
         }
         self.hover_delay_ms = self.hover_delay_ms.clamp(HOVER_DELAY_RANGE.0, HOVER_DELAY_RANGE.1);
         self
