@@ -4134,7 +4134,7 @@ impl App {
                     .map(|n| {
                         let label = if n.parent.is_none() { format!("{} (root)", n.name) } else { n.path.clone() };
                         let detail = n.type_name.clone().unwrap_or_default();
-                        choice(label, detail, &scene, SceneEdit::Reparent { node: node.clone(), parent: n.path.clone() })
+                        choice(label, detail, &scene, SceneEdit::Reparent { node: node.clone(), parent: n.path.clone(), position: None })
                     })
                     .collect();
                 return self.open_choice("Move the node under which node?", choices);
@@ -4322,6 +4322,37 @@ impl App {
             SceneMessage::NewSceneClose => {
                 self.new_scene = None;
                 self.focus = Focus::Editor;
+            }
+            SceneMessage::DragStart(scene, node) => {
+                self.scene_list.drag = Some(scene_tree::NodeDrag { scene, node, over: None });
+            }
+            SceneMessage::DragOver(target, spot) => {
+                if let Some(drag) = &mut self.scene_list.drag {
+                    drag.over = Some((target, spot));
+                }
+            }
+            SceneMessage::DragLeave(target) => {
+                if let Some(drag) = &mut self.scene_list.drag {
+                    if drag.over.as_ref().is_some_and(|(over, _)| *over == target) {
+                        drag.over = None;
+                    }
+                }
+            }
+            SceneMessage::DragEnd => {
+                let Some(drag) = self.scene_list.drag.take() else {
+                    return Task::none();
+                };
+                let Some((target, spot)) = drag.over else {
+                    return Task::none();
+                };
+                let edit = self
+                    .scene_tree_of(&drag.scene)
+                    .and_then(|tree| tree.as_ref().as_ref().ok().and_then(|t| scene_tree::drop_edit(t, &drag.node, &target, spot)));
+                if let Some(edit) = edit {
+                    if let Err(error) = self.edit_scene(&drag.scene, &edit) {
+                        self.status = Some(error);
+                    }
+                }
             }
         }
         Task::none()

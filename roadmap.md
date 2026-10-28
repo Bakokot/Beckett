@@ -359,7 +359,10 @@ crates/
         Scene (right-click a folder in FILES or SCENES, or "Scene: New Scene..." for the active file's folder): root
         type in the palette, then its name; the file is the name in snake_case (`MainMenu` → `main_menu.tscn`),
         never replacing one, and opens; Godot adds its `uid` on its next save — not yet seen on screen
-  - [ ] Drag and drop of nodes in the tree
+  - [x] Drag and drop of nodes in the tree: on a row's top / bottom edge (a line shows it) it goes before / after
+        that node, in its middle (the row is outlined) it becomes its last child; on the root, always inside it.
+        One undo step like the other edits; nodes of an instanced scene and the root don't drag — not yet seen on screen
+  - [ ] `NodePath` property values follow renamed / moved nodes
 - [ ] **ER2** Inspector for node properties, exports and resources (metadata from `godot --dump-extension-api`)
 - [ ] **ER3** Signal connection editor
 - [ ] **ER4** Project settings and Input Map editors

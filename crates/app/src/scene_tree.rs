@@ -11,10 +11,11 @@ use std::rc::Rc;
 
 use godot_project::{Scene, SceneNode};
 use iced::widget::tooltip::Position;
-use iced::widget::{button, column, container, row, scrollable, space, svg, text, text_input, Column};
+use iced::widget::{button, column, container, mouse_area, row, scrollable, space, svg, text, text_input, Column};
 use iced::{Alignment, Background, Border, Element, Font, Length};
 
 use crate::context_menu::context_area;
+use crate::drag::drag_source;
 use crate::file_icons::Icon;
 use crate::{style, ContextTarget, Message};
 
@@ -29,7 +30,8 @@ pub enum SceneEdit {
     Remove(String),
     /// Up (-1) or down (1) among its siblings.
     Shift(String, isize),
-    Reparent { node: String, parent: String },
+    /// Under `parent`, at `position` among its other children (last: `None`).
+    Reparent { node: String, parent: String, position: Option<usize> },
     /// A `res://` script, with its `uid://` when it has one.
     AttachScript { node: String, script: String, uid: Option<String> },
     DetachScript(String),
@@ -68,6 +70,14 @@ pub enum SceneMessage {
     NewSceneInput(String),
     NewSceneSubmit,
     NewSceneClose,
+    /// A node of this scene started being dragged.
+    DragStart(PathBuf, String),
+    /// The dragged node is over this node's row, at this spot.
+    DragOver(String, Spot),
+    /// The mouse left this node's row.
+    DragLeave(String),
+    /// The drag ended: drop where it is over, if anywhere.
+    DragEnd,
 }
 
 /// The name field of a new scene, shown at the top of the view.
@@ -234,7 +244,7 @@ pub fn apply(text: &str, edit: &SceneEdit) -> Result<String, String> {
             // Among the other children: the one now at `target` goes before it.
             scene.reparent_node(node, &parent, Some(target)).map(drop)
         }
-        SceneEdit::Reparent { node, parent } => scene.reparent_node(node, parent, None).map(drop),
+        SceneEdit::Reparent { node, parent, position } => scene.reparent_node(node, parent, *position).map(drop),
         SceneEdit::AttachScript { node, script, uid } => scene.attach_script(node, script, uid.as_deref()),
         SceneEdit::DetachScript(node) => scene.detach_script(node),
         SceneEdit::Instance { parent, name, scene: res, uid } => {
@@ -360,6 +370,59 @@ pub struct ListState {
     pub collapsed: bool,
     /// Nodes whose children are hidden: scene file and node path.
     pub folded: HashSet<(PathBuf, String)>,
+    /// A node being dragged in the tree.
+    pub drag: Option<NodeDrag>,
+}
+
+/// A node being dragged to move it, and where it would drop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeDrag {
+    pub scene: PathBuf,
+    pub node: String,
+    /// The node under the mouse, and where on its row.
+    pub over: Option<(String, Spot)>,
+}
+
+/// Where on a node's row a dragged node drops: above it (as the sibling
+/// before), on it (as its last child) or below it (the sibling after).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    Before,
+    Into,
+    After,
+}
+
+impl Spot {
+    /// From the mouse's height on a row (about 21 pixels high): its top and
+    /// bottom edges are between rows.
+    pub fn at(y: f32) -> Self {
+        const EDGE: f32 = 5.0;
+        const ROW: f32 = 21.0;
+        if y < EDGE {
+            Spot::Before
+        } else if y > ROW - EDGE {
+            Spot::After
+        } else {
+            Spot::Into
+        }
+    }
+}
+
+/// The edit dropping `node` on `target` makes, if any: a move under the
+/// target, or next to it among its siblings (the root takes children only).
+pub fn drop_edit(tree: &Tree, node: &str, target: &str, spot: Spot) -> Option<SceneEdit> {
+    if node == target || is_within(target, node) {
+        return None;
+    }
+    let target_node = tree.node(target)?;
+    let Some(parent) = target_node.parent.clone().filter(|_| spot != Spot::Into) else {
+        return Some(SceneEdit::Reparent { node: node.to_string(), parent: target.to_string(), position: None });
+    };
+    // Among the target's siblings, the dragged node left out.
+    let siblings: Vec<&str> = tree.siblings(target_node).into_iter().filter(|p| *p != node).collect();
+    let index = siblings.iter().position(|p| *p == target)?;
+    let position = if spot == Spot::After { index + 1 } else { index };
+    Some(SceneEdit::Reparent { node: node.to_string(), parent, position: Some(position) })
 }
 
 /// Rows of a folder's contents, like the FILES tree: folders (with their
@@ -470,7 +533,7 @@ pub fn view<'a>(
     if let Some((path, _)) = scene {
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         parts.push(container(heading(format!("NODES OF {}", name.to_uppercase()))).padding(iced::Padding { top: 6.0, ..[0, 8].into() }).into());
-        parts.push(container(tree_view(scene, cursor_line, rename, &list.folded, icon, theme)).height(Length::FillPortion(3)).into());
+        parts.push(container(tree_view(scene, cursor_line, rename, list, icon, theme)).height(Length::FillPortion(3)).into());
     } else if list.collapsed {
         let note = "Open a scene to see and edit its node tree";
         parts.push(container(text(note).size(12).color(muted)).padding([6, 12]).into());
@@ -496,7 +559,7 @@ fn tree_view<'a>(
     scene: Option<(&Path, &Result<Tree, String>)>,
     cursor_line: Option<usize>,
     rename: Option<&'a RenameBar>,
-    folded: &HashSet<(PathBuf, String)>,
+    list: &ListState,
     icon: &dyn Fn(&Tree, &SceneNode) -> Option<svg::Handle>,
     theme: &theme::Theme,
 ) -> Element<'a, Message> {
@@ -515,10 +578,12 @@ fn tree_view<'a>(
     }
 
     let here = cursor_line.and_then(|line| tree.at_line(line));
-    let highlight = style::to_color(ui.accent).scale_alpha(0.2);
+    let accent = style::to_color(ui.accent);
+    let highlight = accent.scale_alpha(0.2);
     let type_color = style::to_color(theme.syntax.r#type);
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     let rename = rename.filter(|bar| bar.scene == path);
+    let (folded, drag) = (&list.folded, list.drag.as_ref());
     let parents: HashSet<&str> = tree.nodes.iter().filter_map(|n| n.parent.as_deref()).collect();
     // The folded node whose descendants are being skipped.
     let mut hidden_under: Option<&str> = None;
@@ -581,10 +646,43 @@ fn tree_view<'a>(
             .width(Length::Fill)
             .padding([2, 8])
             .style(move |theme: &iced::Theme, status| selected_style(theme, status, selected, highlight));
-        let target = ContextTarget::SceneNode(scene, node.path.clone());
-        rows.push(context_area(node_button, move |point| Message::ContextMenu(target.clone(), point)).into());
+        let target = ContextTarget::SceneNode(scene.clone(), node.path.clone());
+        let mut row: Element<'a, Message> = context_area(node_button, move |point| Message::ContextMenu(target.clone(), point)).into();
+        // Dragged to move it; nodes of an instanced scene stay.
+        if node.is_editable() && node.parent.is_some() {
+            let start = Message::Scene(SceneMessage::DragStart(scene.clone(), node.path.clone()));
+            row = drag_source(row, start, Message::Scene(SceneMessage::DragEnd)).into();
+        }
+        // Every row has the same widgets, dragging or not, so the dragged
+        // row keeps its state when the drag starts.
+        let drag = drag.filter(|d| d.scene == path);
+        let over = drag.and_then(|d| d.over.as_ref()).filter(|(over, _)| *over == node.path).map(|(_, spot)| *spot);
+        let mut area = mouse_area(row);
+        if drag.is_some() {
+            let node_path = node.path.clone();
+            area = area
+                .on_move(move |point| Message::Scene(SceneMessage::DragOver(node_path.clone(), Spot::at(point.y))))
+                .on_exit(Message::Scene(SceneMessage::DragLeave(node.path.clone())));
+        }
+        let into = over == Some(Spot::Into);
+        let row = container(area).style(move |_: &iced::Theme| match into {
+            true => container::Style {
+                border: Border { color: accent, width: 1.0, radius: 3.0.into() },
+                background: Some(Background::Color(accent.scale_alpha(0.15))),
+                ..container::Style::default()
+            },
+            false => container::Style::default(),
+        });
+        // Lines between rows, only drawn where the node would drop.
+        let line = |shown: bool| {
+            container(space().height(if shown { 2 } else { 0 })).width(Length::Fill).style(move |_: &iced::Theme| container::Style {
+                background: shown.then_some(Background::Color(accent)),
+                ..container::Style::default()
+            })
+        };
+        rows.push(column![line(over == Some(Spot::Before)), row, line(over == Some(Spot::After))].into());
     }
-    let hint = text("Right-click a node to edit the tree").size(11).color(muted);
+    let hint = text("Right-click a node to edit the tree, drag it to move it").size(11).color(muted);
     let list = scrollable(Column::with_children(rows).width(Length::Fill)).height(Length::Fill);
     column![container(hint).padding([0, 12]), list].spacing(4).into()
 }
@@ -660,6 +758,26 @@ mod tests {
         assert_eq!(apply(SCENE, &SceneEdit::Shift("A".into(), -1)).unwrap(), SCENE);
         assert_eq!(apply(SCENE, &SceneEdit::Shift("C".into(), 1)).unwrap(), SCENE);
         assert!(apply(SCENE, &SceneEdit::Shift(".".into(), 1)).is_err());
+    }
+
+    #[test]
+    fn drops_move_nodes_where_they_land() {
+        let tree = Tree::parse(SCENE).unwrap();
+        let dropped = |node: &str, target: &str, spot: Spot| {
+            let edit = drop_edit(&tree, node, target, spot)?;
+            Some(order(&apply(SCENE, &edit).unwrap()))
+        };
+        assert_eq!(dropped("A", "C", Spot::After).unwrap(), [".", "B", "C", "A"]);
+        assert_eq!(dropped("C", "A", Spot::Before).unwrap(), [".", "C", "A", "B"]);
+        assert_eq!(dropped("A", "B", Spot::Before).unwrap(), [".", "A", "B", "C"]);
+        assert_eq!(dropped("C", "B", Spot::Into).unwrap(), [".", "A", "B", "B/C"]);
+        // On the root: always inside it.
+        assert_eq!(dropped("A", ".", Spot::Before).unwrap(), [".", "B", "C", "A"]);
+        assert_eq!(dropped("A", "A", Spot::Into), None);
+        let nested = apply(SCENE, &SceneEdit::Reparent { node: "C".into(), parent: "B".into(), position: None }).unwrap();
+        let tree = Tree::parse(&nested).unwrap();
+        assert_eq!(drop_edit(&tree, "B", "B/C", Spot::Into), None);
+        assert_eq!((Spot::at(1.0), Spot::at(10.0), Spot::at(19.0)), (Spot::Before, Spot::Into, Spot::After));
     }
 
     #[test]
