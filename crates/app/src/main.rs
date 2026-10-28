@@ -652,6 +652,7 @@ impl App {
             }
         }
         let settings = settings::Settings::load();
+        sort_themes(&mut themes, &mut theme_paths, &settings.theme_order);
         let theme_index = settings.theme.as_ref().and_then(|name| themes.iter().position(|t| &t.name == name)).unwrap_or(0);
         let iced_theme = style::iced_theme(&themes[theme_index]);
         let sidebar_view = settings.sidebar;
@@ -1647,12 +1648,23 @@ impl App {
     /// on the current theme either way (they are also palette commands).
     fn on_theme_editor(&mut self, message: ThemeMessage) -> Task<Message> {
         if let Some(editor) = &mut self.theme_editor {
+            // A delete waiting for its confirmation is dropped by anything else.
+            if !matches!(message, ThemeMessage::DeleteTheme(_)) {
+                editor.confirm_delete = None;
+            }
             if editor.apply(&message) {
                 self.apply_theme();
                 return Task::none();
             }
         }
         match message {
+            ThemeMessage::MoveTheme(index, step) => self.move_theme(index, step),
+            ThemeMessage::DeleteTheme(index) => self.delete_theme(index),
+            ThemeMessage::UseTheme(index) => {
+                if let Some(name) = self.themes.get(index).map(|t| t.name.clone()) {
+                    return self.update(Message::ThemeSelected(name));
+                }
+            }
             ThemeMessage::Save => self.save_theme(),
             ThemeMessage::Revert => {
                 if let Some(editor) = &mut self.theme_editor {
@@ -1749,6 +1761,64 @@ impl App {
         let text = theme.to_toml().map_err(|e| e.to_string())?;
         std::fs::write(&path, text).map_err(|e| e.to_string())?;
         Ok(path)
+    }
+
+    /// Moves a theme one place up (`step` -1) or down (1) in the list; the
+    /// order is kept in the settings.
+    fn move_theme(&mut self, index: usize, step: i32) {
+        let Some(other) = index.checked_add_signed(step as isize).filter(|&o| o < self.themes.len()) else {
+            return;
+        };
+        self.themes.swap(index, other);
+        self.theme_paths.swap(index, other);
+        let swapped = |i: usize| match i {
+            i if i == index => other,
+            i if i == other => index,
+            i => i,
+        };
+        self.theme_index = swapped(self.theme_index);
+        if let Some(editor) = &mut self.theme_editor {
+            editor.base = swapped(editor.base);
+        }
+        self.settings.theme_order = self.themes.iter().map(|t| t.name.clone()).collect();
+        let _ = self.settings.save();
+    }
+
+    /// Deletes a theme of the user's (to the Recycle Bin), after a second
+    /// press to confirm. Built-in themes can't be deleted.
+    fn delete_theme(&mut self, index: usize) {
+        let Some(Some(path)) = self.theme_paths.get(index).cloned() else {
+            return;
+        };
+        let Some(editor) = &mut self.theme_editor else {
+            return;
+        };
+        if editor.confirm_delete != Some(index) {
+            editor.confirm_delete = Some(index);
+            return;
+        }
+        editor.confirm_delete = None;
+        if let Err(error) = trash::delete(&path) {
+            self.status = Some(format!("Cannot delete the theme: {error}"));
+            return;
+        }
+        let name = self.themes.remove(index).name;
+        self.theme_paths.remove(index);
+        let shifted = |i: usize| if i > index { i - 1 } else { i };
+        // The theme in use was deleted: the first one takes its place.
+        self.theme_index = if self.theme_index == index { 0 } else { shifted(self.theme_index) };
+        let current = self.theme_index;
+        let (theme, builtin) = (self.themes[current].clone(), self.theme_paths[current].is_none());
+        if let Some(editor) = &mut self.theme_editor {
+            if editor.base == index {
+                editor.reset(theme, current, builtin);
+            } else {
+                editor.base = shifted(editor.base);
+            }
+        }
+        self.settings.theme_order.retain(|n| n != &name);
+        self.status = Some(format!("Moved the theme \"{name}\" to the Recycle Bin"));
+        self.apply_theme();
     }
 
     /// Adds a theme to the list, replacing a user theme of the same name.
@@ -5007,7 +5077,18 @@ impl App {
 
     fn editor_area(&self) -> Element<'_, Message> {
         if let Some(editor) = &self.theme_editor {
-            return editor.view().map(Message::ThemeEditor);
+            let entries: Vec<theme_editor::ThemeEntry<'_>> = self
+                .themes
+                .iter()
+                .zip(&self.theme_paths)
+                .enumerate()
+                .map(|(index, (theme, path))| theme_editor::ThemeEntry {
+                    name: &theme.name,
+                    builtin: path.is_none(),
+                    current: index == self.theme_index,
+                })
+                .collect();
+            return editor.view(&entries).map(Message::ThemeEditor);
         }
         if self.shortcuts.is_some() {
             return self.shortcuts_page();
@@ -5599,6 +5680,17 @@ fn command_message(id: &str) -> Option<Message> {
     })
 }
 
+/// Orders the theme list as saved (themes not in `order` keep their place
+/// after the others).
+fn sort_themes(themes: &mut Vec<theme::Theme>, paths: &mut Vec<Option<PathBuf>>, order: &[String]) {
+    let mut pairs: Vec<(theme::Theme, Option<PathBuf>)> = themes.drain(..).zip(paths.drain(..)).collect();
+    pairs.sort_by_key(|(theme, _)| order.iter().position(|n| n == &theme.name).unwrap_or(usize::MAX));
+    for (theme, path) in pairs {
+        themes.push(theme);
+        paths.push(path);
+    }
+}
+
 /// A theme from a file: a VS Code theme (`.json`), Godot's editor settings
 /// (`editor_settings-4.x.tres`) or one of ours (`.toml`).
 fn read_theme_file(path: &Path) -> Result<theme::Theme, String> {
@@ -5764,5 +5856,24 @@ mod os_theme_tests {
         themes.retain(|t| t.name != "Godot Light");
         let found = theme_for_mode(&themes, ThemeKind::Light, None).map(|i| themes[i].name.as_str());
         assert_eq!(found, Some("Mine"));
+    }
+}
+
+#[cfg(test)]
+mod theme_order_tests {
+    use std::path::PathBuf;
+
+    use super::sort_themes;
+
+    #[test]
+    fn saved_order_first_then_the_rest_in_place() {
+        let named = |name: &str| theme::Theme { name: name.to_string(), ..theme::builtin().remove(0) };
+        let mut themes = vec![named("A"), named("B"), named("C"), named("D")];
+        let mut paths: Vec<Option<PathBuf>> = vec![None, Some("b.toml".into()), Some("c.toml".into()), None];
+        sort_themes(&mut themes, &mut paths, &["C".to_string(), "Gone".to_string(), "A".to_string()]);
+        let names: Vec<&str> = themes.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["C", "A", "B", "D"]);
+        // Paths stay with their theme.
+        assert_eq!(paths, [Some("c.toml".into()), None, Some("b.toml".into()), None]);
     }
 }

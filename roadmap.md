@@ -160,6 +160,8 @@ crates/
 **Theming**
 - [x] Single-file theme (TOML): UI, syntax and terminal ANSI colors (fonts still to come)
 - [x] Live theme editor ("edit" in the status bar): all 38 colors, HSV + opacity sliders, hex
+      (MANAGE THEMES column: click to use, ▲ / ▼ reorder the theme list (kept in settings), delete your
+      own themes to the Recycle Bin after a confirm; built-ins can only move)
       input, code + terminal preview; the whole IDE updates live; built-ins are saved as a copy
 - [x] Built-in themes: Godot Dark (Godot editor colors) and Godot Light
 - [x] Theme export/import: .toml file dialogs, drag & drop a .toml on the window

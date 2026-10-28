@@ -50,6 +50,20 @@ pub enum ThemeMessage {
     PasteCode,
     /// Input on the preview editor, which is not editable.
     Ignore,
+    /// Move a theme up (-1) or down (1) in the list.
+    MoveTheme(usize, i32),
+    /// Delete a theme of the user's: the first press asks to confirm.
+    DeleteTheme(usize),
+    /// Show this theme (and edit it).
+    UseTheme(usize),
+}
+
+/// A theme as the manage list shows it.
+pub struct ThemeEntry<'a> {
+    pub name: &'a str,
+    pub builtin: bool,
+    /// The theme in use.
+    pub current: bool,
 }
 
 /// HSV plus alpha, kept alongside the color so the hue survives while
@@ -114,6 +128,8 @@ pub struct ThemeEditor {
     hsv: Hsv,
     pub dirty: bool,
     sample: Buffer,
+    /// The theme whose delete button was pressed once (press again to delete).
+    pub confirm_delete: Option<usize>,
 }
 
 impl ThemeEditor {
@@ -127,6 +143,7 @@ impl ThemeEditor {
             hsv: Hsv { h: 0.0, s: 0.0, v: 0.0, a: 255.0 },
             dirty: false,
             sample: Buffer::new(SAMPLE, Language::GDScript),
+            confirm_delete: None,
         };
         editor.select(0);
         editor
@@ -190,7 +207,7 @@ impl ThemeEditor {
         self.draft.set_color(&SLOTS[self.selected], color);
     }
 
-    pub fn view(&self) -> Element<'_, ThemeMessage> {
+    pub fn view<'a>(&'a self, themes: &[ThemeEntry<'a>]) -> Element<'a, ThemeMessage> {
         let ui = &self.draft.ui;
         let muted = style::to_color(ui.text_muted);
         let action = |label: &'static str, message: ThemeMessage, description: &'static str| {
@@ -257,6 +274,7 @@ impl ThemeEditor {
         let body = row![
             scrollable(self.slot_list()).width(Length::Fill).height(Length::Fill),
             container(self.picker()).width(380).height(Length::Fill),
+            container(self.manage_list(themes)).width(260).height(Length::Fill),
         ]
         .spacing(12);
 
@@ -266,6 +284,66 @@ impl ThemeEditor {
             .height(Length::Fill)
             .style(style::surface(ui))
             .into()
+    }
+
+    /// MANAGE THEMES: every theme in the picker's order, to reorder (▲ ▼)
+    /// or delete (the user's own; built-ins can only move).
+    fn manage_list<'a>(&'a self, themes: &[ThemeEntry<'a>]) -> Element<'a, ThemeMessage> {
+        let ui = &self.draft.ui;
+        let muted = style::to_color(ui.text_muted);
+        let danger = style::to_color(ui.danger);
+        let highlight = style::to_color(ui.accent).scale_alpha(0.25);
+        let small = |label: &'static str, message: Option<ThemeMessage>| {
+            let b = button(text(label).size(11)).style(button::text).padding([1, 4]);
+            match message {
+                Some(message) => b.on_press(message),
+                None => b,
+            }
+        };
+        let mut list = Column::new().spacing(2).push(text("MANAGE THEMES").size(12)).push(
+            text("Order of the theme list; your themes can be deleted (to the Recycle Bin).").size(11).color(muted),
+        );
+        let last = themes.len().saturating_sub(1);
+        for (index, entry) in themes.iter().enumerate() {
+            let current = entry.current;
+            let mut name = text(entry.name).size(12);
+            if entry.builtin {
+                name = name.font(Font { style: iced::font::Style::Italic, ..Font::default() });
+            }
+            let use_theme = button(name)
+                .on_press(ThemeMessage::UseTheme(index))
+                .width(Length::Fill)
+                .padding([1, 4])
+                .style(move |theme: &iced::Theme, status| {
+                    let base = button::text(theme, status);
+                    if current {
+                        button::Style { background: Some(Background::Color(highlight)), ..base }
+                    } else {
+                        base
+                    }
+                });
+            let delete: Element<'a, ThemeMessage> = if entry.builtin {
+                style::tip(small("  ", None), "Built-in: can't be deleted", Position::Left, ui)
+            } else if self.confirm_delete == Some(index) {
+                let confirm = button(text("confirm?").size(11).color(danger))
+                    .on_press(ThemeMessage::DeleteTheme(index))
+                    .style(button::text)
+                    .padding([1, 4]);
+                style::tip(confirm, "Press again to move this theme to the Recycle Bin", Position::Left, ui)
+            } else {
+                style::tip(small("delete", Some(ThemeMessage::DeleteTheme(index))), "Delete this theme", Position::Left, ui)
+            };
+            let row = row![
+                use_theme,
+                style::tip(small("▲", (index > 0).then_some(ThemeMessage::MoveTheme(index, -1))), "Move up", Position::Left, ui),
+                style::tip(small("▼", (index < last).then_some(ThemeMessage::MoveTheme(index, 1))), "Move down", Position::Left, ui),
+                delete,
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center);
+            list = list.push(row);
+        }
+        scrollable(list.padding([0, 8])).height(Length::Fill).into()
     }
 
     fn slot_list(&self) -> Element<'_, ThemeMessage> {

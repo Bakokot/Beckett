@@ -31,6 +31,9 @@ pub struct Settings {
     pub dark_theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub light_theme: Option<String>,
+    /// Order of the theme list, by name (themes not in it come after).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub theme_order: Vec<String>,
 }
 
 impl Default for Settings {
@@ -43,6 +46,7 @@ impl Default for Settings {
             follow_os_theme: false,
             dark_theme: None,
             light_theme: None,
+            theme_order: Vec::new(),
         }
     }
 }
