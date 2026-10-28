@@ -159,7 +159,8 @@ crates/
 
 **Theming**
 - [x] Single-file theme (TOML): UI, syntax and terminal ANSI colors (fonts still to come)
-- [x] Live theme editor ("edit" in the status bar): all 38 colors, HSV + opacity sliders, hex
+- [x] Live theme editor ("edit" in the status bar): all 38 colors, a color palette (saturation / brightness
+      square, hue and opacity bars, click or drag), hex
       (MANAGE THEMES column: click to use, ▲ / ▼ reorder the theme list (kept in settings), delete your
       own themes to the Recycle Bin after a confirm; built-ins can only move)
       input, code + terminal preview; the whole IDE updates live; built-ins are saved as a copy

@@ -2,6 +2,7 @@
 
 mod changes;
 mod class_ref;
+mod color_picker;
 mod code_editor;
 mod completion;
 mod context_menu;

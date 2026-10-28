@@ -8,6 +8,7 @@ use iced::{Alignment, Background, Border, Element, Font, Length};
 use theme::{Color, Theme, SLOTS};
 
 use crate::code_editor::{self, CodeEditor};
+use crate::color_picker::color_picker;
 use crate::style;
 
 pub const NAME_INPUT: &str = "theme-name";
@@ -32,10 +33,8 @@ func _physics_process(delta: float) -> void:
 pub enum ThemeMessage {
     Select(usize),
     Hex(String),
-    Hue(f32),
-    Saturation(f32),
-    Brightness(f32),
-    Opacity(f32),
+    /// A color picked in the palette (square, hue or opacity bar).
+    Pick(Hsv),
     Name(String),
     FontFamily(String),
     FontSize(f32),
@@ -182,10 +181,7 @@ impl ThemeEditor {
                 self.hsv = Hsv::from_color(color);
                 self.draft.set_color(slot, color);
             }
-            ThemeMessage::Hue(h) => self.set_hsv(Hsv { h: *h, ..self.hsv }),
-            ThemeMessage::Saturation(s) => self.set_hsv(Hsv { s: *s, ..self.hsv }),
-            ThemeMessage::Brightness(v) => self.set_hsv(Hsv { v: *v, ..self.hsv }),
-            ThemeMessage::Opacity(a) => self.set_hsv(Hsv { a: *a, ..self.hsv }),
+            ThemeMessage::Pick(hsv) => self.set_hsv(*hsv),
             ThemeMessage::Name(name) => self.draft.name = name.clone(),
             // Kept as typed (the editor sanitizes when it applies the font).
             ThemeMessage::FontFamily(family) => {
@@ -394,15 +390,6 @@ impl ThemeEditor {
         let muted = style::to_color(ui.text_muted);
         let slot = &SLOTS[self.selected];
         let color = self.draft.color(slot);
-        let channel = |label: &'static str, value: f32, max: f32, on_change: fn(f32) -> ThemeMessage| {
-            row![
-                text(label).size(12).width(80),
-                slider(0.0..=max, value, on_change).step(1.0_f32),
-                text(format!("{value:.0}")).size(12).font(Font::MONOSPACE).width(34),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center)
-        };
 
         let terminal_row = |colors: &[Color]| {
             iced::widget::Row::with_children(colors.iter().map(|&c| swatch(c, ui, 22.0, 16.0)))
@@ -423,10 +410,17 @@ impl ThemeEditor {
             ]
             .spacing(8)
             .align_y(Alignment::Center),
-            channel("Hue", self.hsv.h, 359.0, ThemeMessage::Hue),
-            channel("Saturation", self.hsv.s, 100.0, ThemeMessage::Saturation),
-            channel("Brightness", self.hsv.v, 100.0, ThemeMessage::Brightness),
-            channel("Opacity", self.hsv.a, 255.0, ThemeMessage::Opacity),
+            color_picker(self.hsv, ThemeMessage::Pick),
+            text(format!(
+                "Hue {:.0}°   Saturation {:.0}%   Brightness {:.0}%   Opacity {:.0}%",
+                self.hsv.h,
+                self.hsv.s,
+                self.hsv.v,
+                self.hsv.a / 2.55
+            ))
+            .size(12)
+            .font(Font::MONOSPACE)
+            .color(muted),
             text("Preview").size(12).color(muted),
             container(
                 CodeEditor::new(&self.sample, code_editor::Colors::from_theme(&self.draft), |_| ThemeMessage::Ignore)
@@ -476,9 +470,11 @@ mod tests {
     fn hue_survives_desaturation() {
         let mut editor = ThemeEditor::new(theme::builtin().remove(0), 0, true);
         editor.select(4); // accent
-        editor.apply(&ThemeMessage::Hue(120.0));
-        editor.apply(&ThemeMessage::Saturation(0.0));
-        editor.apply(&ThemeMessage::Saturation(100.0));
+        let start = editor.hsv;
+        editor.apply(&ThemeMessage::Pick(Hsv { h: 120.0, ..start }));
+        // To the left edge of the square (grey), then back: still green.
+        editor.apply(&ThemeMessage::Pick(Hsv { s: 0.0, ..editor.hsv }));
+        editor.apply(&ThemeMessage::Pick(Hsv { s: 100.0, ..editor.hsv }));
         assert_eq!(editor.hsv.h, 120.0);
         assert!(editor.dirty);
     }
