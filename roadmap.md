@@ -164,7 +164,8 @@ crates/
       (MANAGE THEMES column: click to use, ▲ / ▼ reorder the theme list (kept in settings), delete your
       own themes to the Recycle Bin after a confirm; built-ins can only move)
       input, code + terminal preview; the whole IDE updates live; built-ins are saved as a copy
-- [x] Built-in themes: Godot Dark (Godot editor colors) and Godot Light
+- [x] Built-in themes: Godot Dark (Godot editor colors), Godot Light, and the crimson trio: Crimson Night,
+      Crimson Abyss (high contrast, near black) and Crimson Velvet (soft, plum)
 - [x] Theme export/import: .toml file dialogs, drag & drop a .toml on the window
 - [x] Custom font family, size, line height and ligatures (theme `[font]` section, theme editor row)
 - [x] UI zoom (Ctrl+= / Ctrl+- / Ctrl+0, saved in settings.json); selected theme remembered;

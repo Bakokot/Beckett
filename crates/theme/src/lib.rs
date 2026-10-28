@@ -194,6 +194,9 @@ impl Theme {
 const BUILTIN: &[&str] = &[
     include_str!("../themes/godot-dark.toml"),
     include_str!("../themes/godot-light.toml"),
+    include_str!("../themes/crimson-night.toml"),
+    include_str!("../themes/crimson-abyss.toml"),
+    include_str!("../themes/crimson-velvet.toml"),
 ];
 
 /// Themes shipped with the IDE.

@@ -654,6 +654,11 @@ impl App {
         if let Some(dir) = theme::user_themes_dir() {
             let (user, errors) = theme::load_dir(&dir);
             for (path, theme) in user {
+                // An exact copy of a built-in theme (one that later became
+                // built in) would only show up twice.
+                if themes.contains(&theme) {
+                    continue;
+                }
                 themes.push(theme);
                 theme_paths.push(Some(path));
             }
