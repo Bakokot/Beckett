@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::SidebarView;
 
 pub const ZOOM_STEP: f32 = 0.1;
+/// The sidebar's width until it is dragged (double-clicking its edge comes back to it).
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 260.0;
+pub const MIN_SIDEBAR_WIDTH: f32 = 160.0;
 pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,6 +34,8 @@ pub struct Settings {
     pub dark_theme: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub light_theme: Option<String>,
+    /// Width of the sidebar (files, outline, project), in pixels.
+    pub sidebar_width: f32,
     /// Order of the theme list, by name (themes not in it come after).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub theme_order: Vec<String>,
@@ -47,6 +52,7 @@ impl Default for Settings {
             dark_theme: None,
             light_theme: None,
             theme_order: Vec::new(),
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
         }
     }
 }
@@ -82,6 +88,9 @@ impl Settings {
             self.ui_scale = 1.0;
         }
         self.ui_scale = self.ui_scale.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+        if !self.sidebar_width.is_finite() || self.sidebar_width < MIN_SIDEBAR_WIDTH {
+            self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+        }
         self
     }
 }

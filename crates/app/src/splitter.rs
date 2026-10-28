@@ -18,27 +18,36 @@ pub struct Splitter<'a, Message> {
     active: Color,
     /// A vertical bar, dragged left and right.
     vertical: bool,
+    /// Sent on a double-click (e.g. back to the default size).
+    on_reset: Option<Message>,
 }
 
 /// A horizontal bar: `on_drag` gets the vertical movement in pixels
 /// (negative is up).
 pub fn splitter<'a, Message>(line: Color, active: Color, on_drag: impl Fn(f32) -> Message + 'a) -> Splitter<'a, Message> {
-    Splitter { on_drag: Box::new(on_drag), line, active, vertical: false }
+    Splitter { on_drag: Box::new(on_drag), line, active, vertical: false, on_reset: None }
 }
 
 /// A vertical bar: `on_drag` gets the horizontal movement in pixels
 /// (negative is left).
 pub fn vertical<'a, Message>(line: Color, active: Color, on_drag: impl Fn(f32) -> Message + 'a) -> Splitter<'a, Message> {
-    Splitter { on_drag: Box::new(on_drag), line, active, vertical: true }
+    Splitter { on_drag: Box::new(on_drag), line, active, vertical: true, on_reset: None }
 }
 
 #[derive(Default)]
 struct State {
     /// Mouse position (across the bar) where the last reported drag step ended.
     dragging_from: Option<f32>,
+    last_click: Option<mouse::Click>,
 }
 
 impl<Message> Splitter<'_, Message> {
+    /// What a double-click on the bar sends.
+    pub fn on_reset(mut self, message: Message) -> Self {
+        self.on_reset = Some(message);
+        self
+    }
+
     fn size(&self) -> Size<Length> {
         if self.vertical {
             Size::new(Length::Fixed(THICKNESS), Length::Fill)
@@ -53,7 +62,7 @@ impl<Message> Splitter<'_, Message> {
     }
 }
 
-impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Message> {
+impl<'a, Message: Clone> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Message> {
     fn size(&self) -> Size<Length> {
         Splitter::size(self)
     }
@@ -86,6 +95,14 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Messag
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(point) = cursor.position_over(layout.bounds()) {
+                    let click = mouse::Click::new(point, mouse::Button::Left, state.last_click);
+                    state.last_click = Some(click);
+                    if let (mouse::click::Kind::Double, Some(reset)) = (click.kind(), &self.on_reset) {
+                        shell.publish(reset.clone());
+                        state.dragging_from = None;
+                        shell.capture_event();
+                        return;
+                    }
                     state.dragging_from = Some(self.across(point));
                     shell.capture_event();
                 }
@@ -149,7 +166,7 @@ impl<'a, Message> Widget<Message, Theme, iced::Renderer> for Splitter<'a, Messag
     }
 }
 
-impl<'a, Message: 'a> From<Splitter<'a, Message>> for Element<'a, Message> {
+impl<'a, Message: Clone + 'a> From<Splitter<'a, Message>> for Element<'a, Message> {
     fn from(splitter: Splitter<'a, Message>) -> Self {
         Element::new(splitter)
     }

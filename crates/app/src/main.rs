@@ -174,6 +174,10 @@ pub enum Message {
     /// sensitive) in the SEARCH tab.
     SearchProject(String),
     ClosePanel,
+    /// The bar right of the sidebar moved by this many pixels.
+    ResizeSidebar(f32),
+    /// Double-click on that bar: back to the default width.
+    ResetSidebar,
     /// The splitter above the bottom panel moved by this many pixels.
     ResizePanel(f32),
     /// The bar between the two sides moved by this many pixels, in an
@@ -370,6 +374,8 @@ const DEFAULT_PANEL_HEIGHT: f32 = 260.0;
 const MIN_PANEL_HEIGHT: f32 = 100.0;
 /// Room the bottom panel always leaves for the tabs, editor and status bar.
 const MIN_EDITOR_HEIGHT: f32 = 200.0;
+/// The sidebar never takes the editor below this width.
+const MIN_EDITOR_WIDTH: f32 = 400.0;
 /// Waits before each automatic language server reconnect, in seconds.
 const RECONNECT_DELAYS: [u64; 5] = [1, 2, 5, 10, 20];
 
@@ -434,6 +440,9 @@ struct App {
     /// The session as last written, to skip rewriting an unchanged one.
     saved_session: Option<session::Session>,
     settings: settings::Settings,
+    /// Settings changed without being saved yet (the sidebar width while
+    /// dragging): saved with the next autosave or on close.
+    settings_dirty: bool,
     /// Shortcuts in effect (defaults with the user's changes).
     keymap: keymap::Keymap,
     tabs: Vec<Tab>,
@@ -663,6 +672,7 @@ impl App {
             recent: recent::load(),
             saved_session: None,
             settings,
+            settings_dirty: false,
             keymap: keymap::Keymap::load(),
             tabs: Vec::new(),
             focused_group: 0,
@@ -1095,12 +1105,14 @@ impl App {
             }
             Message::RevertHunk(path, hunk) => self.revert_hunk(&path, &hunk),
             Message::AutosaveSession => {
+                self.save_settings_if_changed();
                 // Also catches commits made in the terminal.
                 self.git_refresh.wanted = true;
                 self.save_session();
                 return autosave_later();
             }
             Message::CloseRequested(window) => {
+                self.save_settings_if_changed();
                 // Hot exit: unsaved edits are kept in the session, not lost.
                 self.save_session();
                 return iced::window::close(window);
@@ -1337,6 +1349,15 @@ impl App {
                 return self.on_search(SearchMessage::Run);
             }
             // Dragging the splitter up makes the panel taller.
+            Message::ResizeSidebar(delta) => {
+                self.settings.sidebar_width = self.sidebar_width() + delta;
+                // Saved with the next autosave (or on close), not on every move.
+                self.settings_dirty = true;
+            }
+            Message::ResetSidebar => {
+                self.settings.sidebar_width = settings::DEFAULT_SIDEBAR_WIDTH;
+                let _ = self.settings.save();
+            }
             Message::ResizePanel(delta) => self.panel_height = (self.panel_height() - delta).max(MIN_PANEL_HEIGHT),
             Message::ResizeSplit(delta, width) => {
                 let left = split::left_width(self.split_ratio, width) + delta;
@@ -2281,6 +2302,19 @@ impl App {
     }
 
     /// The bottom panel's height, kept within what the window allows.
+    /// The sidebar's width, kept between its minimum and what leaves the
+    /// editor its own.
+    fn save_settings_if_changed(&mut self) {
+        if std::mem::take(&mut self.settings_dirty) {
+            let _ = self.settings.save();
+        }
+    }
+
+    fn sidebar_width(&self) -> f32 {
+        let max = (self.window_width - MIN_EDITOR_WIDTH).max(settings::MIN_SIDEBAR_WIDTH);
+        self.settings.sidebar_width.clamp(settings::MIN_SIDEBAR_WIDTH, max)
+    }
+
     fn panel_height(&self) -> f32 {
         let max = (self.window_height - MIN_EDITOR_HEIGHT).max(MIN_PANEL_HEIGHT);
         self.panel_height.clamp(MIN_PANEL_HEIGHT, max)
@@ -4902,7 +4936,10 @@ impl App {
                     main = main.push(splitter::splitter(line, active, Message::ResizePanel));
                     main = main.push(self.bottom_panel(panel));
                 }
-                let body = row![self.sidebar(project), main];
+                let ui = &self.current_theme().ui;
+                let (line, active) = (style::to_color(ui.border), style::to_color(ui.accent));
+                let edge = splitter::vertical(line, active, Message::ResizeSidebar).on_reset(Message::ResetSidebar);
+                let body = row![self.sidebar(project), edge, main];
                 match &self.palette {
                     // Drawn over everything, centered near the top. A
                     // backdrop under it catches clicks outside the box, which
@@ -5070,7 +5107,7 @@ impl App {
         };
 
         container(column![header, tabs, body].spacing(4))
-            .width(260)
+            .width(self.sidebar_width())
             .height(Length::Fill)
             .style(style::surface(&self.current_theme().ui))
             .into()

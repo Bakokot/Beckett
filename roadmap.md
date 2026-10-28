@@ -277,7 +277,9 @@ crates/
       not yet seen on screen
 
 **Workspace**
-- [ ] Dockable / resizable panels
+- [x] Resizable sidebar: drag the bar on its right (160 px minimum, the editor keeps 400 px), double-click
+      it for the default 260 px; the width is kept in settings — not yet seen on screen
+- [ ] Dockable panels
 - [x] Remappable keybindings: click a shortcut on the F1 page and press the new keys (Backspace
       unbinds, "reset" restores); overrides in `keybindings.json`; menus and palette show the
       current keys; terminal passthrough follows the bindings
