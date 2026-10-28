@@ -337,7 +337,7 @@ crates/
         has them), rename, remove (with its connections, editable children and the resources only it used),
         reparent / reorder, attach / detach script; paths in parents, connections and `[editable]` follow,
         `load_steps` kept in step. Nodes of an instanced scene can't be renamed, moved or removed.
-        Not yet: `NodePath` property values aren't rewritten when a node moves
+        (`NodePath` values: see below)
   - [x] SCENE view lists the project's scenes as a folder tree like FILES (only folders holding scenes, and the
         `.tscn`s; arrows open / close folders), with a filter (every
         word, any case); a click opens the scene, the open one is highlighted, right-click gives the file menu;
@@ -362,7 +362,9 @@ crates/
   - [x] Drag and drop of nodes in the tree: on a row's top / bottom edge (a line shows it) it goes before / after
         that node, in its middle (the row is outlined) it becomes its last child; on the root, always inside it.
         One undo step like the other edits; nodes of an instanced scene and the root don't drag — not yet seen on screen
-  - [ ] `NodePath` property values follow renamed / moved nodes
+  - [x] `NodePath` property values follow renamed / moved nodes (exported node references, arrays of paths,
+        `:property` subnames): a path is re-aimed when its target or the node holding it moved; absolute and
+        `%Unique` paths are left alone. Not yet: animation track paths in `Animation` resources
 - [ ] **ER2** Inspector for node properties, exports and resources (metadata from `godot --dump-extension-api`)
 - [ ] **ER3** Signal connection editor
 - [ ] **ER4** Project settings and Input Map editors

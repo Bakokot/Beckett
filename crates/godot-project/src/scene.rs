@@ -601,7 +601,7 @@ impl Scene {
     }
 
     /// Points node parents, connections and editable children that lead
-    /// through `old` at `new`.
+    /// through `old` at `new`, then the nodes' `NodePath` properties.
     fn rewrite_paths(&mut self, old: &str, new: &str) {
         for section in &mut self.sections {
             let keys: &[&str] = match section.tag.as_str() {
@@ -612,10 +612,32 @@ impl Scene {
             };
             for key in keys {
                 if let Some(path) = section.attr_string(key) {
-                    if let Some(rest) = path.strip_prefix(old).filter(|r| r.is_empty() || r.starts_with('/')) {
-                        section.set_attr(key, quote(&format!("{new}{rest}")));
+                    let moved = swap_prefix(&path, old, new);
+                    if moved != path {
+                        section.set_attr(key, quote(&moved));
                     }
                 }
+            }
+        }
+        self.rewrite_node_paths(old, new);
+    }
+
+    /// Keeps each `NodePath("…")` of the nodes' properties (relative to its
+    /// node) pointing at the same node, now that the nodes at `old` are at
+    /// `new`: the target or the node holding the path may have moved.
+    fn rewrite_node_paths(&mut self, old: &str, new: &str) {
+        for node in self.nodes() {
+            let owner_new = node.path;
+            let owner_old = swap_prefix(&owner_new, new, old);
+            let section = &mut self.sections[node.section];
+            let props: Vec<(String, String)> = section
+                .props
+                .iter()
+                .map(|(key, value)| (key.clone(), rewrite_node_path_values(value, &owner_old, &owner_new, old, new)))
+                .collect();
+            if props != section.props {
+                section.props = props;
+                section.original = None;
             }
         }
     }
@@ -668,6 +690,91 @@ fn child_path(parent: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{parent}/{name}")
+    }
+}
+
+/// `path` with its leading `from` (a node path, not the root) replaced by `to`.
+fn swap_prefix(path: &str, from: &str, to: &str) -> String {
+    match path.strip_prefix(from) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{to}{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// Every `NodePath("…")` in a raw value, re-aimed by [`moved_node_path`].
+fn rewrite_node_path_values(value: &str, owner_old: &str, owner_new: &str, old: &str, new: &str) -> String {
+    const OPEN: &str = "NodePath(\"";
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find(OPEN) {
+        let inner_start = start + OPEN.len();
+        let Some(len) = rest[inner_start..].find('"') else {
+            break;
+        };
+        let inner = &rest[inner_start..inner_start + len];
+        out.push_str(&rest[..inner_start]);
+        match moved_node_path(inner, owner_old, owner_new, old, new) {
+            Some(moved) => out.push_str(&moved),
+            None => out.push_str(inner),
+        }
+        rest = &rest[inner_start + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A node path written on the node now at `owner_new` (formerly at
+/// `owner_old`), aimed again at its target after the nodes at `old` moved
+/// to `new`. `None` when it doesn't change, or isn't a path within the
+/// scene (absolute, `%Unique`, escaping the root).
+fn moved_node_path(path: &str, owner_old: &str, owner_new: &str, old: &str, new: &str) -> Option<String> {
+    if path.is_empty() || path.starts_with('/') || path.starts_with('%') {
+        return None;
+    }
+    // `Sprite:position`: the node part, then property subnames.
+    let (node_part, subnames) = match path.find(':') {
+        Some(i) => path.split_at(i),
+        None => (path, ""),
+    };
+    let target_old = resolve_node_path(owner_old, node_part)?;
+    let target_new = swap_prefix(&target_old, old, new);
+    // Paths whose ends both stayed are left as written.
+    if target_new == target_old && owner_new == owner_old {
+        return None;
+    }
+    let relative = relative_node_path(owner_new, &target_new);
+    // A path to the node itself is written as nothing before its subnames.
+    let relative = if relative == "." && !subnames.is_empty() && node_part.is_empty() { String::new() } else { relative };
+    let moved = format!("{relative}{subnames}");
+    (moved != path).then_some(moved)
+}
+
+/// The scene path (`.`, `A/B`) `relative` leads to from the node at `from`.
+fn resolve_node_path(from: &str, relative: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if from == "." { Vec::new() } else { from.split('/').collect() };
+    for part in relative.split('/').filter(|p| !p.is_empty()) {
+        match part {
+            "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            name => parts.push(name),
+        }
+    }
+    Some(if parts.is_empty() { ".".to_string() } else { parts.join("/") })
+}
+
+/// The relative path from the node at `from` to the node at `to`.
+fn relative_node_path(from: &str, to: &str) -> String {
+    let split = |p: &str| -> Vec<String> { if p == "." { Vec::new() } else { p.split('/').map(String::from).collect() } };
+    let (from, to) = (split(from), split(to));
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut parts: Vec<String> = vec!["..".to_string(); from.len() - common];
+    parts.extend(to[common..].iter().cloned());
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
     }
 }
 
@@ -882,6 +989,47 @@ text = "two
             "position = Vector2(4, 0)\n\n[node name=\"Shape2\" type=\"Area2D\" parent=\"Player\"]\n\n[node name=\"Label\""
         ));
         assert!(text.ends_with("[lines]\"\n\n[node name=\"Label2\" type=\"Label\" parent=\".\"]\n\n[connection signal=\"fired\" from=\"Player/Gun\" to=\".\" method=\"_on_fired\"]\n\n[editable path=\"Player/Gun\"]\n"));
+    }
+
+    #[test]
+    fn node_path_maths() {
+        assert_eq!(resolve_node_path("A/B", "../C").as_deref(), Some("A/C"));
+        assert_eq!(resolve_node_path(".", "A/B").as_deref(), Some("A/B"));
+        assert_eq!(resolve_node_path("A", "..").as_deref(), Some("."));
+        assert_eq!(resolve_node_path("A", "../.."), None);
+        assert_eq!(relative_node_path("A/B", "A/C"), "../C");
+        assert_eq!(relative_node_path(".", "A/B"), "A/B");
+        assert_eq!(relative_node_path("A/B", "."), "../..");
+        assert_eq!(relative_node_path("A", "A"), ".");
+        // The target moved; the holder moved; subnames, self, absolute and unique paths.
+        assert_eq!(moved_node_path("../Enemy", "Hud", "Hud", "Enemy", "World/Enemy").as_deref(), Some("../World/Enemy"));
+        assert_eq!(moved_node_path("../Enemy", "Hud", "Ui/Hud", "Hud", "Ui/Hud").as_deref(), Some("../../Enemy"));
+        assert_eq!(moved_node_path("Sprite:frame", ".", ".", "Sprite", "Body/Sprite").as_deref(), Some("Body/Sprite:frame"));
+        assert_eq!(moved_node_path(":position", "A", "B/A", "A", "B/A"), None);
+        assert_eq!(moved_node_path("/root/Main", "A", "A", "Main", "X"), None);
+        assert_eq!(moved_node_path("%Health", "A", "A", "Health", "X"), None);
+        assert_eq!(moved_node_path("Other", "A", "A", "B", "C"), None);
+    }
+
+    #[test]
+    fn node_paths_follow_renamed_and_moved_nodes() {
+        let text = "[gd_scene format=3]\n\n[node name=\"Main\" type=\"Node2D\"]\ntarget = NodePath(\"Enemy\")\n\n\
+            [node name=\"Enemy\" type=\"Node2D\" parent=\".\"]\n\n\
+            [node name=\"Hud\" type=\"Control\" parent=\".\" node_paths=PackedStringArray(\"watch\")]\n\
+            watch = NodePath(\"../Enemy\")\nlist = [NodePath(\"../Enemy:position\"), NodePath(\"../Hud\")]\n";
+        let mut s = Scene::parse(text).unwrap();
+        s.rename_node("Enemy", "Boss").unwrap();
+        let renamed = s.to_text();
+        assert!(renamed.contains("target = NodePath(\"Boss\")"), "{renamed}");
+        assert!(renamed.contains("watch = NodePath(\"../Boss\")"));
+        assert!(renamed.contains("list = [NodePath(\"../Boss:position\"), NodePath(\"../Hud\")]"));
+
+        // Moving the holder re-aims its own paths.
+        s.reparent_node("Hud", "Boss", None).unwrap();
+        let moved = s.to_text();
+        assert!(moved.contains("watch = NodePath(\"..\")"), "{moved}");
+        assert!(moved.contains("list = [NodePath(\"..:position\"), NodePath(\".\")]"), "{moved}");
+        assert!(moved.contains("target = NodePath(\"Boss\")"));
     }
 
     #[test]
