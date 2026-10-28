@@ -12,6 +12,8 @@ pub enum View {
     #[default]
     Files,
     Outline,
+    /// The node tree of the scene in the active tab.
+    Scene,
     /// Main scene, autoloads and Input Map.
     Project,
     Problems,
@@ -26,9 +28,10 @@ pub enum View {
 
 impl View {
     /// In tab order.
-    pub const ALL: [View; 9] = [
+    pub const ALL: [View; 10] = [
         View::Files,
         View::Outline,
+        View::Scene,
         View::Project,
         View::Problems,
         View::Output,
@@ -41,7 +44,7 @@ impl View {
     /// Where the view is until it is moved.
     pub fn home(self) -> Dock {
         match self {
-            View::Files | View::Outline | View::Project => Dock::Left,
+            View::Files | View::Outline | View::Scene | View::Project => Dock::Left,
             _ => Dock::Bottom,
         }
     }
@@ -50,6 +53,7 @@ impl View {
         match self {
             View::Files => "Files",
             View::Outline => "Outline",
+            View::Scene => "Scene",
             View::Project => "Project",
             View::Problems => "Problems",
             View::Output => "Output",
@@ -64,6 +68,7 @@ impl View {
         match self {
             View::Files => "Project files",
             View::Outline => "Functions, variables and signals of the current file (Ctrl+Shift+O to search them)",
+            View::Scene => "Nodes of the scene in the active tab: right-click one to add, rename, move or delete nodes",
             View::Project => "Main scene, autoloads and Input Map of project.godot",
             View::Problems => "Errors and warnings",
             View::Output => "What the running game prints",
@@ -140,13 +145,13 @@ mod tests {
     #[test]
     fn views_move_and_come_home() {
         let mut layout = Layout::default();
-        assert_eq!(layout.views(Dock::Left), [View::Files, View::Outline, View::Project]);
+        assert_eq!(layout.views(Dock::Left), [View::Files, View::Outline, View::Scene, View::Project]);
         assert!(layout.views(Dock::Right).is_empty());
 
         layout.move_to(View::Outline, Dock::Right);
         layout.move_to(View::Terminal, Dock::Right);
         assert_eq!(layout.views(Dock::Right), [View::Outline, View::Terminal]);
-        assert_eq!(layout.views(Dock::Left), [View::Files, View::Project]);
+        assert_eq!(layout.views(Dock::Left), [View::Files, View::Scene, View::Project]);
 
         layout.move_to(View::Outline, Dock::Left);
         layout.move_to(View::Terminal, Dock::Bottom);
@@ -172,7 +177,7 @@ mod tests {
         assert_eq!(shown_in(&layout, Dock::Right, Some(View::Outline)), Some(View::Outline));
         assert_eq!(shown_in(&layout, Dock::Right, None), Some(View::Outline));
         assert_eq!(shown_in(&layout, Dock::Bottom, None), None);
-        for view in [View::Files, View::Project] {
+        for view in [View::Files, View::Scene, View::Project] {
             layout.move_to(view, Dock::Bottom);
         }
         assert_eq!(shown_in(&layout, Dock::Left, Some(View::Files)), None);

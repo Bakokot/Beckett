@@ -15,6 +15,7 @@ mod file_icons;
 mod file_ops;
 mod find;
 mod format;
+mod godot_icons;
 mod git;
 mod keymap;
 mod lsp;
@@ -30,6 +31,7 @@ mod project_symbols;
 mod recent;
 mod rename;
 mod runner;
+mod scene_tree;
 mod session;
 mod settings;
 mod settings_page;
@@ -175,6 +177,8 @@ pub enum Message {
     CloseTerminal(u64),
     /// The OUTLINE view's filter changed.
     OutlineFilter(outline::FilterMessage),
+    /// The SCENE view: an edit of the tree, or a step towards one.
+    Scene(scene_tree::SceneMessage),
     /// Show this view in its dock (left or right sidebar, bottom panel).
     ShowView(View),
     /// List every use of this word in the project (whole word, case
@@ -308,6 +312,8 @@ pub enum ContextTarget {
     Editor,
     /// The tab of a dockable view (files, terminal…).
     View(View),
+    /// A node in the SCENE view: the scene file and the node's path.
+    SceneNode(PathBuf, String),
 }
 
 /// Which panel receives keyboard input.
@@ -531,6 +537,15 @@ struct App {
     /// What the OUTLINE view shows of it (kept from one file to the next).
     outline_filter: outline::Filter,
     outline_request: Option<u64>,
+    /// The SCENE view's tree of the active scene tab.
+    scene_cache: scene_tree::Cache,
+    /// A node being renamed in the SCENE view.
+    scene_rename: Option<scene_tree::RenameBar>,
+    /// The SCENE view's list of the project's scenes.
+    scene_list: scene_tree::ListState,
+    /// Scenes instanced by the one shown, read from disk by `res://` path
+    /// (for their nodes' classes); cleared when files change.
+    instanced_scenes: RefCell<HashMap<String, Option<scene_tree::Parsed>>>,
     /// Ctrl+click target under the mouse, underlined while Ctrl is held.
     link: Option<(usize, usize)>,
     /// Definition request checking whether the hovered word is a target.
@@ -565,6 +580,8 @@ struct Project {
     /// Changed files of the repository, for the CHANGES panel.
     git_files: Vec<git::ChangedFile>,
     explorer: Explorer,
+    /// Every `.tscn` of the project, for the SCENE view.
+    scenes: Vec<PathBuf>,
 }
 
 struct Tab {
@@ -758,6 +775,10 @@ impl App {
             outline: None,
             outline_filter: outline::Filter::default(),
             outline_request: None,
+            scene_cache: scene_tree::Cache::default(),
+            scene_rename: None,
+            scene_list: scene_tree::ListState::default(),
+            instanced_scenes: RefCell::default(),
             link: None,
             link_probe: None,
             uid_cache: HashMap::new(),
@@ -1388,6 +1409,7 @@ impl App {
                 }
                 self.outline_filter.update(message);
             }
+            Message::Scene(message) => return self.on_scene(message),
             Message::CloseDock(dock) => self.close_dock(dock),
             Message::MoveView(view, dock) => self.move_view(view, dock),
             Message::ResetLayout => {
@@ -1520,6 +1542,7 @@ impl App {
             Message::ClearOutput => self.run.output.clear(),
             Message::FilesChanged(paths) => {
                 self.uid_cache.clear();
+                self.instanced_scenes.borrow_mut().clear();
                 self.on_files_changed(&paths);
             }
             Message::ReloadActive => {
@@ -2124,6 +2147,7 @@ impl App {
             ("Go to Symbol in File", "go.symbol", Message::OpenPalette("@".to_string())),
             ("Go to Symbol in Project", "go.projectSymbol", Message::OpenPalette("#".to_string())),
             ("View: Outline", "", Message::ShowView(View::Outline)),
+            ("View: Scene Tree", "", Message::ShowView(View::Scene)),
             ("View: Files", "", Message::ShowView(View::Files)),
             ("View: Project (Autoloads, Input Map)", "", Message::ShowView(View::Project)),
             ("File: New Script...", "", Message::OpenNewScript(None)),
@@ -2900,6 +2924,11 @@ impl App {
             let dirs: std::collections::BTreeSet<&Path> = paths.iter().filter_map(|p| p.parent()).collect();
             for dir in dirs {
                 project.explorer.refresh(dir);
+            }
+            // A scene or a folder (possibly holding scenes) came or went.
+            let scenes_moved = paths.iter().any(|p| is_scene_file(p) || p.is_dir() || p.extension().is_none());
+            if let Some(godot) = project.godot.as_ref().filter(|_| scenes_moved) {
+                project.scenes = godot.scenes();
             }
             // Godot rewrites project.godot when autoloads or actions change.
             let changed = project.godot.as_ref().is_some_and(|g| paths.iter().any(|p| project_panel::is_project_file(g, p)));
@@ -4064,6 +4093,169 @@ impl App {
         ])
     }
 
+    /// The SCENE view: edits change the scene's tab as one undo step; the
+    /// choosers (node type, new parent, script) are palettes.
+    fn on_scene(&mut self, message: scene_tree::SceneMessage) -> Task<Message> {
+        use scene_tree::{SceneEdit, SceneMessage};
+        let choice = |label: String, detail: String, scene: &Path, edit: SceneEdit| palette::Choice {
+            label,
+            detail,
+            message: Message::Scene(SceneMessage::Edit(scene.to_path_buf(), edit)),
+        };
+        match message {
+            SceneMessage::Edit(scene, edit) => {
+                if let Err(error) = self.edit_scene(&scene, &edit) {
+                    self.status = Some(error);
+                }
+            }
+            SceneMessage::ChooseType(scene, parent) => {
+                let choices = scene_tree::node_types(&self.native_classes)
+                    .into_iter()
+                    .map(|type_name| choice(type_name.clone(), String::new(), &scene, SceneEdit::Add { parent: parent.clone(), type_name }))
+                    .collect();
+                return self.open_choice("Add which type of node?", choices);
+            }
+            SceneMessage::ChooseParent(scene, node) => {
+                let Some(tree) = self.scene_tree_of(&scene) else {
+                    return Task::none();
+                };
+                let Ok(tree) = tree.as_ref() else {
+                    return Task::none();
+                };
+                let current = tree.node(&node).and_then(|n| n.parent.clone());
+                let choices = tree
+                    .nodes
+                    .iter()
+                    .filter(|n| Some(&n.path) != current.as_ref() && n.path != node && !n.path.starts_with(&format!("{node}/")))
+                    .map(|n| {
+                        let label = if n.parent.is_none() { format!("{} (root)", n.name) } else { n.path.clone() };
+                        let detail = n.type_name.clone().unwrap_or_default();
+                        choice(label, detail, &scene, SceneEdit::Reparent { node: node.clone(), parent: n.path.clone() })
+                    })
+                    .collect();
+                return self.open_choice("Move the node under which node?", choices);
+            }
+            SceneMessage::ChooseScript(scene, node) => {
+                let Some(godot) = self.project.as_ref().and_then(|p| p.godot.as_ref()) else {
+                    self.status = Some("Not a Godot project".to_string());
+                    return Task::none();
+                };
+                let choices: Vec<_> = godot
+                    .resource_files()
+                    .into_iter()
+                    .filter(|f| f.extension().is_some_and(|e| e == "gd"))
+                    .filter_map(|file| {
+                        let res = godot.to_res_path(&file)?;
+                        let mut uid_file = file.into_os_string();
+                        uid_file.push(".uid");
+                        let uid = std::fs::read_to_string(uid_file).ok().map(|u| u.trim().to_string());
+                        let edit = SceneEdit::AttachScript { node: node.clone(), script: res.clone(), uid };
+                        Some(choice(res, String::new(), &scene, edit))
+                    })
+                    .collect();
+                if choices.is_empty() {
+                    self.status = Some("No script in the project (File: New Script... makes one)".to_string());
+                    return Task::none();
+                }
+                return self.open_choice("Attach which script?", choices);
+            }
+            SceneMessage::StartRename(scene, node) => {
+                let name = self
+                    .scene_tree_of(&scene)
+                    .and_then(|tree| tree.as_ref().as_ref().ok().and_then(|t| t.node(&node)).map(|n| n.name.clone()))
+                    .unwrap_or_default();
+                let end = name.chars().count();
+                self.scene_rename = Some(scene_tree::RenameBar { scene, node, name, error: None });
+                self.focus = Focus::Input;
+                return Task::batch([
+                    iced::widget::operation::focus(scene_tree::RENAME_INPUT),
+                    iced::widget::operation::select_range(scene_tree::RENAME_INPUT, 0, end),
+                ]);
+            }
+            SceneMessage::RenameInput(name) => {
+                if let Some(bar) = &mut self.scene_rename {
+                    bar.name = name;
+                    bar.error = None;
+                }
+            }
+            SceneMessage::RenameSubmit => {
+                let Some(bar) = &self.scene_rename else {
+                    return Task::none();
+                };
+                let (scene, edit) = (bar.scene.clone(), SceneEdit::Rename { node: bar.node.clone(), name: bar.name.clone() });
+                match self.edit_scene(&scene, &edit) {
+                    Ok(()) => {
+                        self.scene_rename = None;
+                        self.focus = Focus::Editor;
+                    }
+                    Err(error) => {
+                        if let Some(bar) = &mut self.scene_rename {
+                            bar.error = Some(error);
+                        }
+                    }
+                }
+            }
+            SceneMessage::RenameClose => {
+                self.scene_rename = None;
+                self.focus = Focus::Editor;
+            }
+            SceneMessage::Filter(filter) => {
+                // Typing goes to the filter box, not the editor.
+                self.focus = Focus::Input;
+                self.scene_list.filter = filter;
+            }
+            SceneMessage::ToggleList => self.scene_list.collapsed = !self.scene_list.collapsed,
+            SceneMessage::ToggleFolder(folder) => {
+                if !self.scene_list.expanded.remove(&folder) {
+                    self.scene_list.expanded.insert(folder);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// The parsed tree of a scene open in a tab.
+    fn scene_tree_of(&self, scene: &Path) -> Option<scene_tree::Parsed> {
+        let tab = self.tabs.iter().find(|t| t.path == scene)?;
+        Some(self.scene_cache.get(&tab.path, tab.buffer.version(), || tab.buffer.text()))
+    }
+
+    /// The tree of an instanced scene, by `res://` path, read from disk once.
+    fn instanced_scene(&self, res_path: &str) -> Option<scene_tree::Parsed> {
+        if let Some(cached) = self.instanced_scenes.borrow().get(res_path) {
+            return cached.clone();
+        }
+        let godot = self.project.as_ref()?.godot.as_ref()?;
+        let parsed = godot
+            .resolve(res_path)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .map(|text| Rc::new(scene_tree::Tree::parse(&text)));
+        self.instanced_scenes.borrow_mut().insert(res_path.to_string(), parsed.clone());
+        parsed
+    }
+
+    /// Applies an edit to the scene's tab, as one undo step.
+    fn edit_scene(&mut self, scene: &Path, edit: &scene_tree::SceneEdit) -> Result<(), String> {
+        let index = self.tabs.iter().position(|t| t.path == scene).ok_or("The scene's tab was closed")?;
+        let text = self.tabs[index].buffer.text();
+        let edited = scene_tree::apply(&text, edit)?;
+        if let Some(change) = format::minimal_edit(&text, &edited) {
+            self.edit_tab(index, Command::Replace(vec![change]));
+            self.status = Some("Scene edited (Ctrl+S saves it, Ctrl+Z undoes)".to_string());
+        }
+        Ok(())
+    }
+
+    /// Opens the palette to pick one of `choices`.
+    fn open_choice(&mut self, prompt: &'static str, choices: Vec<palette::Choice<Message>>) -> Task<Message> {
+        let mut palette = Palette::choose(prompt, choices);
+        palette.refresh(&[]);
+        self.palette = Some(palette);
+        self.focus = Focus::Input;
+        self.dismiss_popups();
+        iced::widget::operation::focus(palette::INPUT)
+    }
+
     fn on_file_op(&mut self, message: FileOpMessage) -> Task<Message> {
         let Some(bar) = &mut self.file_op else {
             return Task::none();
@@ -4496,6 +4688,7 @@ impl App {
         self.project = Some(Project {
             explorer: Explorer::new(root.clone()),
             info: ProjectInfo::read(godot.as_ref()),
+            scenes: godot.as_ref().map(GodotProject::scenes).unwrap_or_default(),
             repo: git::repo_root(&root),
             git_status: git::Status::default(),
             git_files: Vec::new(),
@@ -4779,6 +4972,57 @@ impl App {
                 entries.push(Entry::Separator);
                 let reset = (!self.settings.docks.is_default()).then(|| pick(Message::ResetLayout));
                 entries.push(Entry::with_shortcut("Reset Panel Layout", "", reset));
+                entries
+            }
+            ContextTarget::SceneNode(scene, path) => {
+                let Some(tab) = self.tabs.iter().find(|t| &t.path == scene) else {
+                    return Vec::new();
+                };
+                let tree = self.scene_cache.get(&tab.path, tab.buffer.version(), || tab.buffer.text());
+                let Some(node) = tree.as_ref().as_ref().ok().and_then(|t| t.node(path).map(|n| (t, n))) else {
+                    return Vec::new();
+                };
+                let (tree, node) = node;
+                let scene_message = |m: scene_tree::SceneMessage| pick(Message::Scene(m));
+                let edit = |e: scene_tree::SceneEdit| scene_message(scene_tree::SceneMessage::Edit(scene.clone(), e));
+                // Nodes of an instanced scene can't be renamed, moved or removed.
+                let movable = node.is_editable() && node.parent.is_some();
+                let siblings = tree.siblings(node);
+                let index = siblings.iter().position(|p| *p == path).unwrap_or(0);
+                let when = |enabled: bool, message: Message| enabled.then_some(message);
+                let mut entries = vec![
+                    Entry::item("Add Child Node...", scene_message(scene_tree::SceneMessage::ChooseType(scene.clone(), path.clone()))),
+                    Entry::with_shortcut(
+                        "Rename...",
+                        "",
+                        when(node.is_editable(), scene_message(scene_tree::SceneMessage::StartRename(scene.clone(), path.clone()))),
+                    ),
+                    Entry::Separator,
+                    Entry::with_shortcut("Move Up", "", when(movable && index > 0, edit(scene_tree::SceneEdit::Shift(path.clone(), -1)))),
+                    Entry::with_shortcut(
+                        "Move Down",
+                        "",
+                        when(movable && index + 1 < siblings.len(), edit(scene_tree::SceneEdit::Shift(path.clone(), 1))),
+                    ),
+                    Entry::with_shortcut(
+                        "Move To...",
+                        "",
+                        when(movable, scene_message(scene_tree::SceneMessage::ChooseParent(scene.clone(), path.clone()))),
+                    ),
+                    Entry::Separator,
+                    Entry::item(
+                        if node.script.is_some() { "Change Script..." } else { "Attach Script..." },
+                        scene_message(scene_tree::SceneMessage::ChooseScript(scene.clone(), path.clone())),
+                    ),
+                ];
+                if node.script.is_some() {
+                    entries.push(Entry::item("Detach Script", edit(scene_tree::SceneEdit::DetachScript(path.clone()))));
+                }
+                entries.extend([
+                    Entry::Separator,
+                    Entry::item("Copy Node Path", pick(Message::CopyText(path.clone()))),
+                    Entry::with_shortcut("Delete", "", when(movable, edit(scene_tree::SceneEdit::Remove(path.clone())))),
+                ]);
                 entries
             }
             ContextTarget::Editor => {
@@ -5530,6 +5774,19 @@ impl App {
                 let line = tab.map(|t| t.buffer.char_to_pos(t.buffer.primary().head).line as u32);
                 outline::view(outline, &self.outline_filter, line, theme)
             }
+            View::Scene => {
+                let tab = self.active_tab().filter(|t| is_scene_file(&t.path));
+                let tree = tab.map(|t| self.scene_cache.get(&t.path, t.buffer.version(), || t.buffer.text()));
+                let line = tab.map(|t| t.buffer.char_to_pos(t.buffer.primary().head).line);
+                let scene = tab.zip(tree.as_deref()).map(|(t, tree)| (t.path.as_path(), tree));
+                let light = godot_icons::is_light(ui.surface);
+                let scene_of = |res: &str| self.instanced_scene(res);
+                let icon = |tree: &scene_tree::Tree, node: &godot_project::SceneNode| {
+                    let class = tree.class_of(node, &scene_of);
+                    godot_icons::handle(&scene_tree::icon_name(class.as_deref(), &self.native_classes), light)
+                };
+                scene_tree::view(&project.scenes, &project.root, &self.scene_list, scene, line, self.scene_rename.as_ref(), &icon, theme)
+            }
             View::Project => project_panel::view(&project.info, project.godot.as_ref(), theme),
             View::Problems => self.problems.view(ui, |p| self.display_path(p)),
             View::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),
@@ -6120,6 +6377,11 @@ fn read_theme_file(path: &Path) -> Result<theme::Theme, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         theme::Theme::from_toml(&text).map_err(|e| e.to_string())
     }
+}
+
+/// Whether the SCENE view shows this file's tree.
+fn is_scene_file(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("tscn"))
 }
 
 /// Shows a file (selected) or folder in the system file manager.

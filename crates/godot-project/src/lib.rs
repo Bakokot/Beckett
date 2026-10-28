@@ -1,9 +1,11 @@
 //! Godot project awareness: `project.godot` parsing and `res://` paths.
 
 mod input;
+mod scene;
 mod settings;
 
 pub use input::{Autoload, InputAction, BUILTIN_ACTIONS};
+pub use scene::{Scene, SceneError, SceneNode, Section};
 pub use settings::{Entry, ProjectSettings};
 
 use std::io;
@@ -83,6 +85,14 @@ impl GodotProject {
 }
 
 impl GodotProject {
+    /// Every scene file (`.tscn`) of the project, sorted.
+    pub fn scenes(&self) -> Vec<PathBuf> {
+        let mut scenes = Vec::new();
+        collect_scenes(&self.root, &mut scenes);
+        scenes.sort();
+        scenes
+    }
+
     /// Scene files (`.tscn`) that reference the resource at `res_path`,
     /// e.g. the scenes a script is attached to.
     pub fn scenes_using(&self, res_path: &str) -> Vec<PathBuf> {
@@ -303,6 +313,7 @@ mod tests {
         assert_eq!(project.find_uid("uid://zzz"), None);
         let files = project.resource_files();
         assert_eq!(files, [root.join("icon.svg"), root.join("player.gd"), root.join("scenes").join("main.tscn")]);
+        assert_eq!(project.scenes(), [root.join("scenes").join("main.tscn")]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

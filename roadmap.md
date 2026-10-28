@@ -331,6 +331,30 @@ crates/
 ## Phase 3 — Godot editor replacement
 
 - [ ] **ER1** Scene tree editor (add/remove/reparent/rename nodes, attach scripts) — `.tscn` read/write
+  - [x] `.tscn` reader/writer (`godot-project::Scene`): untouched sections are written back as read (all 475
+        scenes on disk round-trip byte for byte, CRLF kept); edited ones in Godot's layout. Node tree with paths,
+        types, instanced scenes and scripts. Edits: add (a taken name gets a number, `unique_id` when the scene
+        has them), rename, remove (with its connections, editable children and the resources only it used),
+        reparent / reorder, attach / detach script; paths in parents, connections and `[editable]` follow,
+        `load_steps` kept in step. Nodes of an instanced scene can't be renamed, moved or removed.
+        Not yet: `NodePath` property values aren't rewritten when a node moves
+  - [x] SCENE view lists the project's scenes as a folder tree like FILES (only folders holding scenes, and the
+        `.tscn`s; arrows open / close folders), with a filter (every
+        word, any case); a click opens the scene, the open one is highlighted, right-click gives the file menu;
+        the list folds away (its header) and is refreshed when scenes or folders change on disk — not yet seen on screen
+  - [x] SCENE view (left sidebar, dockable): the node tree of the `.tscn` in the active tab, indented, with
+        each node's class, `tscn` / `gd` links to its instanced scene and script, the node under the cursor
+        highlighted; a click shows the node's section. Right-click a node: Add Child Node (type picked in the
+        palette, from the language server's classes or a common list), Rename (in place, Enter / Escape),
+        Move Up / Down, Move To (palette), Attach / Change / Detach Script (palette of the project's scripts,
+        `uid` read from the `.uid` file), Copy Node Path, Delete. An edit changes the tab's text as one undo step
+        (Ctrl+S saves). Nodes of an instanced scene can't be renamed, moved or deleted — not yet seen on screen
+  - [x] Godot's own node icons in the SCENE tree (all 1047 editor and module icons of Godot 4.7.1, MIT, packed in
+        `assets/godot_icons.tsv`, notice in `assets/GODOT_ICONS_LICENSE.txt`). An instanced scene shows its root's
+        class icon, and its inner nodes theirs (read from the instanced scene); a class without an icon takes its
+        nearest parent's, else Node's. On light themes the colors are converted as the Godot editor does — not yet
+        seen on screen. Not yet: icons of GDExtension classes (e.g. Terrain3D) and of `@icon` script classes
+  - [ ] Drag and drop of nodes in the tree; new scene; instance a scene as a child; collapse / expand
 - [ ] **ER2** Inspector for node properties, exports and resources (metadata from `godot --dump-extension-api`)
 - [ ] **ER3** Signal connection editor
 - [ ] **ER4** Project settings and Input Map editors
