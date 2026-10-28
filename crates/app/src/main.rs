@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod changes;
+mod class_docs;
 mod class_ref;
 mod color_picker;
 mod code_editor;
@@ -17,6 +18,7 @@ mod find;
 mod format;
 mod godot_icons;
 mod git;
+mod inspector;
 mod keymap;
 mod lsp;
 mod new_script;
@@ -177,6 +179,10 @@ pub enum Message {
     CloseTerminal(u64),
     /// The OUTLINE view's filter changed.
     OutlineFilter(outline::FilterMessage),
+    /// The INSPECTOR view: its filter and fields.
+    Inspector(inspector::InspectorMessage),
+    /// Godot's class reference was written and read (or not).
+    ClassDocsLoaded(Result<std::sync::Arc<godot_project::ClassDb>, String>),
     /// The SCENE view: an edit of the tree, or a step towards one.
     Scene(scene_tree::SceneMessage),
     /// Show this view in its dock (left or right sidebar, bottom panel).
@@ -548,6 +554,10 @@ struct App {
     /// Scenes instanced by the one shown, read from disk by `res://` path
     /// (for their nodes' classes); cleared when files change.
     instanced_scenes: RefCell<HashMap<String, Option<scene_tree::Parsed>>>,
+    /// The INSPECTOR view's filter and the field being typed in.
+    inspector: inspector::InspectorState,
+    /// Godot's class reference, read when the INSPECTOR is first shown.
+    class_docs: class_docs::ClassDocs,
     /// Ctrl+click target under the mouse, underlined while Ctrl is held.
     link: Option<(usize, usize)>,
     /// Definition request checking whether the hovered word is a target.
@@ -782,6 +792,8 @@ impl App {
             new_scene: None,
             scene_list: scene_tree::ListState::default(),
             instanced_scenes: RefCell::default(),
+            inspector: inspector::InspectorState::default(),
+            class_docs: class_docs::ClassDocs::Missing,
             link: None,
             link_probe: None,
             uid_cache: HashMap::new(),
@@ -944,6 +956,10 @@ impl App {
         }
         self.sync_groups();
         self.refresh_outline();
+        let task = match self.start_class_docs() {
+            Some(docs) => Task::batch([task, docs]),
+            None => task,
+        };
         match self.start_git_refresh() {
             Some(git) => Task::batch([task, git]),
             None => task,
@@ -1413,6 +1429,13 @@ impl App {
                 self.outline_filter.update(message);
             }
             Message::Scene(message) => return self.on_scene(message),
+            Message::Inspector(message) => return self.on_inspector(message),
+            Message::ClassDocsLoaded(result) => {
+                self.class_docs = match result {
+                    Ok(db) => class_docs::ClassDocs::Ready(db),
+                    Err(error) => class_docs::ClassDocs::Failed(error),
+                };
+            }
             Message::CloseDock(dock) => self.close_dock(dock),
             Message::MoveView(view, dock) => self.move_view(view, dock),
             Message::ResetLayout => {
@@ -2151,6 +2174,7 @@ impl App {
             ("Go to Symbol in Project", "go.projectSymbol", Message::OpenPalette("#".to_string())),
             ("View: Outline", "", Message::ShowView(View::Outline)),
             ("View: Scene Tree", "", Message::ShowView(View::Scene)),
+            ("View: Inspector", "", Message::ShowView(View::Inspector)),
             ("Scene: New Scene...", "", Message::Scene(scene_tree::SceneMessage::NewScene(PathBuf::new()))),
             ("View: Files", "", Message::ShowView(View::Files)),
             ("View: Project (Autoloads, Input Map)", "", Message::ShowView(View::Project)),
@@ -3910,6 +3934,7 @@ impl App {
         });
         // The connection is keyed by the choice: restart it with the new one.
         self.lsp_retries = 0;
+        self.class_docs = class_docs::ClassDocs::Missing;
         self.reset_lsp(Lsp::Starting);
     }
 
@@ -4362,6 +4387,66 @@ impl App {
     fn scene_tree_of(&self, scene: &Path) -> Option<scene_tree::Parsed> {
         let tab = self.tabs.iter().find(|t| t.path == scene)?;
         Some(self.scene_cache.get(&tab.path, tab.buffer.version(), || tab.buffer.text()))
+    }
+
+    /// Starts writing and reading Godot's class reference once the
+    /// INSPECTOR is shown, with the Godot the project uses.
+    fn start_class_docs(&mut self) -> Option<Task<Message>> {
+        if !matches!(self.class_docs, class_docs::ClassDocs::Missing) || !self.is_shown(View::Inspector) {
+            return None;
+        }
+        let version = self.project.as_ref()?.godot.as_ref()?.godot_version();
+        let Some(install) = lsp_client::godot::resolve(self.godot_choice.as_deref(), version.as_deref()) else {
+            self.class_docs = class_docs::ClassDocs::Failed("no Godot executable found".to_string());
+            return None;
+        };
+        let Some(dir) = class_docs::dir(&install) else {
+            self.class_docs = class_docs::ClassDocs::Failed("no cache folder".to_string());
+            return None;
+        };
+        self.class_docs = class_docs::ClassDocs::Loading;
+        let exe = install.path;
+        Some(Task::perform(
+            async move { class_docs::load(&exe, &dir).map(std::sync::Arc::new) },
+            Message::ClassDocsLoaded,
+        ))
+    }
+
+    fn on_inspector(&mut self, message: inspector::InspectorMessage) -> Task<Message> {
+        self.inspector.update(&message);
+        match message {
+            inspector::InspectorMessage::Filter(_) | inspector::InspectorMessage::Input(..) => {
+                // Typing goes to the field, not the editor.
+                self.focus = Focus::Input;
+            }
+            inspector::InspectorMessage::Commit { scene, node, key, type_name } => {
+                if let Some(edit) = self.inspector.commit(&node, &key, &type_name) {
+                    if let Err(error) = self.edit_scene(&scene, &edit) {
+                        self.status = Some(error);
+                    }
+                }
+                self.focus = Focus::Editor;
+            }
+        }
+        Task::none()
+    }
+
+    fn inspector_view(&self) -> Element<'_, Message> {
+        let theme = self.current_theme();
+        let tab = self.active_tab().filter(|t| is_scene_file(&t.path));
+        let tree = tab.map(|t| self.scene_cache.get(&t.path, t.buffer.version(), || t.buffer.text()));
+        let line = tab.map(|t| t.buffer.char_to_pos(t.buffer.primary().head).line);
+        let scene = tab.zip(tree.as_deref()).and_then(|(t, tree)| tree.as_ref().ok().map(|tree| (t.path.as_path(), tree)));
+        let scene_of = |res: &str| self.instanced_scene(res);
+        let class_of = |tree: &scene_tree::Tree, node: &godot_project::SceneNode| tree.class_of(node, &scene_of);
+        let light = godot_icons::is_light(theme.ui.surface);
+        let icon = |class: &str| godot_icons::handle(&scene_tree::icon_name(Some(class), &self.native_classes), light);
+        let classes = match &self.class_docs {
+            class_docs::ClassDocs::Ready(db) => inspector::Classes::Ready(db),
+            class_docs::ClassDocs::Failed(error) => inspector::Classes::Failed(error),
+            class_docs::ClassDocs::Missing | class_docs::ClassDocs::Loading => inspector::Classes::Loading,
+        };
+        inspector::view(scene, line, &class_of, &icon, classes, &self.inspector, theme)
     }
 
     /// The tree of an instanced scene, by `res://` path, read from disk once.
@@ -4827,6 +4912,7 @@ impl App {
             .is_none()
             .then(|| "No project.godot found in this folder".to_string());
         self.lsp_retries = 0;
+        self.class_docs = class_docs::ClassDocs::Missing;
         self.reset_lsp(if godot.is_some() { Lsp::Starting } else { Lsp::Off });
         self.recent = recent::add(&root);
         self.project = Some(Project {
@@ -5936,6 +6022,7 @@ impl App {
                 };
                 scene_tree::view(&project.scenes, &project.root, &self.scene_list, scene, line, self.scene_rename.as_ref(), self.new_scene.as_ref(), &icon, theme)
             }
+            View::Inspector => self.inspector_view(),
             View::Project => project_panel::view(&project.info, project.godot.as_ref(), theme),
             View::Problems => self.problems.view(ui, |p| self.display_path(p)),
             View::Search => self.search.view(ui, |p| self.display_path(p)).map(Message::Search),

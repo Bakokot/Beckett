@@ -69,10 +69,15 @@ impl Section {
 
     /// Sets a property; a new one goes first.
     fn set_prop(&mut self, key: &str, raw: String) {
+        self.put_prop(key, raw, 0);
+    }
+
+    /// Sets a property; a new one goes at `at` (clamped to the end).
+    fn put_prop(&mut self, key: &str, raw: String, at: usize) {
         match self.props.iter_mut().find(|(k, _)| k == key) {
             Some((_, v)) if *v == raw => return,
             Some((_, v)) => *v = raw,
-            None => self.props.insert(0, (key.to_string(), raw)),
+            None => self.props.insert(at.min(self.props.len()), (key.to_string(), raw)),
         }
         self.original = None;
     }
@@ -146,6 +151,10 @@ pub enum SceneError {
     Inherited(String),
     /// A node can't be moved under itself or its descendants.
     IntoItself,
+    /// Not a property name a scene can hold.
+    InvalidProperty(String),
+    /// Empty, or with a string or bracket left open.
+    InvalidValue(String),
 }
 
 impl fmt::Display for SceneError {
@@ -158,6 +167,9 @@ impl fmt::Display for SceneError {
             SceneError::Root => write!(f, "the root node can't be removed or moved"),
             SceneError::Inherited(path) => write!(f, "\"{path}\" comes from an instanced scene"),
             SceneError::IntoItself => write!(f, "a node can't be moved under itself"),
+            SceneError::InvalidProperty(key) => write!(f, "\"{key}\" is not a valid property name"),
+            SceneError::InvalidValue(value) if value.is_empty() => write!(f, "a value is needed"),
+            SceneError::InvalidValue(value) => write!(f, "\"{value}\" has a string or bracket left open"),
         }
     }
 }
@@ -506,6 +518,25 @@ impl Scene {
         self.prune_resources();
         Ok(())
     }
+
+    /// Sets a node's property to raw variant text (a new one goes last), or
+    /// removes it (`None`), which gives it back its default.
+    pub fn set_property(&mut self, path: &str, key: &str, raw: Option<&str>) -> Result<(), SceneError> {
+        let index = self.find(path).ok_or_else(|| SceneError::NoSuchNode(path.to_string()))?;
+        if key.is_empty() || key.contains(['=', '\n', '[', ']']) {
+            return Err(SceneError::InvalidProperty(key.to_string()));
+        }
+        match raw.map(str::trim) {
+            Some(raw) if raw.is_empty() || Nesting::of(raw).is_open() => {
+                return Err(SceneError::InvalidValue(raw.to_string()));
+            }
+            Some(raw) => self.sections[index].put_prop(key, raw.to_string(), usize::MAX),
+            None => self.sections[index].remove_prop(key),
+        }
+        // A resource only the old value used goes.
+        self.prune_resources();
+        Ok(())
+    }
 }
 
 impl Scene {
@@ -846,6 +877,12 @@ impl Nesting {
         text.chars().for_each(|c| self.feed(c));
     }
 
+    fn of(text: &str) -> Self {
+        let mut nesting = Self::default();
+        nesting.feed_str(text);
+        nesting
+    }
+
     fn is_open(&self) -> bool {
         self.in_string || self.depth > 0
     }
@@ -989,6 +1026,26 @@ text = "two
             "position = Vector2(4, 0)\n\n[node name=\"Shape2\" type=\"Area2D\" parent=\"Player\"]\n\n[node name=\"Label\""
         ));
         assert!(text.ends_with("[lines]\"\n\n[node name=\"Label2\" type=\"Label\" parent=\".\"]\n\n[connection signal=\"fired\" from=\"Player/Gun\" to=\".\" method=\"_on_fired\"]\n\n[editable path=\"Player/Gun\"]\n"));
+    }
+
+    #[test]
+    fn sets_and_reverts_properties() {
+        let mut s = scene();
+        s.set_property("Player", "position", Some("Vector2(5, 6)")).unwrap();
+        s.set_property("Player/Shape", "shape", Some("SubResource(\"RectangleShape2D_x\")")).unwrap();
+        let text = s.to_text();
+        assert!(text.contains("script = ExtResource(\"1_abcde\")\nposition = Vector2(5, 6)\n"), "{text}");
+        s.set_property("Player", "position", Some("Vector2(7, 8)")).unwrap();
+        assert!(s.to_text().contains("position = Vector2(7, 8)\n") && !s.to_text().contains("Vector2(5, 6)"));
+        // Back to its default; a sub-resource nothing uses any more goes.
+        s.set_property("Player", "position", None).unwrap();
+        s.set_property("Player/Shape", "shape", None).unwrap();
+        let text = s.to_text();
+        assert!(!text.contains("position = Vector2(7") && !text.contains("RectangleShape2D_x"));
+        assert!(text.starts_with("[gd_scene load_steps=3 "));
+        assert_eq!(s.set_property("Player", "a=b", Some("1")), Err(SceneError::InvalidProperty("a=b".into())));
+        assert_eq!(s.set_property("Player", "text", Some("\"open")), Err(SceneError::InvalidValue("\"open".into())));
+        assert_eq!(s.set_property("Player", "text", Some(" ")), Err(SceneError::InvalidValue(String::new())));
     }
 
     #[test]

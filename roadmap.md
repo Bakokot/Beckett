@@ -366,6 +366,17 @@ crates/
         `:property` subnames): a path is re-aimed when its target or the node holding it moved; absolute and
         `%Unique` paths are left alone. Not yet: animation track paths in `Animation` resources
 - [ ] **ER2** Inspector for node properties, exports and resources (metadata from `godot --dump-extension-api`)
+  - [x] Class reference from `godot --headless --doctool` (it has the defaults and enums the extension API
+        lacks), written once per Godot version into the cache folder (~1 s) and read in the background when the
+        INSPECTOR is shown (`godot-project::ClassDb`: inheritance, stored properties with type / default / enum /
+        bitfield, overridden defaults, enum values)
+  - [x] INSPECTOR view (right sidebar, dockable): the node under the cursor in the active scene, its icon,
+        class and script; a section per class of its inheritance with the properties scenes store, then what the
+        scene sets that no class declares (script variables, metadata, theme overrides); filter by name. Values
+        from the scene, else the default (faded); checkbox for bools, dropdown for enums, a field for the rest
+        (strings without quotes, other values as Godot writes them, Enter sets it); ↺ back to the default. Edits
+        change the scene's text as one undo step — not yet seen on screen
+  - [ ] Editors per type (vectors, colors, flags, ranges, resources), Godot's property groups, script exports
 - [ ] **ER3** Signal connection editor
 - [ ] **ER4** Project settings and Input Map editors
 - [ ] **ER5** Resource editors (Theme, TileSet, AnimationPlayer…), one at a time

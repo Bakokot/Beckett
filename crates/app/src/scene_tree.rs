@@ -37,6 +37,8 @@ pub enum SceneEdit {
     DetachScript(String),
     /// An instance of a `res://` scene (with its `uid://`) under `parent`.
     Instance { parent: String, name: String, scene: String, uid: Option<String> },
+    /// A property set to raw variant text, or back to its default (`None`).
+    SetProperty { node: String, key: String, value: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -130,25 +132,33 @@ pub struct Tree {
     pub nodes: Vec<SceneNode>,
     /// Zero-based line of each section's header, by section index.
     pub lines: Vec<usize>,
+    /// Each node's properties as written (raw values), by node index.
+    pub props: Vec<Vec<(String, String)>>,
 }
 
 impl Tree {
     pub fn parse(text: &str) -> Result<Self, String> {
         let scene = Scene::parse(text).map_err(|e| e.to_string())?;
-        Ok(Self { nodes: scene.nodes(), lines: scene.section_lines() })
+        let nodes = scene.nodes();
+        let sections = scene.sections();
+        let props = nodes
+            .iter()
+            .map(|n| sections[n.section].props().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+            .collect();
+        Ok(Self { nodes, lines: scene.section_lines(), props })
     }
 
     pub fn node(&self, path: &str) -> Option<&SceneNode> {
         self.nodes.iter().find(|n| n.path == path)
     }
 
-    fn line(&self, node: &SceneNode) -> usize {
+    pub fn line(&self, node: &SceneNode) -> usize {
         self.lines.get(node.section).copied().unwrap_or(0)
     }
 
     /// The node whose section holds `line`: the last one starting at or
     /// before it.
-    fn at_line(&self, line: usize) -> Option<usize> {
+    pub fn at_line(&self, line: usize) -> Option<usize> {
         self.nodes.iter().rposition(|n| self.line(n) <= line)
     }
 
@@ -233,7 +243,7 @@ pub fn apply(text: &str, edit: &SceneEdit) -> Result<String, String> {
         SceneEdit::Rename { node, name } => scene.rename_node(node, name.trim()).map(drop),
         SceneEdit::Remove(node) => scene.remove_node(node),
         SceneEdit::Shift(node, delta) => {
-            let tree = Tree { nodes: scene.nodes(), lines: Vec::new() };
+            let tree = Tree { nodes: scene.nodes(), lines: Vec::new(), props: Vec::new() };
             let found = tree.node(node).ok_or_else(|| format!("no node at \"{node}\""))?;
             let parent = found.parent.clone().ok_or("the root node can't be moved")?;
             let siblings = tree.siblings(found);
@@ -247,6 +257,7 @@ pub fn apply(text: &str, edit: &SceneEdit) -> Result<String, String> {
         SceneEdit::Reparent { node, parent, position } => scene.reparent_node(node, parent, *position).map(drop),
         SceneEdit::AttachScript { node, script, uid } => scene.attach_script(node, script, uid.as_deref()),
         SceneEdit::DetachScript(node) => scene.detach_script(node),
+        SceneEdit::SetProperty { node, key, value } => scene.set_property(node, key, value.as_deref()),
         SceneEdit::Instance { parent, name, scene: res, uid } => {
             scene.instance_scene(parent, name, res, uid.as_deref()).map(drop)
         }

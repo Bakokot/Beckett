@@ -1,9 +1,11 @@
 //! Godot project awareness: `project.godot` parsing and `res://` paths.
 
+mod class_db;
 mod input;
 mod scene;
 mod settings;
 
+pub use class_db::{ClassDb, ClassInfo, Property};
 pub use input::{Autoload, InputAction, BUILTIN_ACTIONS};
 pub use scene::{Scene, SceneError, SceneNode, Section};
 pub use settings::{Entry, ProjectSettings};
