@@ -179,6 +179,8 @@ pub enum Message {
     CloseTerminal(u64),
     /// The OUTLINE view's filter changed.
     OutlineFilter(outline::FilterMessage),
+    /// The FILES view's file type filter changed.
+    FileTypes(explorer::FilterMessage),
     /// The INSPECTOR view: its filter and fields.
     Inspector(inspector::InspectorMessage),
     /// Godot's class reference was written and read (or not).
@@ -1203,6 +1205,11 @@ impl App {
             Message::ToggleDir(path) => {
                 if let Some(project) = &mut self.project {
                     project.explorer.toggle(&path);
+                }
+            }
+            Message::FileTypes(message) => {
+                if let Some(project) = &mut self.project {
+                    project.explorer.update(message);
                 }
             }
             Message::OpenFile(path) => {
@@ -5400,6 +5407,7 @@ impl App {
             godot: self.godot_choice.clone(),
             breakpoints,
             watches: self.watches.clone(),
+            file_types: self.project.as_ref().map(|p| p.explorer.filter().iter().cloned().collect()).unwrap_or_default(),
         }
     }
 
@@ -5426,10 +5434,11 @@ impl App {
 
     /// Reopens the tabs of the project's last session, unsaved edits included.
     fn restore_session(&mut self) {
-        let Some(project) = &self.project else {
+        let Some(project) = &mut self.project else {
             return;
         };
         let saved = session::load(&project.root);
+        project.explorer.set_filter(saved.file_types.iter().cloned());
         self.split_ratio = saved.split_ratio.unwrap_or(0.5).clamp(0.0, 1.0);
         self.godot_choice = saved.godot.clone();
         self.watches = saved.watches.clone();
@@ -5903,6 +5912,13 @@ impl App {
 
         let mut actions: Vec<Element<'a, Message>> = Vec::new();
         match view {
+            View::Files => {
+                // The chips can be closed with a filter on: the label keeps it in sight.
+                let filtered = project.explorer.filter().len();
+                let label = if filtered == 0 { "types".to_string() } else { format!("types ({filtered})") };
+                let types = button(text(label).size(12)).on_press(Message::FileTypes(explorer::FilterMessage::ToggleChips)).style(button::text).padding([0, 6]);
+                actions.push(style::tip(types, "Filter the files by type (.gd, .tscn…)", tooltip::Position::Top, ui));
+            }
             View::Output if self.is_running() => actions.push(action("stop", Message::StopRun, "Stop the game (F8)")),
             View::Output => actions.push(action("clear", Message::ClearOutput, "Clear the output")),
             View::Terminal => actions.push(action("kill", Message::KillTerminal, "End this shell (the last one closes the panel)")),
@@ -6000,8 +6016,13 @@ impl App {
                     added: style::to_color(ui.success),
                     conflicted: style::to_color(ui.danger),
                 };
-                let files = scrollable(project.explorer.view(active, &git)).height(Length::Fill);
-                fallback_context_area(files, move |point| Message::ContextMenu(ContextTarget::Folder(root.clone()), point)).into()
+                let files = scrollable(project.explorer.view(active, &git, style::to_color(ui.text_muted))).height(Length::Fill);
+                let files = fallback_context_area(files, move |point| Message::ContextMenu(ContextTarget::Folder(root.clone()), point));
+                if project.explorer.chips_open {
+                    column![project.explorer.type_chips(ui), files].spacing(4).into()
+                } else {
+                    files.into()
+                }
             }
             View::Outline => {
                 let tab = self.active_tab();

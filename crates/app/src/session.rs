@@ -23,6 +23,9 @@ pub struct Session {
     /// Watch expressions of the debugger.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub watches: Vec<String>,
+    /// Extensions the file tree is filtered on (empty: every file).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +132,7 @@ mod tests {
             godot: Some("C:/Godot/Godot_v4.5.1-stable_win64.exe".into()),
             breakpoints: [("C:/game/a.gd".into(), vec![2, 9])].into_iter().collect(),
             watches: vec!["velocity.length()".into()],
+            file_types: vec!["gd".into(), "tscn".into()],
         };
         let text = serde_json::to_string(&session).unwrap();
         assert!(!text.contains("\"folds\":[]"), "{text}");
